@@ -61,7 +61,7 @@ status: 0 new, 1 busy, 2 success, 3 failed, 4 timeout, 5 not supported
   uses the driver's sysfs attributes, so it never races the kernel for the control channel.
   The user needs to be in the `openrazer` group.
 * `hidraw`: raw Protocol25. This needs rw access to `/dev/hidraw*`:
-  `sudo cp udev/99-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
+  `sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger`
 
 ## Usage
 
