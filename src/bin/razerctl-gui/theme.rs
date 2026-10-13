@@ -197,8 +197,11 @@ pub fn apply_style(ctx: &egui::Context, p: &Pal) {
         s.spacing.button_padding = egui::vec2(S3, S2);
         s.spacing.interact_size.y = 32.0;
         s.spacing.combo_width = 0.0;
+        s.spacing.combo_height = 400.0;
         s.spacing.slider_rail_height = 3.0;
         s.spacing.slider_width = 220.0;
+        // solid (not floating): the bar reserves its own 6px instead of covering the right hairline of every panel
+        s.spacing.scroll = egui::style::ScrollStyle::solid();
         s.spacing.scroll.bar_width = 6.0;
     });
 }

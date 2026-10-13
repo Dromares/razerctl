@@ -165,7 +165,7 @@ pub fn meter(ui: &mut Ui, p: &Pal, width: f32, height: f32, frac: f32, segments:
 /// clicked this frame, if any. `active` may be `None` (no segment matches).
 pub fn segmented(ui: &mut Ui, p: &Pal, id: &str, labels: &[String], active: Option<usize>, min_w: f32) -> Option<usize> {
     let gs: Vec<_> = labels.iter().map(|l| galley(ui, &l.to_uppercase(), mono_med(T_LABEL), Color32::PLACEHOLDER, TRACK_LABEL)).collect();
-    let widths: Vec<f32> = gs.iter().map(|g| (g.size().x + 2.0 * S3).max(min_w)).collect();
+    let widths: Vec<f32> = gs.iter().map(|g| (g.size().x + 20.0).max(min_w)).collect();
     let total: f32 = widths.iter().sum();
     let (outer, _) = ui.allocate_exact_size(vec2(total, 34.0), Sense::hover());
     let mut clicked = None;

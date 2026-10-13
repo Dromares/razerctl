@@ -85,7 +85,7 @@ impl ButtonRow {
     }
 }
 
-#[derive(PartialEq, Clone, Copy)]
+#[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab { Buttons, Device, Software }
 
 struct App {
@@ -431,7 +431,8 @@ impl App {
             ui.spacing_mut().item_spacing.x = 8.0;
             let glyph_c = if err { fg } else { p.ok };
             if !glyph.is_empty() { ui.label(RichText::new(glyph).font(mono(T_LABEL + 1.0)).color(glyph_c)); }
-            ui.label(RichText::new(text).font(mono(T_LABEL + 0.5)).color(fg));
+            // long systemctl / OS errors wrap onto more lines instead of running off the window
+            ui.add(egui::Label::new(RichText::new(text).font(mono(T_LABEL + 0.5)).color(fg)).wrap());
         });
     }
 
@@ -608,6 +609,9 @@ impl App {
                                     .width(170.0)
                                     .selected_text(RichText::new(CHOICES[row.choice].0).font(sans(T_BODY - 1.0)).color(p.i100()))
                                     .show_ui(ui, |ui| {
+                                        // compact list: all 15 choices fit without a long scroll
+                                        ui.spacing_mut().interact_size.y = 24.0;
+                                        ui.spacing_mut().item_spacing.y = 2.0;
                                         for (i, (label, _)) in CHOICES.iter().enumerate() {
                                             ui.selectable_value(&mut row.choice, i, *label);
                                         }
@@ -848,10 +852,9 @@ impl App {
         panel(ui, &p, 16, |ui| {
             let labels: Vec<String> = POLL_RATES.iter().map(|h| format!("{h} Hz")).collect();
             let active = POLL_RATES.iter().position(|h| *h == self.poll_edit);
-            if let Some(i) = segmented(ui, &p, "poll", &labels, active, 64.0) { self.poll_edit = POLL_RATES[i]; }
-            ui.add_space(S2);
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = S3;
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = vec2(S3, S2);
+                if let Some(i) = segmented(ui, &p, "poll", &labels, active, 60.0) { self.poll_edit = POLL_RATES[i]; }
                 let differs = current != Some(self.poll_edit);
                 if btn(ui, &p, "Apply", if differs { Kind::Primary } else { Kind::Secondary }, true).clicked() { set = Some(self.poll_edit); }
                 if let Some(c) = current { ui.label(RichText::new(format!("current {c} Hz")).font(mono(T_DATA)).color(p.i65())); }
@@ -962,7 +965,8 @@ impl App {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S2;
                 ui.label(caps(&p, "Config"));
-                ui.label(RichText::new(self.conf_path.display().to_string()).font(mono(T_DATA)).color(p.i100()));
+                // a real $XDG_CONFIG_HOME can be arbitrarily long: wrap instead of widening the column
+                ui.add(egui::Label::new(RichText::new(self.conf_path.display().to_string()).font(mono(T_DATA)).color(p.i100())).wrap());
             });
             ui.add_space(S2);
             // Comment lines dimmed, the line the parser rejected highlighted (as of the previous frame's parse).
@@ -1178,4 +1182,188 @@ fn main() -> eframe::Result {
         install_fonts(&cc.egui_ctx);
         Ok(Box::new(App::new()))
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use eframe::egui::epaint::Shape as EShape;
+
+    fn test_app() -> App {
+        App {
+            tab: Tab::Buttons,
+            status: String::new(),
+            status_is_error: false,
+            info: None,
+            backend_kind: String::new(),
+            dpi_edit: 800,
+            poll_edit: 1000,
+            profile: 1,
+            rows: Vec::new(),
+            conf_path: PathBuf::from("/nonexistent/razerctl/remap.conf"),
+            conf_text: "# back = ctrl+c\n".into(),
+            conf_error: None,
+            service_state: "inactive".into(),
+            presses: Arc::new(Mutex::new(VecDeque::new())),
+            watching: false,
+            batt_cfg: battery::Config { enabled: true, threshold: 20, interval_min: 5 },
+            batt_service: "inactive".into(),
+            selected: None,
+            failed: None,
+            pal: Pal::new(Mode::Dark),
+            styled: None,
+            demo: demo::Demo::default(),
+        }
+    }
+
+    fn with_device(app: &mut App) {
+        app.info = Some(demo::info(82, false));
+        app.backend_kind = "hidraw".into();
+        app.rows = demo::rows();
+    }
+
+    /// Lay out one frame of `tab` (header, strip, tester, status bar and the tab body) and return every string drawn.
+    fn render(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> String {
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        app.pal = Pal::new(mode);
+        apply_style(&ctx, &app.pal);
+        app.tab = tab;
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(size.0, size.1)));
+        let mut text = String::new();
+        for _ in 0..2 {
+            let out = ctx.run_ui(input.clone(), |ui| {
+                app.header(ui);
+                app.device_strip(ui);
+                app.tester(ui);
+                app.status_bar(ui);
+                match tab {
+                    Tab::Buttons => app.ui_buttons(ui),
+                    Tab::Device => app.ui_device(ui),
+                    Tab::Software => app.ui_software(ui),
+                }
+            });
+            text.clear();
+            for cs in &out.shapes {
+                if let EShape::Text(t) = &cs.shape { text.push_str(t.galley.text()); text.push('\n'); }
+            }
+        }
+        text
+    }
+
+    const SIZES: [(f32, f32); 2] = [(1280.0, 900.0), (780.0, 560.0)];
+
+    #[test]
+    fn every_tab_lays_out_in_both_modes_and_both_window_sizes() {
+        for no_device in [false, true] {
+            for mode in [Mode::Dark, Mode::Light] {
+                for size in SIZES {
+                    for (tab, _) in demo::TABS {
+                        let mut app = test_app();
+                        if !no_device { with_device(&mut app); }
+                        let text = render(&mut app, tab, mode, size);
+                        assert!(!text.is_empty(), "{tab:?} {mode:?} {size:?} drew nothing");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn low_battery_settings_are_visible_with_no_device() {
+        let mut app = test_app();
+        // the narrow case is tall: egui drops text that is entirely below the screen, and this test has no scroll area
+        for size in [(1280.0, 900.0), (780.0, 1800.0)] {
+            let text = render(&mut app, Tab::Device, Mode::Dark, size);
+            assert!(text.contains("LOW-BATTERY NOTIFICATION"), "{size:?}: section missing: {text}");
+            assert!(text.contains("Send a desktop notification when the battery is low"), "{size:?}");
+            assert!(text.contains("NOTIFY AT OR BELOW") && text.contains("CHECK EVERY"), "{size:?}");
+            assert!(text.contains("No device info."), "{size:?}: empty state missing");
+            assert!(!text.contains("POLLING RATE"), "{size:?}: DPI / polling need a device");
+        }
+    }
+
+    #[test]
+    fn device_tab_offers_all_seven_polling_rates_and_keeps_the_high_rate_warning() {
+        let mut app = test_app();
+        with_device(&mut app);
+        app.poll_edit = 8000;
+        let text = render(&mut app, Tab::Device, Mode::Dark, (1280.0, 900.0));
+        for hz in POLL_RATES { assert!(text.contains(&format!("{hz} HZ")), "{hz} Hz segment missing"); }
+        assert!(text.contains("Above 1000 Hz uses more CPU and battery"));
+    }
+
+    #[test]
+    fn buttons_tab_says_what_is_wrong_instead_of_an_empty_table() {
+        let mut app = test_app();
+        let text = render(&mut app, Tab::Buttons, Mode::Light, (780.0, 560.0));
+        assert!(text.contains("Wake the mouse and press Refresh."));
+        assert!(text.contains("KEY SYNTAX"), "key syntax footnote was always visible");
+        assert!(text.contains("RESET ALL TO DEFAULT"), "Reset stays enabled with no rows, as before");
+    }
+
+    #[test]
+    fn mouse_diagram_collapses_below_900px() {
+        let mut app = test_app();
+        with_device(&mut app);
+        let wide = render(&mut app, Tab::Buttons, Mode::Dark, (1280.0, 900.0));
+        let narrow = render(&mut app, Tab::Buttons, Mode::Dark, (780.0, 560.0));
+        assert!(wide.contains("TOP VIEW") && wide.contains("UNDERSIDE"));
+        assert!(!narrow.contains("TOP VIEW"));
+        assert!(narrow.contains("ONBOARD ASSIGNMENTS"));
+    }
+
+    #[test]
+    fn header_drops_the_device_name_when_narrow_but_keeps_the_battery() {
+        let mut app = test_app();
+        with_device(&mut app);
+        let name = app.info.as_ref().unwrap().name.clone();
+        assert!(render(&mut app, Tab::Device, Mode::Dark, (1280.0, 900.0)).matches(name.as_str()).count() >= 2);
+        let narrow = render(&mut app, Tab::Device, Mode::Dark, (780.0, 560.0));
+        assert_eq!(narrow.matches(name.as_str()).count(), 1, "only Status > NAME, not the header");
+        assert!(narrow.contains("82%"));
+    }
+
+    #[test]
+    fn choices_keep_their_fifteen_labels_and_order() {
+        let labels: Vec<&str> = CHOICES.iter().map(|(l, _)| *l).collect();
+        assert_eq!(labels, [
+            "Factory default", "Disabled", "Left click", "Right click", "Middle click", "Back", "Forward",
+            "Scroll up", "Scroll down", "Double click", "DPI up", "DPI down", "DPI cycle up", "DPI cycle down",
+            "Keyboard key…",
+        ]);
+        assert!(CHOICES.last().unwrap().1.is_none(), "last entry is the custom-key choice");
+    }
+
+    #[test]
+    fn row_is_dirty_only_when_the_dropdown_differs_from_the_mouse() {
+        let mut row = demo::rows().remove(3); // Back, factory default
+        assert!(!row.dirty());
+        row.choice = CHOICES.iter().position(|(l, _)| *l == "Disabled").unwrap();
+        assert!(row.dirty());
+        row.choice = CHOICES.len() - 1;
+        row.key_text = "f99".into(); // does not parse: still counts as an unsaved edit
+        assert!(row.dirty());
+    }
+
+    #[test]
+    fn selection_defaults_to_the_first_unlocked_row_and_ignores_stale_ids() {
+        let mut app = test_app();
+        assert_eq!(app.selected_id(), None);
+        with_device(&mut app);
+        assert_eq!(app.selected_id(), Some(2), "Left (1) is locked");
+        app.selected = Some(4);
+        assert_eq!(app.selected_id(), Some(4));
+        app.selected = Some(99);
+        assert_eq!(app.selected_id(), Some(2));
+    }
+
+    #[test]
+    fn button_names_carry_their_qualifier_separately() {
+        assert_eq!(pretty_button(3), ("Middle", "wheel click"));
+        assert_eq!(pretty_button(0x60), ("DPI", "underside"));
+        assert_eq!(pretty_button(1), ("Left", ""));
+        assert_eq!(pretty_button(0x42), ("Other", ""));
+    }
 }

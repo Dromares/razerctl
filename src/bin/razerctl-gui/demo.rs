@@ -42,7 +42,7 @@ pub struct Demo {
     pointer: Option<(String, String)>,
 }
 
-const TABS: [(Tab, &str); 3] = [(Tab::Buttons, "buttons"), (Tab::Device, "device"), (Tab::Software, "software")];
+pub const TABS: [(Tab, &str); 3] = [(Tab::Buttons, "buttons"), (Tab::Device, "device"), (Tab::Software, "software")];
 
 impl Demo {
     pub fn from_env() -> Self {
@@ -70,7 +70,7 @@ pub fn window_size() -> Option<(f32, f32)> {
     Some((w.parse().ok()?, h.parse().ok()?))
 }
 
-fn info(battery: u8, charging: bool) -> Info {
+pub fn info(battery: u8, charging: bool) -> Info {
     Info {
         name: "Razer Viper Mini Signature Edition (Wireless)".into(),
         firmware: Some("v1.04.00".into()),
@@ -83,7 +83,7 @@ fn info(battery: u8, charging: bool) -> Info {
     }
 }
 
-fn rows() -> Vec<ButtonRow> {
+pub fn rows() -> Vec<ButtonRow> {
     [1u8, 2, 3, 4, 5, 0x60, 9, 10].iter()
         .map(|id| ButtonRow::from_assignment(onboard::parse_action(*id, "default").expect("default action")))
         .collect()
@@ -122,7 +122,13 @@ pub fn apply(app: &mut App) {
             match name.as_str() {
                 "save-error-real" => {
                     app.rows[4].key_text = "f13".into();
-                    app.save_buttons(); // real path: no hardware here, so the real "No Razer mouse found" error
+                    // Real save path. Only ever against no hardware (run it with /sys/class/hidraw hidden), because
+                    // with a mouse attached it would write these synthetic assignments to it.
+                    if super::open_hidraw().is_ok() {
+                        app.err("save-error-real skipped: a Razer mouse is attached and would be written to.");
+                    } else {
+                        app.save_buttons();
+                    }
                 }
                 "save-error-asleep" => {
                     // what save_buttons() reports when the mouse goes to sleep mid-write on Back
@@ -176,7 +182,9 @@ pub fn step(app: &mut App, ctx: &egui::Context) {
         app.demo.snapshot = Some((dir, idx + 1, 0));
     } else {
         app.tab = TABS[tab].0;
-        if frames == 10 { ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default())); }
+        // synthetic pointer scenarios wait longer: popups fade in over ~100 ms
+        let settle = std::env::var("RAZERCTL_GUI_SETTLE").ok().and_then(|v| v.parse().ok()).unwrap_or(if app.demo.pointer.is_some() { 120 } else { 10 });
+        if frames == settle { ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default())); }
         app.demo.snapshot = Some((dir, idx, frames + 1));
     }
     ctx.request_repaint();
