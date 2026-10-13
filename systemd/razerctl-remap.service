@@ -1,0 +1,12 @@
+[Unit]
+Description=razerctl button remapping (Razer Synapse replacement)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/razerctl remap
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

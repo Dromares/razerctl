@@ -1,0 +1,9 @@
+//! razerctl — Linux rewrite of the Razer Synapse device-control core.
+//! Shared by the `razerctl` CLI and the `razerctl-gui` desktop app.
+
+pub mod battery;
+pub mod device;
+pub mod hidraw;
+pub mod onboard;
+pub mod protocol;
+pub mod remap;

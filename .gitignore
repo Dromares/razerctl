@@ -1,0 +1,6 @@
+/target
+# makepkg output
+/packaging/pkg/
+/packaging/src/
+/packaging/*.pkg.tar.*
+*.service.pkg
