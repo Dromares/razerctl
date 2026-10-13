@@ -1,6 +1,9 @@
+# Must sort BEFORE 73-seat-late.rules: that is where systemd applies the uaccess
+# tag. A 99-* file adds the tag too late and the ACL is never granted.
+#
 # Give the logged-in user access to Razer (VID 1532) hidraw nodes so razerctl can
 # send Protocol25 feature reports without root.  Install:
-#   sudo cp udev/99-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+#   sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
 KERNEL=="hidraw*", ATTRS{idVendor}=="1532", TAG+="uaccess", MODE="0660"
 # Without OpenRazer the mouse's /dev/input nodes are root:input; razerctl's button
 # tester and software remapper read them, so grant the desktop user access there too.

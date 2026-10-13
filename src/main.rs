@@ -155,7 +155,7 @@ fn run() -> Result<(), String> {
     let (node, dev) = devs.swap_remove(idx);
     let dev: Box<dyn Backend> = dev.map_err(|e| {
         let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
-            " — install udev/99-razerctl.rules or use --backend openrazer"
+            " — install udev/70-razerctl.rules or use --backend openrazer"
         } else { "" };
         format!("{}: {e}{hint}", node.dev.display())
     })?;

@@ -101,7 +101,7 @@ fn open_hidraw() -> Result<Hidraw, String> {
     let (node, _) = devs.into_iter().next().ok_or("No Razer mouse found. Is the receiver plugged in?")?;
     Hidraw::open(&node.dev).map_err(|e| {
         if e.kind() == std::io::ErrorKind::PermissionDenied {
-            format!("No permission for {} — install udev/99-razerctl.rules (see README)", node.dev.display())
+            format!("No permission for {} — install udev/70-razerctl.rules (see README)", node.dev.display())
         } else {
             e.to_string()
         }
@@ -387,10 +387,17 @@ impl App {
         ui.horizontal(|ui| {
             ui.label("Polling rate");
             egui::ComboBox::from_id_salt("poll").selected_text(format!("{} Hz", self.poll_edit)).show_ui(ui, |ui| {
-                for hz in [125u32, 500, 1000] { ui.selectable_value(&mut self.poll_edit, hz, format!("{hz} Hz")); }
+                // Same set Synapse's protocol layer supports (rzDevice25 RATE_125Hz..RATE_8000Hz).
+                for hz in [125u32, 250, 500, 1000, 2000, 4000, 8000] {
+                    ui.selectable_value(&mut self.poll_edit, hz, format!("{hz} Hz"));
+                }
             });
             if ui.button("Apply").clicked() { set_poll = Some(self.poll_edit); }
+            if let Some(p) = info.poll_rate { ui.weak(format!("current {p} Hz")); }
         });
+        if self.poll_edit > 1000 {
+            ui.weak("Above 1000 Hz uses more CPU and battery (Razer quotes roughly a quarter of the 1000 Hz battery life at 8000 Hz).");
+        }
         if ui.button("↻ Refresh").clicked() { self.refresh_device(); }
 
         ui.add_space(14.0);
@@ -438,7 +445,14 @@ impl App {
         }
         if let Some(p) = set_poll {
             match open_backend().and_then(|b| b.set_poll_rate(p).map_err(sleep_hint)) {
-                Ok(()) => { self.ok(format!("Polling rate set to {p} Hz")); self.refresh_device(); }
+                Ok(()) => {
+                    self.refresh_device();
+                    match self.info.as_ref().and_then(|i| i.poll_rate) {
+                        Some(now) if now == p => self.ok(format!("Polling rate set to {p} Hz (confirmed by the mouse).")),
+                        Some(now) => self.err(format!("The mouse accepted the command but reports {now} Hz, so it doesn't support {p} Hz in its current mode.")),
+                        None => self.ok(format!("Polling rate set to {p} Hz.")),
+                    }
+                }
                 Err(e) => self.err(e),
             }
         }

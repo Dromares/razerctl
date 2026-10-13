@@ -10,7 +10,8 @@ BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
 UNITS="$HOME/.config/systemd/user"
-RULE=/etc/udev/rules.d/99-razerctl.rules
+RULE=/etc/udev/rules.d/70-razerctl.rules
+OLD_RULE=/etc/udev/rules.d/99-razerctl.rules   # earlier versions; sorted too late for uaccess
 
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl --user disable --now razerctl-remap.service razerctl-battery.service 2>/dev/null || true
@@ -33,9 +34,10 @@ systemctl --user daemon-reload || true
 systemctl --user try-restart razerctl-battery.service 2>/dev/null || true
 update-desktop-database "$APPS" 2>/dev/null || true
 
-if ! cmp -s udev/99-razerctl.rules "$RULE" 2>/dev/null; then
+if ! cmp -s udev/70-razerctl.rules "$RULE" 2>/dev/null || [[ -e "$OLD_RULE" ]]; then
     echo "Installing udev rule (needs sudo once)…"
-    sudo install -Dm644 udev/99-razerctl.rules "$RULE"
+    sudo install -Dm644 udev/70-razerctl.rules "$RULE"
+    sudo rm -f "$OLD_RULE"
     sudo udevadm control --reload && sudo udevadm trigger
 fi
 echo "Installed. Launch 'razerctl' from your app menu, or run razerctl-gui."

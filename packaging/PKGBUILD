@@ -22,7 +22,7 @@ package() {
     install -Dm755 target/release/razerctl-gui      "$pkgdir/usr/bin/razerctl-gui"
     install -Dm644 packaging/razerctl.desktop       "$pkgdir/usr/share/applications/razerctl.desktop"
     install -Dm644 packaging/razerctl.svg           "$pkgdir/usr/share/icons/hicolor/scalable/apps/razerctl.svg"
-    install -Dm644 udev/99-razerctl.rules           "$pkgdir/usr/lib/udev/rules.d/99-razerctl.rules"
+    install -Dm644 udev/70-razerctl.rules           "$pkgdir/usr/lib/udev/rules.d/70-razerctl.rules"
     sed 's|%h/.local/bin/razerctl|/usr/bin/razerctl|' systemd/razerctl-remap.service \
         > razerctl-remap.service.pkg
     install -Dm644 razerctl-remap.service.pkg       "$pkgdir/usr/lib/systemd/user/razerctl-remap.service"
