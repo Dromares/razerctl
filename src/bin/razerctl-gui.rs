@@ -3,7 +3,7 @@
 //! Tabs:
 //!   Buttons   – remaps stored in the mouse's onboard memory (work with no software running)
 //!   Device    – battery, firmware, DPI, polling rate
-//!   Software  – optional computer-side remapper (uinput) config + systemd service
+//!   Software  – optional computer-side remapper (uinput): config, macros (macros.conf) + systemd service
 //! A live "button tester" at the bottom shows what the computer actually receives.
 //!
 //! The look (tokens, fonts, widgets, mouse diagram) lives in `razerctl-gui/`; this file keeps the state, the
@@ -19,13 +19,14 @@ mod theme;
 mod widgets;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{self, epaint::RectShape, pos2, vec2, Align2, Color32, Frame, Margin, Rect, RichText, Sense, Shape, Stroke};
 use razerctl::device::{self, Backend, Info, Prefer};
 use razerctl::hidraw::Hidraw;
+use razerctl::macros::{self, Macros};
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
 use razerctl::{battery, remap};
 use theme::*;
@@ -101,6 +102,10 @@ struct App {
     conf_path: PathBuf,
     conf_text: String,
     conf_error: Option<String>,
+    /// Raw text of macros.conf, edited as text (comments kept on save); `macros_error` is the last parse error.
+    macros_path: PathBuf,
+    macros_text: String,
+    macros_error: Option<String>,
     service_state: String,
     presses: Arc<Mutex<VecDeque<String>>>,
     watching: bool,
@@ -150,6 +155,8 @@ impl App {
         let conf_text = std::fs::read_to_string(&conf_path).unwrap_or_else(|_| {
             "# One rule per line:  BUTTON = ACTION\n# back = ctrl+c\n# forward = KEY_F13\n# middle = disable\n".into()
         });
+        let macros_path = macros::macros_path();
+        let macros_text = std::fs::read_to_string(&macros_path).unwrap_or_else(|_| MACROS_TEMPLATE.into());
         let mut app = App {
             tab: Tab::Buttons,
             status: String::new(),
@@ -163,6 +170,9 @@ impl App {
             conf_path,
             conf_text,
             conf_error: None,
+            macros_path,
+            macros_text,
+            macros_error: None,
             service_state: String::new(),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
@@ -296,6 +306,19 @@ impl App {
             Err(e) => self.err(e.to_string()),
         }
         self.refresh_service();
+    }
+
+    /// Write macros.conf as typed (comments kept), only if it parses. Nothing is sent to the mouse: macros are
+    /// played by the remap service, which reads the file when it starts.
+    fn save_macros(&mut self) {
+        if let Err(e) = macros::parse_macros(&self.macros_text) {
+            self.err(format!("Macros not saved: {e}"));
+            return;
+        }
+        match write_atomic(&self.macros_path, &self.macros_text) {
+            Ok(()) => self.ok("Macros saved. Restart the service to apply."),
+            Err(e) => self.err(format!("{}: {e}", self.macros_path.display())),
+        }
     }
 
     fn start_watch(&mut self, ctx: &egui::Context) {
@@ -957,6 +980,21 @@ impl App {
                 self.service_panel(ui);
             });
         });
+        // macros: full-width section, editor in the Config column and the parsed list in the Service column
+        // (stacked when narrow)
+        ui.add_space(S2);
+        section(ui, &p, "03", "Macros");
+        ui.with_layout(layout, |ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let parsed = ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(left_w);
+                self.macros_panel(ui)
+            }).inner;
+            ui.allocate_ui_with_layout(vec2(right_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(right_w);
+                self.macros_list(ui, &parsed);
+            });
+        });
     }
 
     fn config_panel(&mut self, ui: &mut egui::Ui) {
@@ -1044,6 +1082,76 @@ impl App {
             if btn_w(ui, &p, "↻  Refresh state", Kind::Secondary, true, bw).clicked() { self.refresh_service(); }
         });
     }
+
+    /// macros.conf editor, laid out like `config_panel`. Returns this frame's parse for the list beside it.
+    fn macros_panel(&mut self, ui: &mut egui::Ui) -> Result<Macros, String> {
+        let p = self.pal;
+        panel(ui, &p, 16, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S2;
+                ui.label(caps(&p, "Macros"));
+                ui.add(egui::Label::new(RichText::new(self.macros_path.display().to_string()).font(mono(T_DATA)).color(p.i100())).wrap());
+            });
+            ui.add_space(S2);
+            code_editor(ui, &p, "macros", &mut self.macros_text, self.macros_error.as_deref());
+            ui.add_space(S2);
+            let parsed = macros::parse_macros(&self.macros_text);
+            match &parsed {
+                Ok(m) => { chip(ui, &p, Some("●"), &format!("{} macro(s), valid", m.len()), ChipStyle::Plain, p.ok); self.macros_error = None; }
+                Err(e) => {
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = S3;
+                        chip(ui, &p, Some("×"), "Invalid", ChipStyle::Outline, p.bad);
+                        ui.add(egui::Label::new(RichText::new(e).font(mono(T_DATA)).color(p.bad)).wrap());
+                    });
+                    self.macros_error = Some(e.clone());
+                }
+            }
+            ui.add_space(S3);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S3;
+                if btn(ui, &p, "💾  Save macros", Kind::Primary, self.macros_error.is_none()).clicked() { self.save_macros(); }
+                ui.label(RichText::new(if self.macros_error.is_none() { "Restart the service to apply." } else { "Fix the error to enable saving." })
+                    .font(sans(T_SMALL)).color(p.i65()));
+            });
+            ui.add_space(S3);
+            hair(ui, &p);
+            ui.add_space(S3);
+            macro_syntax(ui, &p);
+            parsed
+        })
+    }
+
+    /// Read-only summary of the parsed macros: name, event count, total delay (user delays, before the
+    /// playback padding).
+    fn macros_list(&self, ui: &mut egui::Ui, parsed: &Result<Macros, String>) {
+        let p = self.pal;
+        panel(ui, &p, 16, |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let w = ui.available_width();
+            let num_w = 64.0;
+            let cols = [(w - 2.0 * num_w).max(0.0), num_w, num_w];
+            list_row(ui, cols, [caps(&p, "Name"), caps(&p, "Events"), caps(&p, "Delay")]);
+            ui.add_space(S1);
+            hair(ui, &p);
+            ui.add_space(S1);
+            let note = |ui: &mut egui::Ui, s: &str| {
+                ui.add_space(S1);
+                ui.add(egui::Label::new(RichText::new(s).font(sans(T_SMALL)).color(p.i65())).wrap());
+            };
+            match parsed {
+                Err(_) => note(ui, "Fix the error to list the macros."),
+                Ok(m) if m.is_empty() => note(ui, "No macros yet: add a [name] block with at least one event."),
+                Ok(m) => {
+                    for mac in m.values() {
+                        let (events, delay_ms) = macro_summary(mac);
+                        let cell = |s: String| RichText::new(s).font(mono(T_DATA)).color(p.i100());
+                        list_row(ui, cols, [cell(mac.name.clone()), cell(events.to_string()), cell(format!("{delay_ms} ms"))]);
+                    }
+                }
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------- layout helpers
@@ -1057,6 +1165,87 @@ fn key_syntax(ui: &mut egui::Ui, p: &Pal) {
         "Keys: letters, digits, f1–f24, enter, esc, tab, space, arrows, home/end/pageup/pagedown, insert/delete; \
          modifiers ctrl, shift, alt, super (one key + any modifiers).",
     ).font(sans(T_SMALL)).color(p.i65())).wrap());
+}
+
+/// macros.conf when there is none yet: comments only (zero macros, so it saves as is), with one working example.
+const MACROS_TEMPLATE: &str = "\
+# One [name] block per macro, one event per line. Bind it in Config:  forward = macro:copy
+# [copy]
+# down ctrl
+# delay 20
+# tap c
+# up ctrl
+";
+
+fn macro_syntax(ui: &mut egui::Ui, p: &Pal) {
+    ui.add(egui::Label::new(RichText::new(
+        "[name] · down/up/tap KEY · click BUTTON · delay MS · wheel N · hwheel N · move DX DY (keys as in Config). \
+         Bind in Config: forward = macro:NAME[,once|xN|held|toggle]",
+    ).font(sans(T_SMALL)).color(p.i65())).wrap());
+}
+
+/// Multiline code editor (as in `config_panel`): comment lines dimmed, the line named by a `line N: …` parse
+/// error highlighted (as of the previous frame's parse).
+fn code_editor(ui: &mut egui::Ui, p: &Pal, id: &str, text: &mut String, error: Option<&str>) {
+    let p = *p;
+    let err_line: Option<usize> = error.and_then(|e| e.strip_prefix("line ")?.split(':').next()?.parse().ok());
+    let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
+        let mut job = egui::text::LayoutJob::default();
+        job.wrap.max_width = wrap;
+        for (ln, line) in text.as_str().split_inclusive('\n').enumerate() {
+            let (c, f) = if line.trim_start().starts_with('#') { (p.i65(), mono(T_DATA + 1.0)) } else { (p.i100(), mono_med(T_DATA + 1.0)) };
+            let bg = if err_line == Some(ln + 1) { p.bad.gamma_multiply(0.22) } else { Color32::TRANSPARENT };
+            job.append(line, 0.0, egui::TextFormat { font_id: f, color: c, line_height: Some(20.0), background: bg, ..Default::default() });
+        }
+        ui.painter().layout_job(job)
+    };
+    let w = ui.available_width();
+    ui.add(egui::TextEdit::multiline(text).id_salt(id).code_editor().desired_rows(9).desired_width(w)
+        .layouter(&mut layouter).margin(Margin::same(12)));
+}
+
+/// One row of the macros list: a left-aligned name column, then right-aligned number columns. Long names are
+/// truncated (full text on hover).
+fn list_row(ui: &mut egui::Ui, cols: [f32; 3], cells: [RichText; 3]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+        for (i, (w, cell)) in cols.into_iter().zip(cells).enumerate() {
+            let layout = if i == 0 { egui::Layout::left_to_right(egui::Align::Center) } else { egui::Layout::right_to_left(egui::Align::Center) };
+            ui.allocate_ui_with_layout(vec2(w, 22.0), layout, |ui| {
+                ui.set_min_size(vec2(w, 22.0));
+                ui.add(egui::Label::new(cell).truncate());
+            });
+        }
+    });
+}
+
+/// (event count, sum of the macro's own delays in ms). `tap` / `click` count as two events, as in the file
+/// format's limit; Synapse's playback padding is not included.
+fn macro_summary(m: &macros::Macro) -> (usize, u64) {
+    let delay = m.events.iter().map(|e| match e { macros::MacroEvent::Delay(ms) => u64::from(*ms), _ => 0 }).sum();
+    (m.events.len(), delay)
+}
+
+/// Write `text` to a temp file next to `path`, then rename it over `path` (creating the parent dir), so a crash
+/// never leaves a half-written file. The temp file is removed if anything fails.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 /// Title row: serif display title left, one- or two-line intro in a fixed column to its right.
@@ -1203,6 +1392,9 @@ mod tests {
             conf_path: PathBuf::from("/nonexistent/razerctl/remap.conf"),
             conf_text: "# back = ctrl+c\n".into(),
             conf_error: None,
+            macros_path: PathBuf::from("/nonexistent/razerctl/macros.conf"),
+            macros_text: MACROS_TEMPLATE.into(),
+            macros_error: None,
             service_state: "inactive".into(),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
@@ -1224,6 +1416,12 @@ mod tests {
 
     /// Lay out one frame of `tab` (header, strip, tester, status bar and the tab body) and return every string drawn.
     fn render(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> String {
+        render_texts(app, tab, mode, size).into_iter().map(|(s, ..)| s + "\n").collect()
+    }
+
+    /// Like `render`, one entry per string drawn: text, position, and override colour (buttons paint their label
+    /// with one, so it tells an enabled button from a disabled one).
+    fn render_texts(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> Vec<(String, egui::Pos2, Option<Color32>)> {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         app.pal = Pal::new(mode);
@@ -1231,7 +1429,7 @@ mod tests {
         app.tab = tab;
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(size.0, size.1)));
-        let mut text = String::new();
+        let mut texts = Vec::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(input.clone(), |ui| {
                 app.header(ui);
@@ -1244,17 +1442,23 @@ mod tests {
                     Tab::Software => app.ui_software(ui),
                 }
             });
-            text.clear();
+            texts.clear();
             for cs in &out.shapes {
-                if let EShape::Text(t) = &cs.shape { text.push_str(t.galley.text()); text.push('\n'); }
+                if let EShape::Text(t) = &cs.shape { texts.push((t.galley.text().to_string(), t.pos, t.override_text_color)); }
             }
             // No renderer consumes the font-atlas upload here; epaint 0.36 panics on drop if it is left unapplied.
             out.textures_delta.clear();
         }
-        text
+        texts
     }
 
     const SIZES: [(f32, f32); 2] = [(1280.0, 900.0), (780.0, 560.0)];
+    /// Window height that fits the whole Software tab, macros included, in both widths (render has no scroll area).
+    const TALL: f32 = 2400.0;
+
+    /// copy: 5 events (tap = down + up), 30 ms; scroll: 3 events, 15 ms.
+    const MACROS: &str = "# two macros\n[copy]\ndown ctrl\ndelay 30\ntap c\nup ctrl\n\n[scroll]\nwheel 1\ndelay 15\nwheel 1\n";
+    const BAD_MACROS: &str = "[copy]\ndown ctrl\ntap c\n";
 
     #[test]
     fn every_tab_lays_out_in_both_modes_and_both_window_sizes() {
@@ -1266,6 +1470,15 @@ mod tests {
                         if !no_device { with_device(&mut app); }
                         let text = render(&mut app, tab, mode, size);
                         assert!(!text.is_empty(), "{tab:?} {mode:?} {size:?} drew nothing");
+                    }
+                    // the macros section is below the fold at these heights: lay it out tall enough to be drawn,
+                    // with the template (empty list), real macros and a parse error
+                    for macros_text in [MACROS_TEMPLATE, MACROS, BAD_MACROS] {
+                        let mut app = test_app();
+                        if !no_device { with_device(&mut app); }
+                        app.macros_text = macros_text.into();
+                        let text = render(&mut app, Tab::Software, mode, (size.0, TALL));
+                        assert!(text.contains("03 // MACROS") && text.contains("SAVE MACROS"), "{mode:?} {size:?}: {text}");
                     }
                 }
             }
@@ -1367,5 +1580,114 @@ mod tests {
         assert_eq!(pretty_button(0x60), ("DPI", "underside"));
         assert_eq!(pretty_button(1), ("Left", ""));
         assert_eq!(pretty_button(0x42), ("Other", ""));
+    }
+
+    /// Override colour of the drawn "SAVE MACROS" label: stamp_fg when the button is enabled, ink-45 when not.
+    fn save_macros_colour(texts: &[(String, egui::Pos2, Option<Color32>)]) -> Option<Color32> {
+        texts.iter().find(|(s, ..)| s.ends_with("SAVE MACROS")).and_then(|(_, _, c)| *c)
+    }
+
+    #[test]
+    fn macros_section_lists_valid_macros_and_refuses_to_save_invalid_ones() {
+        for size in SIZES {
+            let size = (size.0, TALL);
+            let mut app = test_app();
+            app.macros_text = MACROS.into();
+            let texts = render_texts(&mut app, Tab::Software, Mode::Dark, size);
+            let lines: Vec<&str> = texts.iter().map(|(s, ..)| s.as_str()).collect();
+            assert!(lines.contains(&"2 MACRO(S), VALID"), "{size:?}: {lines:?}");
+            for cell in ["copy", "5", "30 ms", "scroll", "3", "15 ms"] {
+                assert!(lines.contains(&cell), "{size:?}: list cell {cell:?} missing: {lines:?}");
+            }
+            assert!(lines.contains(&"/nonexistent/razerctl/macros.conf"), "{size:?}: path missing");
+            assert_eq!(app.macros_error, None);
+            assert_eq!(save_macros_colour(&texts), Some(app.pal.stamp_fg), "{size:?}: Save should be enabled");
+
+            app.macros_text = BAD_MACROS.into();
+            let texts = render_texts(&mut app, Tab::Software, Mode::Dark, size);
+            let lines: Vec<&str> = texts.iter().map(|(s, ..)| s.as_str()).collect();
+            let err = "line 2: macro 'copy' leaves KEY_LEFTCTRL pressed";
+            assert_eq!(app.macros_error.as_deref(), Some(err));
+            assert!(lines.contains(&"INVALID") && lines.contains(&err), "{size:?}: {lines:?}");
+            assert!(lines.contains(&"Fix the error to enable saving."), "{size:?}");
+            assert!(lines.contains(&"Fix the error to list the macros."), "{size:?}");
+            assert!(!lines.contains(&"copy"), "{size:?}: no list while the text doesn't parse");
+            assert_eq!(save_macros_colour(&texts), Some(app.pal.i45()), "{size:?}: Save should be disabled");
+            assert!(app.status.is_empty(), "nothing was saved or reported");
+        }
+    }
+
+    #[test]
+    fn macros_list_sits_beside_the_editor_when_wide_and_under_it_when_narrow() {
+        let at = |texts: &[(String, egui::Pos2, Option<Color32>)], s: &str| {
+            texts.iter().find(|(t, ..)| t == s).map(|(_, pos, _)| *pos).unwrap_or_else(|| panic!("{s} not drawn"))
+        };
+        let mut app = test_app();
+        let wide = render_texts(&mut app, Tab::Software, Mode::Light, (1280.0, TALL));
+        let (editor, list) = (at(&wide, "MACROS"), at(&wide, "NAME"));
+        assert!(list.x > editor.x + 600.0 && (list.y - editor.y).abs() < 4.0, "wide: editor {editor:?}, list {list:?}");
+        let narrow = render_texts(&mut app, Tab::Software, Mode::Light, (780.0, TALL));
+        let (editor, list) = (at(&narrow, "MACROS"), at(&narrow, "NAME"));
+        assert!((list.x - editor.x).abs() < 4.0 && list.y > editor.y + 200.0, "narrow: editor {editor:?}, list {list:?}");
+        assert!(narrow.iter().any(|(t, ..)| t == "No macros yet: add a [name] block with at least one event."));
+    }
+
+    #[test]
+    fn macros_template_is_valid_and_its_commented_example_is_a_working_macro() {
+        assert!(macros::parse_macros(MACROS_TEMPLATE).unwrap().is_empty(), "comments only: saves as is");
+        let example: String = MACROS_TEMPLATE.lines().skip_while(|l| !l.starts_with("# [")).map(|l| format!("{}\n", &l[2..])).collect();
+        let m = macros::parse_macros(&example).unwrap();
+        assert_eq!(m.keys().collect::<Vec<_>>(), ["copy"]);
+        assert_eq!(macro_summary(&m["copy"]), (5, 20));
+        assert!(MACROS_TEMPLATE.contains("forward = macro:copy"), "the template says how to bind it");
+    }
+
+    /// Unique dir under the system temp dir, removed on drop (also when a test fails).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            TempDir(std::env::temp_dir().join(format!("razerctl-gui-{tag}-{}-{nanos}", std::process::id())))
+        }
+        fn names(&self, sub: &str) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.0.join(sub)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn save_macros_writes_the_raw_text_via_a_temp_file_and_leaves_none_behind() {
+        let dir = TempDir::new("macros-save");
+        let mut app = test_app();
+        app.macros_path = dir.0.join("razerctl/macros.conf");
+        app.macros_text = MACROS.into();
+        app.save_macros(); // creates razerctl/
+        assert!(!app.status_is_error, "{}", app.status);
+        assert_eq!(app.status, "Macros saved. Restart the service to apply.");
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), MACROS, "raw text, comments kept");
+        app.macros_text = MACROS_TEMPLATE.into();
+        app.save_macros(); // overwrite
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), MACROS_TEMPLATE);
+        assert_eq!(dir.names("razerctl"), ["macros.conf"]);
+
+        // text that doesn't parse is refused before touching the file
+        app.ok("");
+        app.macros_text = BAD_MACROS.into();
+        app.save_macros();
+        assert!(app.status_is_error && app.status.contains("line 2:"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), MACROS_TEMPLATE);
+
+        // a failed rename (target is a directory) cleans up its temp file
+        std::fs::create_dir(dir.0.join("razerctl/sub")).unwrap();
+        assert!(write_atomic(&dir.0.join("razerctl/sub"), "x").is_err());
+        assert_eq!(dir.names("razerctl"), ["macros.conf", "sub"]);
     }
 }

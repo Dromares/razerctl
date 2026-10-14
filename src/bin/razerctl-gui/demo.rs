@@ -153,6 +153,7 @@ pub fn apply(app: &mut App) {
         }
         "software" => {
             app.conf_text = "# One rule per line:  BUTTON = ACTION\nback = ctrl+c\nforward = KEY_F13\nmiddle = disable\n".into();
+            app.macros_text = "# Bind in Config:  forward = macro:copy\n[copy]\ndown ctrl\ndelay 20\ntap c\nup ctrl\n\n[scroll-3]\nwheel 1\ndelay 15\nwheel 1\ndelay 15\nwheel 1\n".into();
             app.service_state = "active".into();
             app.ok("Config saved. Restart the service to apply.");
         }
