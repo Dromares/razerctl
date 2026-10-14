@@ -34,7 +34,7 @@ pub enum Action {
 
 pub type Mapping = HashMap<KeyCode, Action>;
 
-fn parse_key(s: &str) -> Result<KeyCode, String> {
+pub fn parse_key(s: &str) -> Result<KeyCode, String> {
     let s = s.trim();
     let up = s.to_ascii_uppercase();
     // friendly aliases

@@ -4,6 +4,7 @@
 pub mod battery;
 pub mod device;
 pub mod hidraw;
+pub mod macros;
 pub mod onboard;
 pub mod protocol;
 pub mod remap;
