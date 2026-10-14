@@ -937,7 +937,7 @@ impl App {
                 if let Some(i) = segmented(ui, &p, "poll", &labels, active, 60.0) { self.poll_edit = POLL_RATES[i]; }
                 let differs = current != Some(self.poll_edit);
                 if btn(ui, &p, "Apply", if differs { Kind::Primary } else { Kind::Secondary }, true).clicked() { set = Some(self.poll_edit); }
-                if let Some(c) = current { ui.label(RichText::new(format!("current {c} Hz")).font(mono(T_DATA)).color(p.i65())); }
+                if let Some(c) = current { ui.add(egui::Label::new(RichText::new(format!("current {c} Hz")).font(mono(T_DATA)).color(p.i65())).wrap_mode(egui::TextWrapMode::Extend)); }
             });
             if self.poll_edit > 1000 {
                 ui.add_space(S1);
