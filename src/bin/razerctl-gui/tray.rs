@@ -38,7 +38,10 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings { close_to_tray: true, notified: false }
+        Settings {
+            close_to_tray: true,
+            notified: false,
+        }
     }
 }
 
@@ -51,7 +54,9 @@ pub fn parse_settings(text: &str) -> Settings {
     let mut s = Settings::default();
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
-        let Some((k, v)) = line.split_once('=') else { continue };
+        let Some((k, v)) = line.split_once('=') else {
+            continue;
+        };
         let v = matches!(v.trim(), "true" | "yes" | "1" | "on");
         match k.trim() {
             "close_to_tray" => s.close_to_tray = v,
@@ -70,7 +75,9 @@ pub fn format_settings(s: &Settings) -> String {
 }
 
 pub fn load_settings(path: &Path) -> Settings {
-    std::fs::read_to_string(path).map(|t| parse_settings(&t)).unwrap_or_default()
+    std::fs::read_to_string(path)
+        .map(|t| parse_settings(&t))
+        .unwrap_or_default()
 }
 
 pub fn save_settings(path: &Path, s: &Settings) -> std::io::Result<()> {
@@ -90,7 +97,11 @@ pub enum CloseAction {
 /// What closing the window does. With no StatusNotifier host there is nowhere to hide to, and a hidden window the user
 /// cannot get back would be worse than quitting (DAN-1452 decision 4), so the stored choice is kept but not obeyed.
 pub fn close_action(close_to_tray: bool, host_present: bool) -> CloseAction {
-    if close_to_tray && host_present { CloseAction::Hide } else { CloseAction::Quit }
+    if close_to_tray && host_present {
+        CloseAction::Hide
+    } else {
+        CloseAction::Quit
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ what the tray shows
@@ -122,7 +133,11 @@ pub struct Snapshot {
 
 impl Default for Snapshot {
     fn default() -> Self {
-        Snapshot { device: None, remap: RemapLine::Stopped, threshold: battery::Config::default().threshold }
+        Snapshot {
+            device: None,
+            remap: RemapLine::Stopped,
+            threshold: battery::Config::default().threshold,
+        }
     }
 }
 
@@ -137,7 +152,13 @@ pub enum Glyph {
 
 impl Glyph {
     #[cfg(test)]
-    pub const ALL: [Glyph; 5] = [Glyph::NoDevice, Glyph::Low, Glyph::Charging, Glyph::Remap, Glyph::Normal];
+    pub const ALL: [Glyph; 5] = [
+        Glyph::NoDevice,
+        Glyph::Low,
+        Glyph::Charging,
+        Glyph::Remap,
+        Glyph::Normal,
+    ];
 
     /// Symbolic icon name, as in `tray-icons.png`.
     pub fn icon_name(self) -> &'static str {
@@ -153,14 +174,18 @@ impl Glyph {
 
 impl Snapshot {
     pub fn is_low(&self) -> bool {
-        self.device.as_ref().is_some_and(|d| !d.charging && d.pct.is_some_and(|p| p <= self.threshold))
+        self.device
+            .as_ref()
+            .is_some_and(|d| !d.charging && d.pct.is_some_and(|p| p <= self.threshold))
     }
 }
 
 /// The icon shows the first condition that is true: no mouse, low, charging, remap running, normal. Never "passive":
 /// KDE folds passive items into the overflow menu, which would hide the icon exactly when no mouse is found.
 pub fn glyph(s: &Snapshot) -> Glyph {
-    let Some(d) = &s.device else { return Glyph::NoDevice };
+    let Some(d) = &s.device else {
+        return Glyph::NoDevice;
+    };
     if s.is_low() {
         Glyph::Low
     } else if d.charging {
@@ -174,7 +199,9 @@ pub fn glyph(s: &Snapshot) -> Glyph {
 
 /// `razerctl · Viper Mini SE · 14% (low)`, as in the tooltip column of `tray-icons.png`.
 pub fn tooltip(s: &Snapshot) -> String {
-    let Some(d) = &s.device else { return "razerctl · no mouse found".into() };
+    let Some(d) = &s.device else {
+        return "razerctl · no mouse found".into();
+    };
     let mut t = format!("razerctl · {}", d.name);
     if let Some(p) = d.pct {
         t.push_str(&format!(" · {p}%"));
@@ -201,7 +228,11 @@ pub enum Act {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Row {
-    Action { label: &'static str, act: Act, enabled: bool },
+    Action {
+        label: &'static str,
+        act: Act,
+        enabled: bool,
+    },
     Info(String),
     Sep,
 }
@@ -225,26 +256,70 @@ pub fn menu_rows(s: &Snapshot) -> Vec<Row> {
         }
     };
     let (remap, toggle) = match s.remap {
-        RemapLine::Running => ("● Remap running", Row::Action { label: "Stop remap", act: Act::StopRemap, enabled: true }),
-        RemapLine::Waiting => ("○ Remap waiting for the mouse", Row::Action { label: "Stop remap", act: Act::StopRemap, enabled: true }),
-        RemapLine::Stopped => ("○ Remap stopped", Row::Action { label: "Start remap", act: Act::StartRemap, enabled: true }),
-        RemapLine::Failed => ("× Remap failed", Row::Action { label: "Start remap", act: Act::StartRemap, enabled: true }),
+        RemapLine::Running => (
+            "● Remap running",
+            Row::Action {
+                label: "Stop remap",
+                act: Act::StopRemap,
+                enabled: true,
+            },
+        ),
+        RemapLine::Waiting => (
+            "○ Remap waiting for the mouse",
+            Row::Action {
+                label: "Stop remap",
+                act: Act::StopRemap,
+                enabled: true,
+            },
+        ),
+        RemapLine::Stopped => (
+            "○ Remap stopped",
+            Row::Action {
+                label: "Start remap",
+                act: Act::StartRemap,
+                enabled: true,
+            },
+        ),
+        RemapLine::Failed => (
+            "× Remap failed",
+            Row::Action {
+                label: "Start remap",
+                act: Act::StartRemap,
+                enabled: true,
+            },
+        ),
     };
     vec![
-        Row::Action { label: "Show razerctl", act: Act::Show, enabled: true },
+        Row::Action {
+            label: "Show razerctl",
+            act: Act::Show,
+            enabled: true,
+        },
         Row::Sep,
         Row::Info(device),
         Row::Sep,
         Row::Info(remap.into()),
         toggle,
-        Row::Action { label: "Stop all macros", act: Act::StopMacros, enabled: s.remap == RemapLine::Running },
+        Row::Action {
+            label: "Stop all macros",
+            act: Act::StopMacros,
+            enabled: s.remap == RemapLine::Running,
+        },
         Row::Sep,
-        Row::Action { label: "Quit razerctl", act: Act::Quit, enabled: true },
+        Row::Action {
+            label: "Quit razerctl",
+            act: Act::Quit,
+            enabled: true,
+        },
     ]
 }
 
 /// One reading of the world, as the poller sees it. `unit` is `systemctl is-active` for the remap unit.
-pub fn snapshot_from(read: Result<(String, u8, bool), String>, unit: &str, threshold: u8) -> Snapshot {
+pub fn snapshot_from(
+    read: Result<(String, u8, bool), String>,
+    unit: &str,
+    threshold: u8,
+) -> Snapshot {
     let device = read.ok().map(|(name, pct, charging)| Reading {
         name: name.strip_prefix("Razer ").unwrap_or(&name).to_string(),
         pct: Some(pct),
@@ -256,7 +331,11 @@ pub fn snapshot_from(read: Result<(String, u8, bool), String>, unit: &str, thres
         "failed" => RemapLine::Failed,
         _ => RemapLine::Stopped,
     };
-    Snapshot { device, remap, threshold }
+    Snapshot {
+        device,
+        remap,
+        threshold,
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ pixmaps
@@ -296,14 +375,28 @@ pub fn pixmap(g: Glyph, size: u32) -> ksni::Icon {
             let (r, gc, b, alpha) = if a > 0.0 {
                 let alpha = a + (1.0 - a) * halo * 0.55;
                 let mix = a / alpha;
-                (0xe8 as f32 * mix, 0xe8 as f32 * mix, 0xe8 as f32 * mix, alpha)
+                (
+                    0xe8 as f32 * mix,
+                    0xe8 as f32 * mix,
+                    0xe8 as f32 * mix,
+                    alpha,
+                )
             } else {
                 (0.0, 0.0, 0.0, halo * 0.55)
             };
-            data.extend_from_slice(&[(alpha * 255.0).round() as u8, r.round() as u8, gc.round() as u8, b.round() as u8]);
+            data.extend_from_slice(&[
+                (alpha * 255.0).round() as u8,
+                r.round() as u8,
+                gc.round() as u8,
+                b.round() as u8,
+            ]);
         }
     }
-    ksni::Icon { width: size as i32, height: size as i32, data }
+    ksni::Icon {
+        width: size as i32,
+        height: size as i32,
+        data,
+    }
 }
 
 fn rrect_sdf(x: f32, y: f32, (l, t, r, b): (f32, f32, f32, f32), rad: f32) -> f32 {
@@ -334,11 +427,10 @@ fn glyph_covers(g: Glyph, x: f32, y: f32) -> bool {
         let ang = (y - 11.0).atan2(x - 11.0) + std::f32::consts::PI;
         ring && ((ang / (std::f32::consts::TAU / 18.0)) as u32).is_multiple_of(2)
     } else {
-        ring
-            || (rrect_sdf(x, y, body, 5.0) < 0.0
-                && ((y - 9.5).abs() <= 0.8 && (6.8..=15.2).contains(&x)
-                    || seg_dist(x, y, (11.0, 2.8), (11.0, 9.5)) <= 0.8
-                    || ((10.0..=12.0).contains(&x) && (4.2..=7.4).contains(&y))))
+        ring || (rrect_sdf(x, y, body, 5.0) < 0.0
+            && ((y - 9.5).abs() <= 0.8 && (6.8..=15.2).contains(&x)
+                || seg_dist(x, y, (11.0, 2.8), (11.0, 9.5)) <= 0.8
+                || ((10.0..=12.0).contains(&x) && (4.2..=7.4).contains(&y))))
     };
     let d = ((x - 16.2).powi(2) + (y - 16.2).powi(2)).sqrt();
     match g {
@@ -347,10 +439,14 @@ fn glyph_covers(g: Glyph, x: f32, y: f32) -> bool {
                 on = d <= 4.4;
             }
             if g == Glyph::Low {
-                if seg_dist(x, y, (16.2, 13.6), (16.2, 16.3)) <= 0.8 || ((x - 16.2).powi(2) + (y - 18.4).powi(2)).sqrt() <= 0.9 {
+                if seg_dist(x, y, (16.2, 13.6), (16.2, 16.3)) <= 0.8
+                    || ((x - 16.2).powi(2) + (y - 18.4).powi(2)).sqrt() <= 0.9
+                {
                     on = false;
                 }
-            } else if in_tri(x, y, (17.0, 12.8), (14.4, 16.6), (16.3, 16.6)) || in_tri(x, y, (16.1, 15.8), (18.0, 15.8), (15.4, 19.6)) {
+            } else if in_tri(x, y, (17.0, 12.8), (14.4, 16.6), (16.3, 16.6))
+                || in_tri(x, y, (16.1, 15.8), (18.0, 15.8), (15.4, 19.6))
+            {
                 on = false;
             }
         }
@@ -383,12 +479,20 @@ struct Shared {
 impl Shared {
     fn send(&self, c: Cmd) {
         let _ = self.cmds.send(c);
-        if let Some(ctx) = self.repaint.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+        if let Some(ctx) = self
+            .repaint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             ctx.request_repaint();
         }
     }
     fn snapshot(&self) -> Snapshot {
-        self.snap.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        self.snap
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -404,7 +508,11 @@ fn run_act(shared: &Arc<Shared>, act: Act) {
         Act::Quit => shared.send(Cmd::Quit),
         Act::StartRemap | Act::StopRemap | Act::StopMacros => {
             // systemctl takes a moment and the menu callback must not block; read the result back right after
-            let poke = shared.poke.lock().unwrap_or_else(PoisonError::into_inner).clone();
+            let poke = shared
+                .poke
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
             std::thread::spawn(move || {
                 let sys = RealSys;
                 let r = match act {
@@ -432,7 +540,11 @@ impl ksni::Tray for Item {
         ksni::Category::Hardware
     }
     fn status(&self) -> ksni::Status {
-        if glyph(&self.shared.snapshot()) == Glyph::Low { ksni::Status::NeedsAttention } else { ksni::Status::Active }
+        if glyph(&self.shared.snapshot()) == Glyph::Low {
+            ksni::Status::NeedsAttention
+        } else {
+            ksni::Status::Active
+        }
     }
     fn icon_name(&self) -> String {
         glyph(&self.shared.snapshot()).icon_name().into()
@@ -445,7 +557,10 @@ impl ksni::Tray for Item {
         Glyph::Low.icon_name().into()
     }
     fn tool_tip(&self) -> ksni::ToolTip {
-        ksni::ToolTip { title: tooltip(&self.shared.snapshot()), ..Default::default() }
+        ksni::ToolTip {
+            title: tooltip(&self.shared.snapshot()),
+            ..Default::default()
+        }
     }
     fn activate(&mut self, _x: i32, _y: i32) {
         self.shared.send(Cmd::Show);
@@ -456,8 +571,17 @@ impl ksni::Tray for Item {
             .into_iter()
             .map(|r| match r {
                 Row::Sep => MenuItem::Separator,
-                Row::Info(t) => StandardItem { label: t, enabled: false, ..Default::default() }.into(),
-                Row::Action { label, act, enabled } => StandardItem {
+                Row::Info(t) => StandardItem {
+                    label: t,
+                    enabled: false,
+                    ..Default::default()
+                }
+                .into(),
+                Row::Action {
+                    label,
+                    act,
+                    enabled,
+                } => StandardItem {
                     label: label.into(),
                     enabled,
                     activate: Box::new(move |this: &mut Self| run_act(&this.shared, act)),
@@ -512,7 +636,12 @@ impl Host {
         };
         // off the main thread: registering with a slow or hung StatusNotifierWatcher must not hold up the window
         let bg = host.clone();
-        std::thread::Builder::new().name("tray register".into()).spawn(move || { bg.try_spawn(); }).ok();
+        std::thread::Builder::new()
+            .name("tray register".into())
+            .spawn(move || {
+                bg.try_spawn();
+            })
+            .ok();
         let (shared, handle) = (host.shared.clone(), host.handle.clone());
         std::thread::Builder::new()
             .name("tray poller".into())
@@ -542,7 +671,11 @@ impl Host {
 
     /// Commands that arrived since the last call.
     pub fn drain(&self) -> Vec<Cmd> {
-        self.cmds.lock().unwrap_or_else(PoisonError::into_inner).try_iter().collect()
+        self.cmds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .try_iter()
+            .collect()
     }
 
     fn try_spawn(&self) -> bool {
@@ -552,7 +685,12 @@ impl Host {
             return true;
         }
         self.online.store(true, Ordering::Relaxed);
-        match (Item { shared: self.shared.clone(), online: self.online.clone() }).spawn() {
+        match (Item {
+            shared: self.shared.clone(),
+            online: self.online.clone(),
+        })
+        .spawn()
+        {
             Ok(handle) => {
                 *h = Some(handle);
                 true
@@ -580,38 +718,66 @@ impl Host {
             Some(p) => p,
             None => {
                 self.online.load(Ordering::Relaxed)
-                    && self.handle.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|h| !h.is_closed())
+                    && self
+                        .handle
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .as_ref()
+                        .is_some_and(|h| !h.is_closed())
             }
         }
     }
 
     pub fn attach_window(&self, ctx: &egui::Context) {
-        *self.shared.repaint.lock().unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
+        *self
+            .shared
+            .repaint
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(ctx.clone());
     }
 
     pub fn set_outcome(&self, a: CloseAction) {
-        *self.shared.outcome.lock().unwrap_or_else(PoisonError::into_inner) = Some(a);
+        *self
+            .shared
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(a);
     }
 
     pub fn outcome(&self) -> Option<CloseAction> {
-        *self.shared.outcome.lock().unwrap_or_else(PoisonError::into_inner)
+        *self
+            .shared
+            .outcome
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Re-read the world soon (after the window started or stopped the service).
     pub fn poke(&self) {
-        let _ = self.shared.poke.lock().unwrap_or_else(PoisonError::into_inner).send(());
+        let _ = self
+            .shared
+            .poke
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send(());
     }
 }
 
 /// Battery and remap state every 30 s (and on a poke), whether or not a window exists: this is the "keep polling
 /// while hidden" requirement, and it is a plain thread so it cannot depend on a frame being drawn.
-fn poll_forever(shared: &Arc<Shared>, handle: &Arc<Mutex<Option<TrayHandle>>>, poke: &Receiver<()>) {
+fn poll_forever(
+    shared: &Arc<Shared>,
+    handle: &Arc<Mutex<Option<TrayHandle>>>,
+    poke: &Receiver<()>,
+) {
     const EVERY: Duration = Duration::from_secs(30);
     let sys = RealSys;
     loop {
         let threshold = battery::load().threshold;
         let read = battery::read_battery().map_err(|e| e.to_string());
-        let unit = service::systemctl(&sys, &["is-active", SERVICE]).map(|o| o.stdout.trim().to_string()).unwrap_or_default();
+        let unit = service::systemctl(&sys, &["is-active", SERVICE])
+            .map(|o| o.stdout.trim().to_string())
+            .unwrap_or_default();
         let snap = snapshot_from(read, &unit, threshold);
         let changed = {
             let mut cur = shared.snap.lock().unwrap_or_else(PoisonError::into_inner);
@@ -620,7 +786,11 @@ fn poll_forever(shared: &Arc<Shared>, handle: &Arc<Mutex<Option<TrayHandle>>>, p
             changed
         };
         if changed {
-            if let Some(h) = handle.lock().unwrap_or_else(PoisonError::into_inner).as_ref() {
+            if let Some(h) = handle
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+            {
                 h.update(|_| {}); // re-emit icon, tooltip and menu from the new snapshot
             }
         }
@@ -638,14 +808,20 @@ fn poll_forever(shared: &Arc<Shared>, handle: &Arc<Mutex<Option<TrayHandle>>>, p
 pub fn linger(host: &Host) -> Cmd {
     let mut gone = 0;
     loop {
-        let got = host.cmds.lock().unwrap_or_else(PoisonError::into_inner).recv_timeout(Duration::from_secs(2));
+        let got = host
+            .cmds
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .recv_timeout(Duration::from_secs(2));
         match got {
             Ok(c) => return c,
             Err(RecvTimeoutError::Disconnected) => return Cmd::Quit,
             Err(RecvTimeoutError::Timeout) => {
                 gone = if host.present() { 0 } else { gone + 1 };
                 if gone >= 5 {
-                    eprintln!("tray: the icon is gone; reopening the window instead of running unseen");
+                    eprintln!(
+                        "tray: the icon is gone; reopening the window instead of running unseen"
+                    );
                     return Cmd::Show;
                 }
             }
@@ -660,7 +836,9 @@ pub fn reopen_window() -> std::io::Error {
     // out before exec closes the D-Bus connection under it
     std::thread::sleep(Duration::from_millis(250));
     match std::env::current_exe() {
-        Ok(exe) => std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec(),
+        Ok(exe) => std::process::Command::new(exe)
+            .args(std::env::args_os().skip(1))
+            .exec(),
         Err(e) => e,
     }
 }
@@ -692,10 +870,18 @@ mod tests {
     use super::*;
 
     fn dev(pct: u8, charging: bool) -> Option<Reading> {
-        Some(Reading { name: "Viper Mini SE".into(), pct: Some(pct), charging })
+        Some(Reading {
+            name: "Viper Mini SE".into(),
+            pct: Some(pct),
+            charging,
+        })
     }
     fn snap(device: Option<Reading>, remap: RemapLine) -> Snapshot {
-        Snapshot { device, remap, threshold: 20 }
+        Snapshot {
+            device,
+            remap,
+            threshold: 20,
+        }
     }
 
     #[test]
@@ -703,7 +889,11 @@ mod tests {
         use CloseAction::*;
         // (close_to_tray, host present) -> action
         assert_eq!(close_action(true, true), Hide);
-        assert_eq!(close_action(true, false), Quit, "no StatusNotifier host: nowhere to hide, so a real quit");
+        assert_eq!(
+            close_action(true, false),
+            Quit,
+            "no StatusNotifier host: nowhere to hide, so a real quit"
+        );
         assert_eq!(close_action(false, true), Quit);
         assert_eq!(close_action(false, false), Quit);
     }
@@ -712,9 +902,18 @@ mod tests {
     fn default_setting_is_minimise_to_tray_and_survives_a_round_trip() {
         assert!(Settings::default().close_to_tray);
         assert!(!Settings::default().notified);
-        let s = Settings { close_to_tray: false, notified: true };
+        let s = Settings {
+            close_to_tray: false,
+            notified: true,
+        };
         assert_eq!(parse_settings(&format_settings(&s)), s);
-        assert_eq!(parse_settings("garbage\nclose_to_tray = maybe"), Settings { close_to_tray: false, notified: false });
+        assert_eq!(
+            parse_settings("garbage\nclose_to_tray = maybe"),
+            Settings {
+                close_to_tray: false,
+                notified: false
+            }
+        );
         assert_eq!(parse_settings(""), Settings::default());
     }
 
@@ -723,21 +922,44 @@ mod tests {
         let g = |d, r| glyph(&snap(d, r));
         assert_eq!(g(None, RemapLine::Running), Glyph::NoDevice);
         assert_eq!(g(dev(14, false), RemapLine::Running), Glyph::Low);
-        assert_eq!(g(dev(14, true), RemapLine::Running), Glyph::Charging, "low while charging is just charging");
+        assert_eq!(
+            g(dev(14, true), RemapLine::Running),
+            Glyph::Charging,
+            "low while charging is just charging"
+        );
         assert_eq!(g(dev(82, true), RemapLine::Running), Glyph::Charging);
         assert_eq!(g(dev(82, false), RemapLine::Running), Glyph::Remap);
         assert_eq!(g(dev(82, false), RemapLine::Stopped), Glyph::Normal);
-        assert_eq!(g(dev(20, false), RemapLine::Stopped), Glyph::Low, "at the threshold counts as low");
+        assert_eq!(
+            g(dev(20, false), RemapLine::Stopped),
+            Glyph::Low,
+            "at the threshold counts as low"
+        );
         assert_eq!(g(dev(21, false), RemapLine::Stopped), Glyph::Normal);
     }
 
     #[test]
     fn tooltips_match_the_sheet() {
-        assert_eq!(tooltip(&snap(None, RemapLine::Stopped)), "razerctl · no mouse found");
-        assert_eq!(tooltip(&snap(dev(14, false), RemapLine::Stopped)), "razerctl · Viper Mini SE · 14% (low)");
-        assert_eq!(tooltip(&snap(dev(82, true), RemapLine::Stopped)), "razerctl · Viper Mini SE · 82% (charging)");
-        assert_eq!(tooltip(&snap(dev(82, false), RemapLine::Running)), "razerctl · Viper Mini SE · 82% · remap running");
-        assert_eq!(tooltip(&snap(dev(82, false), RemapLine::Stopped)), "razerctl · Viper Mini SE · 82%");
+        assert_eq!(
+            tooltip(&snap(None, RemapLine::Stopped)),
+            "razerctl · no mouse found"
+        );
+        assert_eq!(
+            tooltip(&snap(dev(14, false), RemapLine::Stopped)),
+            "razerctl · Viper Mini SE · 14% (low)"
+        );
+        assert_eq!(
+            tooltip(&snap(dev(82, true), RemapLine::Stopped)),
+            "razerctl · Viper Mini SE · 82% (charging)"
+        );
+        assert_eq!(
+            tooltip(&snap(dev(82, false), RemapLine::Running)),
+            "razerctl · Viper Mini SE · 82% · remap running"
+        );
+        assert_eq!(
+            tooltip(&snap(dev(82, false), RemapLine::Stopped)),
+            "razerctl · Viper Mini SE · 82%"
+        );
     }
 
     fn labels(rows: &[Row]) -> Vec<String> {
@@ -745,8 +967,16 @@ mod tests {
             .map(|r| match r {
                 Row::Sep => "---".into(),
                 Row::Info(t) => format!("i {t}"),
-                Row::Action { label, enabled: true, .. } => (*label).into(),
-                Row::Action { label, enabled: false, .. } => format!("({label})"),
+                Row::Action {
+                    label,
+                    enabled: true,
+                    ..
+                } => (*label).into(),
+                Row::Action {
+                    label,
+                    enabled: false,
+                    ..
+                } => format!("({label})"),
             })
             .collect()
     }
@@ -756,36 +986,89 @@ mod tests {
         // A: mouse found, remap running
         assert_eq!(
             labels(&menu_rows(&snap(dev(82, false), RemapLine::Running))),
-            ["Show razerctl", "---", "i Viper Mini SE · 82%", "---", "i ● Remap running", "Stop remap", "Stop all macros", "---", "Quit razerctl"]
+            [
+                "Show razerctl",
+                "---",
+                "i Viper Mini SE · 82%",
+                "---",
+                "i ● Remap running",
+                "Stop remap",
+                "Stop all macros",
+                "---",
+                "Quit razerctl"
+            ]
         );
         // B: low battery, remap stopped: Stop all macros greyed, the action is the opposite of the line
         assert_eq!(
             labels(&menu_rows(&snap(dev(14, false), RemapLine::Stopped))),
-            ["Show razerctl", "---", "i ▲ Viper Mini SE · 14% · low", "---", "i ○ Remap stopped", "Start remap", "(Stop all macros)", "---", "Quit razerctl"]
+            [
+                "Show razerctl",
+                "---",
+                "i ▲ Viper Mini SE · 14% · low",
+                "---",
+                "i ○ Remap stopped",
+                "Start remap",
+                "(Stop all macros)",
+                "---",
+                "Quit razerctl"
+            ]
         );
         // C: no mouse, remap waiting for it
         assert_eq!(
             labels(&menu_rows(&snap(None, RemapLine::Waiting))),
-            ["Show razerctl", "---", "i ○ No mouse found", "---", "i ○ Remap waiting for the mouse", "Stop remap", "(Stop all macros)", "---", "Quit razerctl"]
+            [
+                "Show razerctl",
+                "---",
+                "i ○ No mouse found",
+                "---",
+                "i ○ Remap waiting for the mouse",
+                "Stop remap",
+                "(Stop all macros)",
+                "---",
+                "Quit razerctl"
+            ]
         );
     }
 
     #[test]
     fn menu_never_offers_more_than_five_actions_and_charging_is_named() {
         let rows = menu_rows(&snap(dev(82, true), RemapLine::Failed));
-        assert_eq!(rows.iter().filter(|r| matches!(r, Row::Action { .. })).count(), 4);
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, Row::Action { .. }))
+                .count(),
+            4
+        );
         let l = labels(&rows);
-        assert!(l.contains(&"i Viper Mini SE · 82% · charging".to_string()), "{l:?}");
-        assert!(l.contains(&"i × Remap failed".to_string()) && l.contains(&"Start remap".to_string()), "{l:?}");
+        assert!(
+            l.contains(&"i Viper Mini SE · 82% · charging".to_string()),
+            "{l:?}"
+        );
+        assert!(
+            l.contains(&"i × Remap failed".to_string()) && l.contains(&"Start remap".to_string()),
+            "{l:?}"
+        );
     }
 
     #[test]
     fn a_reading_becomes_a_snapshot() {
         let s = snapshot_from(Ok(("Razer Viper Mini SE".into(), 82, false)), "active", 20);
-        assert_eq!((s.device.as_ref().map(|d| d.name.as_str()), s.remap), (Some("Viper Mini SE"), RemapLine::Running));
-        assert_eq!(snapshot_from(Err("no Razer device".into()), "active", 20).remap, RemapLine::Waiting);
-        assert_eq!(snapshot_from(Err("x".into()), "failed", 20).remap, RemapLine::Failed);
-        assert_eq!(snapshot_from(Ok(("M".into(), 5, false)), "inactive", 20).remap, RemapLine::Stopped);
+        assert_eq!(
+            (s.device.as_ref().map(|d| d.name.as_str()), s.remap),
+            (Some("Viper Mini SE"), RemapLine::Running)
+        );
+        assert_eq!(
+            snapshot_from(Err("no Razer device".into()), "active", 20).remap,
+            RemapLine::Waiting
+        );
+        assert_eq!(
+            snapshot_from(Err("x".into()), "failed", 20).remap,
+            RemapLine::Failed
+        );
+        assert_eq!(
+            snapshot_from(Ok(("M".into(), 5, false)), "inactive", 20).remap,
+            RemapLine::Stopped
+        );
     }
 
     #[test]
@@ -798,7 +1081,10 @@ mod tests {
         assert_eq!(host.drain(), [Cmd::Quit, Cmd::Show]);
         let src = include_str!("tray.rs");
         let code = src.split("#[cfg(test)]").next().unwrap();
-        assert!(!code.contains("battery::SERVICE") && !code.contains("razerctl-battery"), "the tray must not touch the notifier unit");
+        assert!(
+            !code.contains("battery::SERVICE") && !code.contains("razerctl-battery"),
+            "the tray must not touch the notifier unit"
+        );
     }
 
     #[test]
@@ -811,7 +1097,10 @@ mod tests {
                 poke: Mutex::new(mpsc::channel().0),
                 outcome: Mutex::new(None),
             });
-            Item { shared, online: Arc::new(AtomicBool::new(true)) }
+            Item {
+                shared,
+                online: Arc::new(AtomicBool::new(true)),
+            }
         };
         use ksni::Tray;
         for (s, want) in [
@@ -829,14 +1118,23 @@ mod tests {
         for g in Glyph::ALL {
             for size in [22u32, 32] {
                 let p = pixmap(g, size);
-                assert_eq!((p.width, p.height, p.data.len()), (size as i32, size as i32, (size * size * 4) as usize));
-                assert!(p.data.chunks(4).any(|px| px[0] > 200), "{g:?} {size}: nothing drawn");
+                assert_eq!(
+                    (p.width, p.height, p.data.len()),
+                    (size as i32, size as i32, (size * size * 4) as usize)
+                );
+                assert!(
+                    p.data.chunks(4).any(|px| px[0] > 200),
+                    "{g:?} {size}: nothing drawn"
+                );
             }
             let p = pixmap(g, 22);
             assert!(!seen.contains(&p.data), "{g:?} looks like another state");
             seen.push(p.data);
         }
         // the 16 px size of the sheet must keep Low and Charging apart too
-        assert_ne!(pixmap(Glyph::Low, 16).data, pixmap(Glyph::Charging, 16).data);
+        assert_ne!(
+            pixmap(Glyph::Low, 16).data,
+            pixmap(Glyph::Charging, 16).data
+        );
     }
 }
