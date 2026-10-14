@@ -50,6 +50,19 @@ pub fn systemctl(sys: &dyn Sys, args: &[&str]) -> Result<Out, String> {
     sys.run("systemctl", &a)
 }
 
+/// Ask the running remap service to stop every macro it is playing (SIGUSR1 to the main process; the service
+/// releases whatever the macros hold and keeps remapping). The service has to be running: `kill` on a stopped unit
+/// fails, and that failure is the answer.
+pub fn stop_all_macros(sys: &dyn Sys) -> Result<(), String> {
+    let o = systemctl(sys, &["kill", "--kill-whom=main", "--signal=SIGUSR1", SERVICE])?;
+    if o.ok {
+        Ok(())
+    } else {
+        let why = o.stderr.lines().next().unwrap_or("").trim();
+        Err(format!("couldn't stop the macros: {}", if why.is_empty() { "systemctl kill failed" } else { why }))
+    }
+}
+
 // ------------------------------------------------------------------------------------------ unit state
 
 /// What `systemctl --user show` says about the remap unit.

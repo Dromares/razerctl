@@ -74,8 +74,10 @@ impl Pal {
     pub fn i06(&self) -> Color32 { ink_a(self.ink_rgb, self.a06) }
     pub fn i05(&self) -> Color32 { ink_a(self.ink_rgb, self.a05) }
 
-    /// Alpha token composited over an opaque surface (contrast measurement in the tests).
-    #[cfg(test)]
+    /// The ink-65 token composited over an opaque surface (the macro list's scrollbar handle: 5.30:1 dark / 5.09:1 light).
+    pub fn i65_on(&self, surface: Color32) -> Color32 { self.over(self.a65, surface) }
+
+    /// Alpha token composited over an opaque surface (contrast measurement in the tests, the scrollbar handle).
     pub fn over(&self, a: f32, surface: Color32) -> Color32 {
         let m = |f: u8, s: u8| (f as f32 * a + s as f32 * (1.0 - a)).round() as u8;
         Color32::from_rgb(m(self.ink_rgb[0], surface.r()), m(self.ink_rgb[1], surface.g()), m(self.ink_rgb[2], surface.b()))

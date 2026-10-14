@@ -131,3 +131,30 @@ razerctl macros check                    # validate macros.conf and the macro: r
 razerctl macros play copy --dry-run      # the exact evdev frames and sleeps, nothing is sent
 razerctl remap --macros FILE             # use another macros file (default above)
 ```
+
+**Stop all macros** (the GUI's Software remap banner, and the tray menu) sends `SIGUSR1` to the remap service
+(`systemctl --user kill --kill-whom=main --signal=SIGUSR1 razerctl-remap.service`): every running macro ends within
+a poll tick (~20 ms), anything it held down is released, and remapping carries on. A `razerctl` older than this
+change has no handler for the signal, so the service exits and systemd restarts it 2 s later (same effect, one
+interruption): reinstall the binary (`./install.sh`) to get the in-place stop.
+
+## System tray and closing the window
+
+`razerctl-gui` puts a StatusNotifierItem in the system tray (the `ksni` crate, over D-Bus; no GTK). Closing the
+window **hides to the tray** by default: the window really closes, and the process stays as the tray icon (it keeps
+reading the battery and the remap unit every 30 s) until you choose *Show razerctl* (or click the icon), which
+reopens the window, or *Quit razerctl*. Unsaved edits in the window are lost on close, as they always were. The
+choice is in the **App** tab (*Minimise to tray* / *Quit*, stored in `~/.config/razerctl/gui.conf`); Ctrl+Q and the
+App tab's *Quit razerctl* button quit whatever it says. The first time the window hides, one desktop notification
+says so.
+
+* Tray menu: Show, a battery line, the remap line with its opposite action (Start / Stop remap), *Stop all macros*,
+  Quit. **Quit only quits the GUI**: the remap service and the low-battery notifier are separate systemd user units
+  (`razerctl-remap.service`, `razerctl-battery.service`) that never depend on the GUI process and keep running.
+* Icon: no mouse (dashed) > low battery (`!`) > charging (bolt) > remap running (dot) > normal. The symbolic SVGs in
+  `packaging/icons/` are installed by `./install.sh` and the package so the shell can recolour them; without them
+  a pixmap drawn by the app is used.
+* **Caveat: a StatusNotifier host is required to hide.** KDE Plasma, XFCE and most panels have one; GNOME needs the
+  *AppIndicator and KStatusNotifierItem Support* extension. With no host, closing the window quits (the App tab says
+  so and keeps your choice; the host is looked for again each time you close the window). A second `razerctl-gui`
+  started while one is hidden in the tray is a second instance with its own icon.
