@@ -10,6 +10,7 @@ repository = "https://github.com/Dromares/razerctl"
 eframe = "0.36"
 evdev = "0.13"
 libc = "0.2"
+ksni = { version = "0.3", default-features = false, features = ["async-io", "blocking"] }
 
 [profile.release]
 lto = true

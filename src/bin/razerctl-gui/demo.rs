@@ -46,7 +46,13 @@ pub struct Demo {
     pointer: Option<(String, String)>,
 }
 
-pub const TABS: [(Tab, &str); 3] = [(Tab::Buttons, "buttons"), (Tab::Device, "device"), (Tab::Software, "software")];
+pub const TABS: [(Tab, &str); 4] = [(Tab::Buttons, "buttons"), (Tab::Device, "device"), (Tab::Software, "software"), (Tab::App, "app")];
+
+/// Any `RAZERCTL_GUI_*` hook set: the app then never starts the tray (the hooks close the window themselves, and a
+/// screenshot run must not talk to D-Bus).
+pub fn hooks_active() -> bool {
+    std::env::vars_os().any(|(k, _)| k.to_string_lossy().starts_with("RAZERCTL_GUI_"))
+}
 
 impl Demo {
     pub fn from_env() -> Self {
@@ -171,6 +177,22 @@ pub fn apply(app: &mut App) {
             app.systemctl(&["restart", SERVICE]); // real systemctl --user call
         }
         n if n.starts_with("macro-") => macro_scenario(app, n),
+        // the App tab of DAN-1452: tray found / no host / Quit selected; battery.conf and gui.conf are not touched
+        n if n.starts_with("app") => {
+            app.tab = Tab::App;
+            app.service_state = "active".into();
+            app.settings = super::tray::Settings { close_to_tray: n != "app-quit", notified: true };
+            app.tray = Some(super::tray::Host::fake(n != "app-notray"));
+            app.watching = true;
+            app.presses.lock().unwrap().extend(["BTN_SIDE", "BTN_LEFT", "BTN_LEFT", "BTN_EXTRA", "BTN_RIGHT", "BTN_MIDDLE"].map(String::from));
+            app.ok(if n == "app-notray" {
+                "No system tray found. Closing the window will quit razerctl."
+            } else if n == "app-quit" {
+                "Closing the window will quit razerctl."
+            } else {
+                "Closing the window will minimise razerctl to the tray."
+            });
+        }
         _ => {}
     }
 }
@@ -285,6 +307,11 @@ fn macro_scenario(app: &mut App, name: &str) {
             app.mac.sel = pos(app, "paste-enter");
             app.service_state = "inactive".into();
             app.err("Macros saved, but the service was not restarted. The installed razerctl at ~/.local/bin/razerctl is too old for macros (it has no `macros` command); reinstall it with ./install.sh.");
+        }
+        "macro-stopall" => {
+            app.mac.sel = pos(app, "rapid-click");
+            app.mac.sel_ev = 0;
+            app.ok("Stopped all macros. Held keys and buttons were released.");
         }
         "macro-nodevice" => {
             app.mac.sel = pos(app, "paste-enter");

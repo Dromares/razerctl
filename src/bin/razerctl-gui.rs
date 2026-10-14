@@ -4,6 +4,7 @@
 //!   Buttons   – remaps stored in the mouse's onboard memory (work with no software running)
 //!   Device    – battery, firmware, DPI, polling rate
 //!   Software  – optional computer-side remapper (uinput): rules, macros (structured editor over macros.conf) + service
+//!   App       – what closing the window does (hide to the system tray, or quit) and the background services
 //! A live "button tester" at the bottom shows what the computer actually receives.
 //!
 //! The look (tokens, fonts, widgets, mouse diagram) lives in `razerctl-gui/`; this file keeps the state, the
@@ -19,6 +20,8 @@ mod mouse;
 mod service;
 #[path = "razerctl-gui/theme.rs"]
 mod theme;
+#[path = "razerctl-gui/tray.rs"]
+mod tray;
 #[path = "razerctl-gui/widgets.rs"]
 mod widgets;
 
@@ -33,6 +36,7 @@ use razerctl::hidraw::Hidraw;
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
 use razerctl::{battery, remap};
 use macro_ui::{MacroUi, Remap, Sub};
+use tray::{CloseAction, Cmd};
 use service::{Failure, Pending, RealSys, Sys};
 use theme::*;
 use widgets::*;
@@ -92,7 +96,7 @@ impl ButtonRow {
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
-enum Tab { Buttons, Device, Software }
+enum Tab { Buttons, Device, Software, App }
 
 struct App {
     tab: Tab,
@@ -131,6 +135,13 @@ struct App {
     styled: Option<Mode>,
     /// Test hooks (RAZERCTL_GUI_SNAPSHOT / _THEME / _DEMO / _SIZE): see `demo.rs`.
     demo: demo::Demo,
+    /// What closing the window does (`gui.conf`), the tray this process holds, and the messages its menu sends. With
+    /// no tray (demo shots, tests) closing always quits.
+    settings: tray::Settings,
+    settings_path: PathBuf,
+    tray: Option<tray::Host>,
+    /// Last time the App tab looked for a StatusNotifier host (it asks again every few seconds while it is open).
+    tray_probed: Option<std::time::Instant>,
 }
 
 fn open_hidraw() -> Result<Hidraw, String> {
@@ -161,7 +172,7 @@ fn sleep_hint(e: impl ToString) -> String {
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(tray: Option<tray::Host>) -> Self {
         let conf_path = remap::config_path();
         let conf_text = std::fs::read_to_string(&conf_path).unwrap_or_else(|_| {
             "# One rule per line:  BUTTON = ACTION\n# back = ctrl+c\n# forward = KEY_F13\n# middle = disable\n".into()
@@ -197,11 +208,53 @@ impl App {
             pal: Pal::new(Mode::Dark),
             styled: None,
             demo: demo::Demo::from_env(),
+            settings: tray::load_settings(&tray::config_path()),
+            settings_path: tray::config_path(),
+            tray,
+            tray_probed: None,
         };
         app.refresh_all();
         app.refresh_service();
         demo::apply(&mut app);
         app
+    }
+
+    /// Closing the window, from the title bar, the tray's Quit, Ctrl+Q or the Quit button: decide what happens to the
+    /// process. The window itself is always closed (see `tray.rs` for why); `main` reads the outcome afterwards.
+    fn decide_close(&mut self, forced: Option<CloseAction>) {
+        let Some(host) = &self.tray else { return };
+        if host.outcome() == Some(CloseAction::Quit) { return; } // a Quit already in flight stays a Quit
+        let action = forced.unwrap_or_else(|| tray::close_action(self.settings.close_to_tray, host.probe()));
+        host.set_outcome(action);
+    }
+
+    fn quit(&mut self, ctx: &egui::Context) {
+        self.decide_close(Some(CloseAction::Quit));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    /// Menu commands from the tray, Ctrl+Q, and the window's own close button.
+    fn handle_tray(&mut self, ctx: &egui::Context) {
+        if let Some(host) = &self.tray { host.attach_window(ctx); }
+        let cmds = self.tray.as_ref().map(|h| h.drain()).unwrap_or_default();
+        for c in cmds {
+            match c {
+                Cmd::Quit => self.quit(ctx),
+                // the window is already showing: raise it where the compositor lets an app do that
+                Cmd::Show => ctx.send_viewport_cmd(egui::ViewportCommand::Focus),
+            }
+        }
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Q)) { self.quit(ctx); }
+        if ctx.input(|i| i.viewport().close_requested()) { self.decide_close(None); }
+    }
+
+    /// Stop every running macro without stopping the service (`systemctl kill -s SIGUSR1`; see `remap.rs`).
+    fn stop_all_macros(&mut self) {
+        match service::stop_all_macros(&*self.sys) {
+            Ok(()) => self.ok("Stopped all macros. Held keys and buttons were released."),
+            Err(e) => self.err(e),
+        }
+        if let Some(t) = &self.tray { t.poke(); }
     }
 
     /// Write the rules editor to `remap.conf` through `write_atomic`: the service reads that file on every
@@ -354,7 +407,7 @@ impl App {
             ui.spacing_mut().item_spacing.x = S5;
             ui.label(RichText::new("🐍").font(sans(18.0)).color(p.i100()));
             ui.label(tracked("RAZERCTL", mono_bold(12.0), p.i100(), 0.22));
-            let labels: Vec<String> = ["Buttons", "Device", "Software remap"].iter().map(|s| s.to_string()).collect();
+            let labels: Vec<String> = ["Buttons", "Device", "Software remap", "App"].iter().map(|s| s.to_string()).collect();
             let active = TABS.iter().position(|t| *t == self.tab);
             if let Some(i) = segmented(ui, &p, "tab", &labels, active, 104.0) { self.tab = TABS[i]; }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -955,6 +1008,159 @@ impl App {
         if changed { self.apply_battery_settings(); }
     }
 
+    // ------------------------------------------------------------------ App
+
+    fn ui_app(&mut self, ui: &mut egui::Ui) {
+        let p = self.pal;
+        title(
+            ui, &p, "App.",
+            "How razerctl itself behaves on this desktop. These settings belong to the window, not to the mouse.",
+            (ui.available_width() * 0.36).clamp(300.0, 440.0) + S4,
+        );
+        // look for a StatusNotifier host again every few seconds while this tab is open (a shell that came up after us)
+        let host = match &self.tray {
+            Some(t) => {
+                if self.tray_probed.is_none_or(|at| at.elapsed() > std::time::Duration::from_secs(3)) {
+                    self.tray_probed = Some(std::time::Instant::now());
+                    t.probe();
+                }
+                ui.ctx().request_repaint_after(std::time::Duration::from_secs(3));
+                t.present()
+            }
+            None => false,
+        };
+        let total = ui.available_width();
+        let gap = S4;
+        if total < 900.0 {
+            section(ui, &p, "01", "Window");
+            self.window_panel(ui, host);
+            ui.add_space(S2);
+            section(ui, &p, "02", "Background services");
+            self.services_panel(ui);
+            return;
+        }
+        let right_w = (total * 0.40).clamp(320.0, 480.0);
+        let left_w = total - right_w - gap;
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(left_w);
+                section(ui, &p, "01", "Window");
+                self.window_panel(ui, host);
+            });
+            ui.allocate_ui_with_layout(vec2(right_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
+                ui.set_width(right_w);
+                section(ui, &p, "02", "Background services");
+                self.services_panel(ui);
+            });
+        });
+    }
+
+    /// 01 // WINDOW: what closing does (applies at once), whether there is a tray to hide to, and the way out.
+    fn window_panel(&mut self, ui: &mut egui::Ui, host: bool) {
+        let p = self.pal;
+        let mut quit = false;
+        let mut changed = None;
+        panel(ui, &p, 16, |ui| {
+            ui.label(caps(&p, "Closing the window"));
+            ui.add_space(S1);
+            let labels = vec!["Minimise to tray".to_string(), "Quit".to_string()];
+            let cur = if self.settings.close_to_tray { 0 } else { 1 };
+            if let Some(i) = segmented(ui, &p, "close", &labels, Some(cur), 168.0) { changed = Some(i == 0); }
+            ui.add_space(S2);
+            let d = if self.settings.close_to_tray {
+                "The window hides and razerctl stays in the system tray. Open it again from the tray icon. Low-battery alerts and remap keep working either way."
+            } else {
+                "Closing the window quits razerctl and removes the tray icon. Low-battery alerts and remap keep working: they are separate background services."
+            };
+            ui.add(egui::Label::new(RichText::new(d).font(sans(T_BODY - 1.0)).color(p.i65())).wrap());
+            ui.add_space(S3);
+            hair(ui, &p);
+            ui.add_space(S3);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S3;
+                ui.label(caps(&p, "System tray"));
+                if host {
+                    chip(ui, &p, Some("●"), "Found", ChipStyle::Plain, p.ok);
+                } else {
+                    chip(ui, &p, Some("▲"), "Not found", ChipStyle::Outline, p.warn);
+                }
+            });
+            if !host {
+                ui.add_space(S2);
+                Frame::new().fill(p.i06()).stroke(Stroke::new(1.0, p.i45())).inner_margin(Margin::same(12)).show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(RichText::new("Closing the window will quit razerctl").font(serif(T_TITLE - 4.0)).color(p.i100()));
+                    ui.add_space(2.0);
+                    ui.add(egui::Label::new(RichText::new(
+                        "This desktop has no StatusNotifier host, so there is nowhere to hide to. Your choice above is kept. \
+                         On GNOME, the AppIndicator extension adds a tray; razerctl picks it up the next time you close the window.",
+                    ).font(sans(T_BODY - 1.0)).color(p.i65())).wrap());
+                });
+            }
+            ui.add_space(S3);
+            hair(ui, &p);
+            ui.add_space(S3);
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S3;
+                quit = btn(ui, &p, "Quit razerctl", Kind::Secondary, true).clicked();
+                ui.label(RichText::new("Ctrl+Q. Closes razerctl for good; remap and alerts keep running.").font(sans(T_SMALL)).color(p.i65()));
+            });
+            ui.add_space(S1);
+            ui.label(RichText::new("Changes apply as you make them.").font(sans(T_SMALL)).color(p.i65()));
+        });
+        if let Some(to_tray) = changed { self.set_close_to_tray(to_tray, host); }
+        if quit { let ctx = ui.ctx().clone(); self.quit(&ctx); }
+    }
+
+    /// The close setting applies as it is changed, and the status bar says what closing will now do.
+    fn set_close_to_tray(&mut self, to_tray: bool, host: bool) {
+        self.settings.close_to_tray = to_tray;
+        match tray::save_settings(&self.settings_path, &self.settings) {
+            Ok(()) if !to_tray => self.ok("Closing the window will quit razerctl."),
+            Ok(()) if host => self.ok("Closing the window will minimise razerctl to the tray."),
+            Ok(()) => self.ok("No system tray found. Closing the window will quit razerctl."),
+            Err(e) => self.err(format!("couldn't save the setting: {e}")),
+        }
+    }
+
+    /// 02 // BACKGROUND SERVICES: read-only status, and the one place that says closing never stops them.
+    fn services_panel(&mut self, ui: &mut egui::Ui) {
+        let p = self.pal;
+        let mut go = None;
+        panel(ui, &p, 16, |ui| {
+            let rows = [
+                ("Remap service", self.service_state.as_str(), "active", SERVICE, "Software remap  →", Tab::Software),
+                ("Low-battery notifier", self.batt_service.as_str(), "active", battery::SERVICE, "Device  →", Tab::Device),
+            ];
+            for (i, (label, state, up, unit, to, tab)) in rows.iter().enumerate() {
+                if i > 0 { ui.add_space(S3); hair(ui, &p); ui.add_space(S3); }
+                ui.label(caps(&p, label));
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = S3;
+                    if state == up {
+                        chip(ui, &p, Some("●"), if *tab == Tab::Device { "Running" } else { "Active" }, ChipStyle::Plain, p.ok);
+                    } else {
+                        chip(ui, &p, Some("○"), if state.is_empty() { "unknown" } else { state }, ChipStyle::Plain, p.i65());
+                    }
+                    ui.label(RichText::new(*unit).font(mono(T_DATA)).color(p.i65()));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if btn(ui, &p, to, Kind::Secondary, true).clicked() { go = Some(*tab); }
+                    });
+                });
+            }
+            ui.add_space(S3);
+            hair(ui, &p);
+            ui.add_space(S3);
+            ui.add(egui::Label::new(RichText::new(
+                "Both run on their own, as systemd user services. Closing the window or choosing Quit never stops them. \
+                 Stop one from its own tab; the tray menu can also start and stop remap.",
+            ).font(sans(T_BODY - 1.0)).color(p.i65())).wrap());
+        });
+        if let Some(t) = go { self.tab = t; }
+    }
+
     // ------------------------------------------------------------------ Software remap
 
     fn ui_software(&mut self, ui: &mut egui::Ui) {
@@ -967,19 +1173,19 @@ impl App {
         );
         // sub-nav and the host-played banner share one row (the banner drops under it when narrow)
         let narrow = ui.available_width() < 900.0;
-        let mut start = false;
+        let mut click = macro_ui::BannerClick::default();
         let mut sub = None;
-        let row = |ui: &mut egui::Ui, app: &Self, start: &mut bool, sub: &mut Option<usize>| {
+        let row = |ui: &mut egui::Ui, app: &Self, click: &mut macro_ui::BannerClick, sub: &mut Option<usize>| {
             let labels = vec!["Rules".to_string(), app.macros_label()];
             *sub = segmented(ui, &p, "sub", &labels, Some(app.mac.sub as usize), 108.0);
-            *start = app.macro_banner(ui);
+            *click = app.macro_banner(ui);
         };
         if narrow {
-            row(ui, self, &mut start, &mut sub);
+            row(ui, self, &mut click, &mut sub);
         } else {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S4;
-                row(ui, self, &mut start, &mut sub);
+                row(ui, self, &mut click, &mut sub);
             });
         }
         if let Some(i) = sub { self.mac.sub = if i == 0 { Sub::Rules } else { Sub::Macros }; }
@@ -987,7 +1193,8 @@ impl App {
             ui.add_space(S1);
             ui.add(egui::Label::new(RichText::new(format!("▲ {w}")).font(sans(T_SMALL)).color(p.warn)).wrap());
         }
-        if start { self.systemctl(&["start", SERVICE]); }
+        if click.start { self.systemctl(&["start", SERVICE]); }
+        if click.stop_macros { self.stop_all_macros(); }
         ui.add_space(S2);
         match self.mac.sub {
             Sub::Rules => self.ui_rules_view(ui),
@@ -1111,7 +1318,7 @@ impl App {
 
 // ---------------------------------------------------------------------- layout helpers
 
-const TABS: [Tab; 3] = [Tab::Buttons, Tab::Device, Tab::Software];
+const TABS: [Tab; 4] = [Tab::Buttons, Tab::Device, Tab::Software, Tab::App];
 /// Same set Synapse's protocol layer supports (rzDevice25 RATE_125Hz..RATE_8000Hz).
 const POLL_RATES: [u32; 7] = [125, 250, 500, 1000, 2000, 4000, 8000];
 
@@ -1198,6 +1405,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         demo::step(self, &ctx);
+        self.handle_tray(&ctx);
         self.poll_service(&ctx);
         self.start_watch(&ctx);
         let mode = self.demo.theme.unwrap_or(if ctx.theme() == egui::Theme::Light { Mode::Light } else { Mode::Dark });
@@ -1218,6 +1426,7 @@ impl eframe::App for App {
             (Tab::Device, false) => "空",
             (Tab::Device, true) => "力",
             (Tab::Software, _) => "鏡",
+            (Tab::App, _) => "空",
         };
         bgp.with_clip_rect(screen).text(pos2(screen.right() + 20.0, screen.top() - 40.0), Align2::RIGHT_TOP, glyph, kanji(420.0), p.i05());
 
@@ -1245,6 +1454,7 @@ impl eframe::App for App {
                     Tab::Buttons => self.ui_buttons(ui),
                     Tab::Device => self.ui_device(ui),
                     Tab::Software => self.ui_software(ui),
+                    Tab::App => self.ui_app(ui),
                 });
             });
     }
@@ -1264,10 +1474,24 @@ fn main() -> eframe::Result {
             .with_min_inner_size([780.0, 560.0]),
         ..Default::default()
     };
-    eframe::run_native("razerctl", options, Box::new(|cc| {
+    // No tray under the visual-review hooks: they close the window themselves and must not touch D-Bus.
+    let host = (!demo::hooks_active()).then(tray::Host::start);
+    let for_app = host.clone();
+    eframe::run_native("razerctl", options, Box::new(move |cc| {
         install_fonts(&cc.egui_ctx);
-        Ok(Box::new(App::new()))
-    }))
+        Ok(Box::new(App::new(for_app)))
+    }))?;
+    // The window is gone. Unless closing it meant "hide to the tray", that is the end; otherwise this process stays
+    // as the tray until the user wants the window back or quits from the menu.
+    if let Some(host) = host.filter(|h| h.outcome() == Some(CloseAction::Hide)) {
+        let path = tray::config_path();
+        let mut settings = tray::load_settings(&path);
+        tray::first_close_notice(&path, &mut settings);
+        if tray::linger(&host) == Cmd::Show {
+            eprintln!("razerctl-gui: reopening the window failed: {}", tray::reopen_window());
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1306,6 +1530,11 @@ mod tests {
             pal: Pal::new(Mode::Dark),
             styled: None,
             demo: demo::Demo::default(),
+            settings: tray::Settings::default(),
+            // never the real gui.conf: tests that change the setting point this at their own temp dir
+            settings_path: std::env::temp_dir().join("razerctl-gui-test-never-written/gui.conf"),
+            tray: None,
+            tray_probed: None,
         }
     }
 
@@ -1341,6 +1570,7 @@ mod tests {
                     Tab::Buttons => app.ui_buttons(ui),
                     Tab::Device => app.ui_device(ui),
                     Tab::Software => app.ui_software(ui),
+                    Tab::App => app.ui_app(ui),
                 }
             });
             texts.clear();
@@ -1658,13 +1888,144 @@ mod tests {
 
     #[test]
     fn remap_chip_is_in_the_device_strip_on_every_tab() {
-        for tab in [Tab::Buttons, Tab::Device, Tab::Software] {
+        for tab in [Tab::Buttons, Tab::Device, Tab::Software, Tab::App] {
             let mut app = macro_app(Sub::Rules);
             let t = render(&mut app, tab, Mode::Dark, (1280.0, 900.0));
             assert!(t.contains("REMAP") && t.contains("● running"), "{tab:?}");
             app.service_state = "failed".into();
             assert!(render(&mut app, tab, Mode::Dark, (1280.0, 900.0)).contains("○ stopped"), "{tab:?}");
         }
+    }
+
+    fn lines_of(app: &mut App, tab: Tab, size: (f32, f32)) -> Vec<String> {
+        render_texts(app, tab, Mode::Dark, size).into_iter().map(|(s, ..)| s).collect()
+    }
+
+    // ---- DAN-1453: tray, App tab, Stop all macros
+
+    #[test]
+    fn app_tab_shows_the_close_setting_the_tray_state_and_the_services() {
+        let mut app = macro_app(Sub::Rules);
+        app.tray = Some(tray::Host::fake(true));
+        app.batt_service = "active".into();
+        let l = lines_of(&mut app, Tab::App, SIZES[0]);
+        for want in ["App.", "MINIMISE TO TRAY", "QUIT", "FOUND", "QUIT RAZERCTL", "razerctl-remap.service", "razerctl-battery.service", "ACTIVE", "RUNNING"] {
+            assert!(l.iter().any(|s| s.ends_with(want) || s.contains(want)), "{want} missing: {l:?}");
+        }
+        assert!(l.iter().any(|s| s.starts_with("The window hides and razerctl stays in the system tray.")), "{l:?}");
+        assert!(!l.iter().any(|s| s.contains("Closing the window will quit razerctl")), "no warning while a tray exists: {l:?}");
+
+        // no StatusNotifier host: the warning block says what will really happen, and the stored choice is still shown
+        app.tray = Some(tray::Host::fake(false));
+        let l = lines_of(&mut app, Tab::App, SIZES[0]);
+        assert!(l.iter().any(|s| s.contains("NOT FOUND")), "{l:?}");
+        assert!(l.iter().any(|s| s == "Closing the window will quit razerctl"), "{l:?}");
+        assert!(l.iter().any(|s| s.starts_with("This desktop has no StatusNotifier host")), "{l:?}");
+        assert!(l.iter().any(|s| s.ends_with("MINIMISE TO TRAY")), "the stored choice is kept: {l:?}");
+
+        // Quit selected: its own description, no claim about hiding
+        app.settings.close_to_tray = false;
+        let l = lines_of(&mut app, Tab::App, SIZES[0]);
+        assert!(l.iter().any(|s| s.starts_with("Closing the window quits razerctl and removes the tray icon.")), "{l:?}");
+    }
+
+    #[test]
+    fn app_tab_stacks_below_900px() {
+        let mut app = macro_app(Sub::Rules);
+        app.tray = Some(tray::Host::fake(true));
+        let texts = render_texts(&mut app, Tab::App, Mode::Dark, (SIZES[1].0, 1400.0)); // tall: render has no scroll area
+        let at = |needle: &str| texts.iter().find(|(s, ..)| s.contains(needle)).map(|(_, p, _)| *p).unwrap_or_else(|| panic!("{needle} missing"));
+        assert!(at("BACKGROUND SERVICES").y > at("QUIT RAZERCTL").y, "services panel goes under the window panel when narrow");
+    }
+
+    #[test]
+    fn closing_the_window_follows_the_setting_and_whether_a_tray_exists() {
+        let case = |close_to_tray: bool, host: bool| {
+            let mut app = test_app();
+            app.settings.close_to_tray = close_to_tray;
+            app.tray = Some(tray::Host::fake(host));
+            app.decide_close(None);
+            app.tray.as_ref().unwrap().outcome()
+        };
+        assert_eq!(case(true, true), Some(CloseAction::Hide));
+        assert_eq!(case(true, false), Some(CloseAction::Quit), "no host: close does a real quit");
+        assert_eq!(case(false, true), Some(CloseAction::Quit));
+        assert_eq!(case(false, false), Some(CloseAction::Quit));
+        // a Quit (tray menu, Ctrl+Q, the button) wins over the setting, and a later close request does not undo it
+        let mut app = test_app();
+        app.tray = Some(tray::Host::fake(true));
+        app.decide_close(Some(CloseAction::Quit));
+        app.decide_close(None);
+        assert_eq!(app.tray.as_ref().unwrap().outcome(), Some(CloseAction::Quit));
+        // no tray at all (demo shots, tests): nothing to decide, the window just closes
+        let mut app = test_app();
+        app.decide_close(None);
+        assert!(app.tray.is_none());
+    }
+
+    #[test]
+    fn close_setting_is_saved_as_it_changes_and_read_back() {
+        let dir = TempDir::new("gui-conf");
+        let mut app = test_app();
+        app.settings_path = dir.0.join("razerctl/gui.conf");
+        app.set_close_to_tray(false, true);
+        assert_eq!(app.status, "Closing the window will quit razerctl.");
+        assert_eq!(tray::load_settings(&app.settings_path), tray::Settings { close_to_tray: false, notified: false });
+        app.set_close_to_tray(true, false);
+        assert_eq!(app.status, "No system tray found. Closing the window will quit razerctl.", "choice kept, effect stated");
+        assert!(tray::load_settings(&app.settings_path).close_to_tray);
+        app.set_close_to_tray(true, true);
+        assert_eq!(app.status, "Closing the window will minimise razerctl to the tray.");
+        assert_eq!(std::fs::read_dir(dir.0.join("razerctl")).unwrap().count(), 1, "no temp file left behind");
+    }
+
+    #[test]
+    fn first_close_notice_is_sent_once_and_only_marks_itself_when_it_was() {
+        // `notify-send` is not on PATH here: the notice fails and the flag must stay unset (AC-T6)
+        let dir = TempDir::new("gui-notice");
+        let path = dir.0.join("gui.conf");
+        let mut s = tray::Settings::default();
+        let old = std::env::var_os("PATH");
+        std::env::set_var("PATH", dir.0.join("nothing-here"));
+        tray::first_close_notice(&path, &mut s);
+        match old { Some(p) => std::env::set_var("PATH", p), None => std::env::remove_var("PATH") }
+        assert!(!s.notified, "a failed notify-send must not count as shown");
+        assert!(!path.exists());
+        // already shown: nothing is sent and nothing is written
+        let mut shown = tray::Settings { close_to_tray: true, notified: true };
+        tray::first_close_notice(&path, &mut shown);
+        assert!(shown.notified && !path.exists());
+    }
+
+    #[test]
+    fn stop_all_macros_signals_the_service_and_says_so() {
+        let mut app = macro_app(Sub::Macros);
+        let fake = service::tests::Fake::default();
+        app.sys = Box::new(fake.clone());
+        app.stop_all_macros();
+        assert_eq!(fake.calls(), ["systemctl --user kill --kill-whom=main --signal=SIGUSR1 razerctl-remap.service"]);
+        assert_eq!((app.status.as_str(), app.status_is_error), ("Stopped all macros. Held keys and buttons were released.", false));
+        // service not running: systemctl says so, and so does the status bar
+        fake.on("systemctl --user kill*", false, "", "Failed to kill unit razerctl-remap.service: Unit razerctl-remap.service is not active.\n");
+        app.stop_all_macros();
+        assert!(app.status_is_error && app.status.starts_with("couldn't stop the macros: Failed to kill unit"), "{}", app.status);
+    }
+
+    #[test]
+    fn stop_all_macros_button_is_in_the_banner_only_while_remap_runs() {
+        let mut app = macro_app(Sub::Macros);
+        for sub in [Sub::Macros, Sub::Rules] {
+            app.mac.sub = sub;
+            let l = lines_of(&mut app, Tab::Software, SIZES[0]);
+            assert!(l.iter().any(|s| s.ends_with("STOP ALL MACROS")), "{sub:?}: {l:?}");
+        }
+        app.service_state = "inactive".into();
+        let l = lines_of(&mut app, Tab::Software, SIZES[0]);
+        assert!(!l.iter().any(|s| s.ends_with("STOP ALL MACROS")), "stopped banner: nothing can be playing: {l:?}");
+        app.service_state = "active".into();
+        app.info = None;
+        let l = lines_of(&mut app, Tab::Software, SIZES[0]);
+        assert!(!l.iter().any(|s| s.ends_with("STOP ALL MACROS")), "no-mouse banner: {l:?}");
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::thread::{self, JoinHandle};
 
@@ -386,6 +387,37 @@ fn drive(player: &Mutex<Player>, map: &Mapping, ev: &InputEvent) {
     }
 }
 
+/// SIGUSR1 means "stop every macro that is playing" (the GUI's and the tray's *Stop all macros*, sent with
+/// `systemctl --user kill`). The handler only sets this flag; `watch_stop_all` acts on it.
+static STOP_ALL_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_usr1(_: libc::c_int) {
+    STOP_ALL_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+/// Install the SIGUSR1 handler and the thread that turns it into `Player::stop_all`: running macros end, held keys
+/// and buttons are released, and remapping carries on. `SA_RESTART` keeps the evdev reads from seeing `EINTR`.
+fn watch_stop_all(player: Arc<Mutex<Player>>) -> io::Result<()> {
+    // SAFETY: the handler is async-signal-safe (one atomic store) and `sa` is fully initialised before the call.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_usr1 as extern "C" fn(libc::c_int) as usize;
+        sa.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGUSR1, &sa, std::ptr::null_mut()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    thread::Builder::new().name("stop-all".into()).spawn(move || loop {
+        if STOP_ALL_REQUESTED.swap(false, Ordering::SeqCst) {
+            player.lock().unwrap_or_else(PoisonError::into_inner).stop_all();
+            eprintln!("stopped all macros (SIGUSR1)");
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    })?;
+    Ok(())
+}
+
 /// Every Action::Macro in `map` names a macro present in `macros`; error names the missing one(s).
 pub fn check_macros(map: &Mapping, macros: &macros::Macros) -> Result<(), String> {
     let missing: BTreeSet<&str> = map
@@ -508,6 +540,9 @@ pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macro
     let virt = Arc::new(Mutex::new(virt));
     let sink: Arc<Mutex<dyn Sink>> = virt.clone();
     let player = Arc::new(Mutex::new(Player::new(sink, macros)));
+    if let Err(e) = watch_stop_all(player.clone()) {
+        eprintln!("SIGUSR1 (stop all macros) unavailable: {e}");
+    }
     let map = Arc::new(map);
     eprintln!("remapping {} rule(s); Ctrl+C to stop", map.len());
 
@@ -828,6 +863,31 @@ mod tests {
         drop(p);
         assert!(t.elapsed() < std::time::Duration::from_millis(500), "drop took {:?}", t.elapsed());
         assert_eq!(frames(&rec), vec![k(KeyCode::KEY_LEFTALT, 1), k(KeyCode::KEY_LEFTALT, 0)]);
+    }
+
+    #[test]
+    fn sigusr1_stops_every_running_macro_and_releases_what_they_hold() {
+        let rec = Arc::new(Mutex::new(Recorder::default()));
+        let player = Arc::new(Mutex::new(Player::new(rec.clone(), defs())));
+        watch_stop_all(player.clone()).unwrap();
+        {
+            let mut p = player.lock().unwrap();
+            p.press(KeyCode::BTN_SIDE, "ctrl", Playback::Toggle);
+            p.press(KeyCode::BTN_EXTRA, "shift", Playback::Held);
+        }
+        wait("both macros playing", || {
+            let f = frames(&rec);
+            f.contains(&k(KeyCode::KEY_LEFTCTRL, 1)) && f.contains(&k(KeyCode::KEY_LEFTSHIFT, 1))
+        });
+        let t = std::time::Instant::now();
+        // SAFETY: the handler is installed above; raise only sets the flag the watcher thread reads.
+        assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
+        wait("macros stopped", || !player.lock().unwrap().is_running(KeyCode::BTN_SIDE) && !player.lock().unwrap().is_running(KeyCode::BTN_EXTRA));
+        assert!(t.elapsed() < std::time::Duration::from_millis(250), "AC-M1: stop took {:?}", t.elapsed());
+        let got = frames(&rec);
+        thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(frames(&rec), got, "still playing after SIGUSR1");
+        assert_no_stuck(&got);
     }
 
     /// Succeeds for the first `ok` frames, then fails; records every attempt.

@@ -720,6 +720,13 @@ impl App {
     }
 }
 
+/// What was pressed in the banner this frame.
+#[derive(Default, Clone, Copy)]
+pub struct BannerClick {
+    pub start: bool,
+    pub stop_macros: bool,
+}
+
 // --------------------------------------------------------------------------------------------- drawing
 
 /// Combo box over `items`; returns the index picked this frame.
@@ -855,11 +862,13 @@ impl App {
         }
     }
 
-    /// One-line honesty banner beside the sub-nav: whether macros can play right now, and why not. Returns true when
-    /// "Start service" was pressed.
-    pub fn macro_banner(&self, ui: &mut Ui) -> bool {
+    /// One-line honesty banner beside the sub-nav: whether macros can play right now, and why not. Reports which
+    /// button was pressed: "Start service" / "Try again", or "Stop all macros" (DAN-1452 decision 10: always shown
+    /// while remap runs, because v1 has no playback status to tell whether anything is playing).
+    pub fn macro_banner(&self, ui: &mut Ui) -> BannerClick {
         let p = self.pal;
         let mut start = false;
+        let mut stop_macros = false;
         let h = 34.0;
         let w = ui.available_width();
         ui.allocate_ui_with_layout(vec2(w, h), Layout::left_to_right(Align::Center), |ui| {
@@ -903,14 +912,19 @@ impl App {
                 Remap::Running => {
                     ui.label(RichText::new("●").font(mono(T_LABEL + 1.0)).color(p.ok));
                     ui.label(tracked("REMAP RUNNING", mono_med(T_LABEL), p.i100(), 0.12));
-                    ui.add(egui::Label::new(
-                        RichText::new("Macros play on this computer while the service runs. The mouse itself is never changed.")
-                            .font(sans(T_SMALL)).color(p.i65()),
-                    ).truncate());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        stop_macros = btn(ui, &p, "Stop all macros", Kind::Secondary, true).clicked();
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(
+                                RichText::new("Macros play on this computer while the service runs. The mouse itself is never changed.")
+                                    .font(sans(T_SMALL)).color(p.i65()),
+                            ).truncate());
+                        });
+                    });
                 }
             }
         });
-        start
+        BannerClick { start, stop_macros }
     }
 
     pub fn ui_rules_view(&mut self, ui: &mut Ui) {
