@@ -3,7 +3,7 @@
 //! Tabs:
 //!   Buttons   – remaps stored in the mouse's onboard memory (work with no software running)
 //!   Device    – battery, firmware, DPI, polling rate
-//!   Software  – optional computer-side remapper (uinput) config + systemd service
+//!   Software  – optional computer-side remapper (uinput): rules, macros (structured editor over macros.conf) + service
 //! A live "button tester" at the bottom shows what the computer actually receives.
 //!
 //! The look (tokens, fonts, widgets, mouse diagram) lives in `razerctl-gui/`; this file keeps the state, the
@@ -11,15 +11,19 @@
 
 #[path = "razerctl-gui/demo.rs"]
 mod demo;
+#[path = "razerctl-gui/macro_ui.rs"]
+mod macro_ui;
 #[path = "razerctl-gui/mouse.rs"]
 mod mouse;
+#[path = "razerctl-gui/service.rs"]
+mod service;
 #[path = "razerctl-gui/theme.rs"]
 mod theme;
 #[path = "razerctl-gui/widgets.rs"]
 mod widgets;
 
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
@@ -28,6 +32,8 @@ use razerctl::device::{self, Backend, Info, Prefer};
 use razerctl::hidraw::Hidraw;
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
 use razerctl::{battery, remap};
+use macro_ui::{MacroUi, Remap, Sub};
+use service::{Failure, Pending, RealSys, Sys};
 use theme::*;
 use widgets::*;
 
@@ -101,7 +107,17 @@ struct App {
     conf_path: PathBuf,
     conf_text: String,
     conf_error: Option<String>,
+    /// macros.conf, and the structured macro editor over it (see `macro_ui.rs`).
+    macros_path: PathBuf,
+    mac: MacroUi,
     service_state: String,
+    /// How the remap unit is failing (crash loop, exited), if it is, and the start whose result is still to be read
+    /// back; `svc_conf` is the remap.conf the service reads. See `service.rs`.
+    svc_failure: Option<Failure>,
+    svc_pending: Option<Pending>,
+    svc_conf: Option<PathBuf>,
+    /// systemctl / journalctl / the service binary, behind a trait so tests never touch the real service.
+    sys: Box<dyn Sys>,
     presses: Arc<Mutex<VecDeque<String>>>,
     watching: bool,
     batt_cfg: battery::Config,
@@ -150,6 +166,8 @@ impl App {
         let conf_text = std::fs::read_to_string(&conf_path).unwrap_or_else(|_| {
             "# One rule per line:  BUTTON = ACTION\n# back = ctrl+c\n# forward = KEY_F13\n# middle = disable\n".into()
         });
+        let macros_path = razerctl::macros::macros_path();
+        let mac = MacroUi::load(&macros_path);
         let mut app = App {
             tab: Tab::Buttons,
             status: String::new(),
@@ -163,7 +181,13 @@ impl App {
             conf_path,
             conf_text,
             conf_error: None,
+            macros_path,
+            mac,
             service_state: String::new(),
+            svc_failure: None,
+            svc_pending: None,
+            svc_conf: None,
+            sys: Box::new(RealSys),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
             batt_cfg: battery::load(),
@@ -180,6 +204,20 @@ impl App {
         app
     }
 
+    /// Write the rules editor to `remap.conf` through `write_atomic`: the service reads that file on every
+    /// start, and a half-written one stops the unit (exit 78).
+    fn save_rules_from_ui(&mut self) -> bool {
+        match write_atomic(&self.conf_path, &self.conf_text) {
+            Ok(()) => {
+                self.ok("Config saved. Restart the service to apply.");
+                true
+            }
+            Err(e) => {
+                self.err(e.to_string());
+                false
+            }
+        }
+    }
     fn ok(&mut self, s: impl Into<String>) { self.status = s.into(); self.status_is_error = false; }
     fn err(&mut self, s: impl Into<String>) { self.status = s.into(); self.status_is_error = true; }
 
@@ -254,15 +292,6 @@ impl App {
         self.save_buttons();
     }
 
-    fn refresh_service(&mut self) {
-        let state = |unit: &str| match Command::new("systemctl").args(["--user", "is-active", unit]).output() {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(e) => format!("systemctl unavailable: {e}"),
-        };
-        self.service_state = state(SERVICE);
-        self.batt_service = state(battery::SERVICE);
-    }
-
     /// Save battery settings, and start/stop the background notifier to match the toggle.
     fn apply_battery_settings(&mut self) {
         if let Err(e) = battery::save(&self.batt_cfg) {
@@ -284,15 +313,6 @@ impl App {
                 "Settings saved, but the notifier service didn't {}: {} (run ./install.sh to install it)",
                 args[0], String::from_utf8_lossy(&o.stderr).trim()
             )),
-            Err(e) => self.err(e.to_string()),
-        }
-        self.refresh_service();
-    }
-
-    fn systemctl(&mut self, args: &[&str]) {
-        match Command::new("systemctl").arg("--user").args(args).output() {
-            Ok(o) if o.status.success() => self.ok(format!("systemctl {} ok", args.join(" "))),
-            Ok(o) => self.err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
             Err(e) => self.err(e.to_string()),
         }
         self.refresh_service();
@@ -388,6 +408,13 @@ impl App {
                 });
                 val(ui, "DPI", i.dpi.map_or("n/a".into(), |(x, _)| x.to_string()));
                 val(ui, "Poll", i.poll_rate.map_or("n/a".into(), |r| format!("{r} Hz")));
+                // host-played macros need the service, so every tab shows whether it is up
+                match self.remap_state() {
+                    Remap::Running => val(ui, "Remap", "● running".into()),
+                    Remap::Stopped => val(ui, "Remap", "○ stopped".into()),
+                    Remap::NoDevice => val(ui, "Remap", "○ waiting".into()),
+                    Remap::Failed => val(ui, "Remap", "× failed".into()),
+                }
                 if wide { val(ui, "Profile", self.profile.to_string()); }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new(format!("● {}", self.backend_kind)).font(mono_bold(T_DATA)).color(p.i100()));
@@ -934,41 +961,46 @@ impl App {
         let p = self.pal;
         title(
             ui, &p, "Software remap.",
-            "Optional. Runs on this computer only, while the service is running. Use it for things the mouse \
-             can't store itself, such as multi-key shortcuts on several buttons or any evdev key name.",
+            "Optional. Runs on this computer only, while the service is running. Remap a button to keys, or play a macro. \
+             Macros are played by the computer, never stored in the mouse.",
             ui.available_width() * 0.36,
         );
-        let total = ui.available_width();
-        let narrow = total < 900.0;
-        let right_w = if narrow { total } else { (total * 0.30).clamp(260.0, 340.0) };
-        let gap = S4;
-        let left_w = if narrow { total } else { total - right_w - gap };
-        let layout = if narrow { egui::Layout::top_down(egui::Align::Min) } else { egui::Layout::left_to_right(egui::Align::Min) };
-        ui.with_layout(layout, |ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            ui.allocate_ui_with_layout(vec2(left_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_width(left_w);
-                section(ui, &p, "01", "Config");
-                self.config_panel(ui);
+        // sub-nav and the host-played banner share one row (the banner drops under it when narrow)
+        let narrow = ui.available_width() < 900.0;
+        let mut start = false;
+        let mut sub = None;
+        let row = |ui: &mut egui::Ui, app: &Self, start: &mut bool, sub: &mut Option<usize>| {
+            let labels = vec!["Rules".to_string(), app.macros_label()];
+            *sub = segmented(ui, &p, "sub", &labels, Some(app.mac.sub as usize), 108.0);
+            *start = app.macro_banner(ui);
+        };
+        if narrow {
+            row(ui, self, &mut start, &mut sub);
+        } else {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S4;
+                row(ui, self, &mut start, &mut sub);
             });
-            ui.allocate_ui_with_layout(vec2(right_w, 0.0), egui::Layout::top_down(egui::Align::Min), |ui| {
-                ui.set_width(right_w);
-                section(ui, &p, "02", "Service");
-                self.service_panel(ui);
-            });
-        });
+        }
+        if let Some(i) = sub { self.mac.sub = if i == 0 { Sub::Rules } else { Sub::Macros }; }
+        if let Some(w) = self.config_dir_warning() {
+            ui.add_space(S1);
+            ui.add(egui::Label::new(RichText::new(format!("▲ {w}")).font(sans(T_SMALL)).color(p.warn)).wrap());
+        }
+        if start { self.systemctl(&["start", SERVICE]); }
+        ui.add_space(S2);
+        match self.mac.sub {
+            Sub::Rules => self.ui_rules_view(ui),
+            Sub::Macros => self.ui_macros_view(ui),
+        }
     }
 
+    /// The rules text (remap.conf) with its validity line. A rule that plays a macro that does not exist is an
+    /// error like a syntax error: it highlights the line and blocks Save config.
     fn config_panel(&mut self, ui: &mut egui::Ui) {
         let p = self.pal;
+        let mut fix: Option<(usize, Option<String>)> = None; // (line, None = remove / Some(macro) = retarget)
         panel(ui, &p, 16, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = S2;
-                ui.label(caps(&p, "Config"));
-                // a real $XDG_CONFIG_HOME can be arbitrarily long: wrap instead of widening the column
-                ui.add(egui::Label::new(RichText::new(self.conf_path.display().to_string()).font(mono(T_DATA)).color(p.i100())).wrap());
-            });
-            ui.add_space(S2);
             // Comment lines dimmed, the line the parser rejected highlighted (as of the previous frame's parse).
             let err_line: Option<usize> = self.conf_error.as_deref().and_then(|e| e.strip_prefix("line ")?.split(':').next()?.parse().ok());
             let mut layouter = move |ui: &egui::Ui, text: &dyn egui::TextBuffer, wrap: f32| {
@@ -982,36 +1014,63 @@ impl App {
                 ui.painter().layout_job(job)
             };
             let w = ui.available_width();
-            ui.add(egui::TextEdit::multiline(&mut self.conf_text).code_editor().desired_rows(9).desired_width(w)
+            ui.add(egui::TextEdit::multiline(&mut self.conf_text).code_editor().desired_rows(4).desired_width(w)
                 .layouter(&mut layouter).margin(Margin::same(12)));
             ui.add_space(S2);
             let parsed = remap::parse_config(&self.conf_text);
-            match &parsed {
-                Ok(m) => { chip(ui, &p, Some("●"), &format!("{} rule(s), valid", m.len()), ChipStyle::Plain, p.ok); self.conf_error = None; }
-                Err(e) => {
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = S3;
-                        chip(ui, &p, Some("×"), "Invalid", ChipStyle::Outline, p.bad);
-                        ui.add(egui::Label::new(RichText::new(e).font(mono(T_DATA)).color(p.bad)).wrap());
-                    });
-                    self.conf_error = Some(e.clone());
-                }
-            }
-            ui.add_space(S3);
+            let dangling = if parsed.is_ok() { self.mac.dangling(&self.conf_text) } else { Vec::new() };
+            self.conf_error = match (&parsed, dangling.first()) {
+                (Err(e), _) => Some(e.clone()),
+                (Ok(_), Some((line, name))) => Some(format!("line {line}: macro '{name}' does not exist")),
+                (Ok(_), None) => None,
+            };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S3;
-                if btn(ui, &p, "💾  Save config", Kind::Primary, self.conf_error.is_none()).clicked() {
-                    let r = self.conf_path.parent().map(std::fs::create_dir_all).transpose()
-                        .and_then(|_| std::fs::write(&self.conf_path, &self.conf_text));
-                    match r {
-                        Ok(_) => self.ok("Config saved. Restart the service to apply."),
-                        Err(e) => self.err(e.to_string()),
+                let save = btn(ui, &p, "💾  Save config", Kind::Primary, self.conf_error.is_none());
+                demo::note("save-config", &save);
+                if save.clicked() {
+                    self.save_rules_from_ui();
+                }
+                match (&self.conf_error, dangling.first()) {
+                    (None, _) => {
+                        let n = parsed.as_ref().map_or(0, |m| m.len());
+                        chip(ui, &p, Some("●"), &format!("{n} rule(s), valid"), ChipStyle::Plain, p.ok);
+                        let hint = if self.mac.dirty() { "Macros have unsaved changes: save them before you restart." } else { "Restart to apply; stops running macros." };
+                        ui.label(RichText::new(hint).font(sans(T_SMALL)).color(p.i65()));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            // a long $XDG_CONFIG_HOME is cut short rather than drawn over the hint
+                            ui.add(egui::Label::new(RichText::new(macro_ui::tilde(&self.conf_path)).font(mono(T_DATA)).color(p.i65())).truncate());
+                        });
+                    }
+                    (Some(e), Some((line, _))) => {
+                        chip(ui, &p, Some("×"), "Invalid", ChipStyle::Outline, p.bad);
+                        ui.label(RichText::new(e).font(mono(T_DATA)).color(p.bad));
+                        let line = *line;
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if btn(ui, &p, "Remove rule", Kind::Secondary, true).clicked() { fix = Some((line, None)); }
+                            let names = self.mac.names();
+                            let pick = egui::ComboBox::from_id_salt("pick-macro").width(150.0)
+                                .selected_text(tracked("PICK ANOTHER MACRO", mono_med(T_LABEL), p.i100(), 0.12))
+                                .show_ui(ui, |ui| {
+                                    let mut chosen = None;
+                                    for n in &names { if ui.selectable_label(false, n).clicked() { chosen = Some(n.clone()); } }
+                                    chosen
+                                });
+                            if let Some(Some(n)) = pick.inner { fix = Some((line, Some(n))); }
+                        });
+                    }
+                    (Some(e), None) => {
+                        chip(ui, &p, Some("×"), "Invalid", ChipStyle::Outline, p.bad);
+                        ui.add(egui::Label::new(RichText::new(e).font(mono(T_DATA)).color(p.bad)).wrap());
                     }
                 }
-                ui.label(RichText::new(if self.conf_error.is_none() { "Restart the service to apply." } else { "Fix the error to enable saving." })
-                    .font(sans(T_SMALL)).color(p.i65()));
             });
         });
+        match fix {
+            Some((line, None)) => self.conf_text = macro_ui::remove_line(&self.conf_text, line),
+            Some((line, Some(to))) => self.conf_text = macro_ui::retarget_line(&self.conf_text, line, &to),
+            None => {}
+        }
     }
 
     fn service_panel(&mut self, ui: &mut egui::Ui) {
@@ -1026,6 +1085,10 @@ impl App {
                 ui.label(RichText::new(&self.service_state).font(serif(T_TITLE + 2.0)).color(if active { p.i100() } else { p.i65() }));
             });
             ui.label(RichText::new(SERVICE).font(mono(T_DATA)).color(p.i65()));
+            if let Some(f) = &self.svc_failure {
+                ui.add_space(S2);
+                ui.add(egui::Label::new(RichText::new(format!("× {}", f.full())).font(mono(T_DATA)).color(p.bad)).wrap());
+            }
             ui.add_space(S4);
             hair(ui, &p);
             ui.add_space(S3);
@@ -1057,6 +1120,28 @@ fn key_syntax(ui: &mut egui::Ui, p: &Pal) {
         "Keys: letters, digits, f1–f24, enter, esc, tab, space, arrows, home/end/pageup/pagedown, insert/delete; \
          modifiers ctrl, shift, alt, super (one key + any modifiers).",
     ).font(sans(T_SMALL)).color(p.i65())).wrap());
+}
+
+/// Write `text` to a temp file next to `path`, then rename it over `path` (creating the parent dir), so a crash
+/// never leaves a half-written file. The temp file is removed if anything fails.
+fn write_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(format!(".tmp{}", std::process::id()));
+    let tmp = PathBuf::from(tmp);
+    let r = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(text.as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r
 }
 
 /// Title row: serif display title left, one- or two-line intro in a fixed column to its right.
@@ -1113,6 +1198,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         demo::step(self, &ctx);
+        self.poll_service(&ctx);
         self.start_watch(&ctx);
         let mode = self.demo.theme.unwrap_or(if ctx.theme() == egui::Theme::Light { Mode::Light } else { Mode::Dark });
         if self.styled != Some(mode) {
@@ -1188,8 +1274,9 @@ fn main() -> eframe::Result {
 mod tests {
     use super::*;
     use eframe::egui::epaint::Shape as EShape;
+    use razerctl::macros;
 
-    fn test_app() -> App {
+    pub(super) fn test_app() -> App {
         App {
             tab: Tab::Buttons,
             status: String::new(),
@@ -1203,7 +1290,13 @@ mod tests {
             conf_path: PathBuf::from("/nonexistent/razerctl/remap.conf"),
             conf_text: "# back = ctrl+c\n".into(),
             conf_error: None,
+            macros_path: PathBuf::from("/nonexistent/razerctl/macros.conf"),
+            mac: MacroUi::empty(),
             service_state: "inactive".into(),
+            svc_failure: None,
+            svc_pending: None,
+            svc_conf: None,
+            sys: Box::new(service::tests::Fake::default()),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
             batt_cfg: battery::Config { enabled: true, threshold: 20, interval_min: 5 },
@@ -1224,6 +1317,12 @@ mod tests {
 
     /// Lay out one frame of `tab` (header, strip, tester, status bar and the tab body) and return every string drawn.
     fn render(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> String {
+        render_texts(app, tab, mode, size).into_iter().map(|(s, ..)| s + "\n").collect()
+    }
+
+    /// Like `render`, one entry per string drawn: text, position, and override colour (buttons paint their label
+    /// with one, so it tells an enabled button from a disabled one).
+    fn render_texts(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> Vec<(String, egui::Pos2, Option<Color32>)> {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         app.pal = Pal::new(mode);
@@ -1231,7 +1330,7 @@ mod tests {
         app.tab = tab;
         let mut input = egui::RawInput::default();
         input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(size.0, size.1)));
-        let mut text = String::new();
+        let mut texts = Vec::new();
         for _ in 0..2 {
             let mut out = ctx.run_ui(input.clone(), |ui| {
                 app.header(ui);
@@ -1244,17 +1343,34 @@ mod tests {
                     Tab::Software => app.ui_software(ui),
                 }
             });
-            text.clear();
+            texts.clear();
             for cs in &out.shapes {
-                if let EShape::Text(t) = &cs.shape { text.push_str(t.galley.text()); text.push('\n'); }
+                if let EShape::Text(t) = &cs.shape { texts.push((t.galley.text().to_string(), t.pos, t.override_text_color)); }
             }
             // No renderer consumes the font-atlas upload here; epaint 0.36 panics on drop if it is left unapplied.
             out.textures_delta.clear();
         }
-        text
+        texts
     }
 
     const SIZES: [(f32, f32); 2] = [(1280.0, 900.0), (780.0, 560.0)];
+    /// Window height that fits the whole Software tab, macros included, in both widths (render has no scroll area).
+    const TALL: f32 = 2400.0;
+
+    /// copy: 5 events (tap = down + up), 30 ms; scroll: 3 events, 15 ms.
+    const MACROS: &str = "[copy]\ndown ctrl\ndelay 30\ntap c\nup ctrl\n\n[scroll]\nwheel 1\ndelay 15\nwheel 1\n";
+    const RULES: &str = "# rules\nback = macro:copy,toggle\nforward = macro:scroll,held\nmiddle = ctrl+c\n";
+
+    /// A device present, the service running, `MACROS` loaded and `RULES` in the rules editor.
+    pub(super) fn macro_app(sub: Sub) -> App {
+        let mut app = test_app();
+        with_device(&mut app);
+        app.service_state = "active".into();
+        app.conf_text = RULES.into();
+        app.mac = MacroUi::from_macros(&macros::parse_macros(MACROS).unwrap());
+        app.mac.sub = sub;
+        app
+    }
 
     #[test]
     fn every_tab_lays_out_in_both_modes_and_both_window_sizes() {
@@ -1266,6 +1382,21 @@ mod tests {
                         if !no_device { with_device(&mut app); }
                         let text = render(&mut app, tab, mode, size);
                         assert!(!text.is_empty(), "{tab:?} {mode:?} {size:?} drew nothing");
+                    }
+                    // both halves of Software remap are taller than these windows: lay them out tall enough to be drawn,
+                    // with no macros, real macros, and an invalid one
+                    for sub in [Sub::Rules, Sub::Macros] {
+                        for state in 0..3 {
+                            let mut app = macro_app(sub);
+                            if no_device { app.info = None; }
+                            match state {
+                                0 => app.mac = MacroUi { sub, ..MacroUi::empty() },
+                                2 => app.mac.drafts[0].events.pop().map(drop).unwrap_or_default(),
+                                _ => {}
+                            }
+                            let text = render(&mut app, Tab::Software, mode, (size.0, TALL));
+                            assert!(text.contains("SOFTWARE REMAP") || text.contains("Software remap."), "{sub:?} {state} {mode:?} {size:?}: {text}");
+                        }
                     }
                 }
             }
@@ -1367,5 +1498,493 @@ mod tests {
         assert_eq!(pretty_button(0x60), ("DPI", "underside"));
         assert_eq!(pretty_button(1), ("Left", ""));
         assert_eq!(pretty_button(0x42), ("Other", ""));
+    }
+
+    /// Override colour of the drawn "SAVE MACROS" label: stamp_fg when the button is enabled, ink-45 when not.
+    fn save_macros_colour(texts: &[(String, egui::Pos2, Option<Color32>)]) -> Option<Color32> {
+        texts.iter().find(|(s, ..)| s.ends_with("SAVE MACROS")).and_then(|(_, _, c)| *c)
+    }
+
+    fn lines(texts: &[(String, egui::Pos2, Option<Color32>)]) -> Vec<&str> {
+        texts.iter().map(|(s, ..)| s.as_str()).collect()
+    }
+
+    fn software(app: &mut App, size: (f32, f32)) -> Vec<(String, egui::Pos2, Option<Color32>)> {
+        render_texts(app, Tab::Software, Mode::Dark, (size.0, TALL))
+    }
+
+    #[test]
+    fn software_remap_opens_on_rules_with_a_macros_count_beside_it() {
+        let mut app = macro_app(Sub::Rules);
+        let t = software(&mut app, SIZES[0]);
+        let l = lines(&t);
+        for want in ["01 // RULES", "02 // ADD A RULE", "03 // SERVICE", "RULES", "MACROS · 2", "REMAP RUNNING", "ADDS THIS LINE"] {
+            assert!(l.contains(&want), "{want:?} not drawn: {l:?}");
+        }
+        assert!(l.contains(&"3 RULE(S), VALID"), "{l:?}");
+        // the rules editor is still a text editor and Save config is enabled
+        assert_eq!(t.iter().find(|(s, ..)| s.ends_with("SAVE CONFIG")).and_then(|(_, _, c)| *c), Some(app.pal.stamp_fg));
+        // the old raw macros editor is gone from this tab
+        assert!(!l.contains(&"03 // MACROS") && !l.iter().any(|s| s.contains("Macros · ")));
+    }
+
+    #[test]
+    fn valid_state_lists_the_macros_and_their_events_one_row_each() {
+        for size in SIZES {
+            let mut app = macro_app(Sub::Macros);
+            let t = software(&mut app, size);
+            let l = lines(&t);
+            for want in ["01 // MACROS", "02 // EDIT", "copy", "scroll", "NAME", "USED BY", "BACK · TOGGLE", "5 EVENTS · 0.05 S", "→ BACK · TOGGLE",
+                         "KEY ↓", "KEY ↑", "DELAY", "VALID", "5 events · about 0.05 s per run", "+ TAP KEY", "+ CLICK", "+ DELAY", "+ OTHER  ▾",
+                         "SAVED"] {
+                assert!(l.iter().any(|s| s.ends_with(want)), "{size:?}: {want:?} not drawn: {l:?}");
+            }
+            assert!(l.contains(&"01") && l.contains(&"05") && !l.contains(&"06"), "{size:?}: one row per event");
+            assert_eq!(save_macros_colour(&t), Some(app.pal.i45()), "{size:?}: Save is off while nothing changed");
+            // an edit turns Save on and the state chip to Unsaved
+            app.mac.drafts[0].events.push(macro_ui::Ev::Delay(5));
+            let t = software(&mut app, size);
+            assert_eq!(save_macros_colour(&t), Some(app.pal.stamp_fg), "{size:?}: Save is on after an edit");
+            assert!(lines(&t).contains(&"UNSAVED"));
+            assert!(app.status.is_empty(), "drawing never saves");
+        }
+    }
+
+    #[test]
+    fn empty_state_explains_host_play_and_offers_starters() {
+        let mut app = macro_app(Sub::Macros);
+        app.mac = MacroUi::empty();
+        app.mac.sub = Sub::Macros;
+        let t = software(&mut app, SIZES[0]);
+        let l = lines(&t);
+        for want in ["MACROS · 0", "No macros yet.", "Played by this computer, not by the mouse.", "rapid-click", "copy-paste", "double-tap",
+                     "OR START FROM", "01 // MACROS", "02 // HOW MACROS RUN", "TYPED, NOT RECORDED"] {
+            assert!(l.contains(&want), "{want:?} not drawn: {l:?}");
+        }
+        assert!(l.iter().any(|s| s.ends_with("NEW MACRO")));
+        assert!(!l.contains(&"02 // EDIT"), "no editor until there is a macro");
+        assert!(!l.iter().any(|s| s.ends_with("SAVE MACROS")));
+    }
+
+    #[test]
+    fn invalid_state_marks_the_row_blocks_save_and_says_why() {
+        let mut app = macro_app(Sub::Macros);
+        use macro_ui::{Draft, Ev};
+        app.mac.push(Draft::new("shift-select", vec![Ev::Key("KEY_LEFTSHIFT".into(), true), Ev::Key("KEY_END".into(), true), Ev::Delay(20), Ev::Key("KEY_END".into(), false)]));
+        app.mac.push(Draft::new("untitled-1", vec![]));
+        app.mac.sel = 2;
+        let t = software(&mut app, SIZES[0]);
+        let l = lines(&t);
+        assert!(l.contains(&"KEY_LEFTSHIFT is pressed at #01 and never released, so it would stay held after the macro ends."), "{l:?}");
+        assert!(l.contains(&"×"), "the offending row carries a × of its own");
+        assert!(l.iter().filter(|s| **s == "INVALID").count() == 2, "both list rows say INVALID: {l:?}");
+        assert!(l.contains(&"2 MACROS INVALID") && l.contains(&"1 PROBLEM"), "{l:?}");
+        assert_eq!(save_macros_colour(&t), Some(app.pal.i45()), "Save macros is disabled");
+        let restart = t.iter().find(|(s, ..)| s.ends_with("SAVE AND RESTART SERVICE")).and_then(|(_, _, c)| *c);
+        assert_eq!(restart, Some(app.pal.i45()), "so is Save and restart");
+        assert!(!app.mac.can_save());
+        // the empty one says it has nothing to play
+        app.mac.sel = 3;
+        let l2: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l2.iter().any(|s| s == "No events. A macro needs at least one event."));
+        assert!(l2.iter().any(|s| s == "No events yet."));
+        // fixing the macro turns Save back on
+        app.mac.drafts[3].events.push(Ev::Wheel(1));
+        app.mac.drafts[2].events.pop();
+        app.mac.drafts[2].events.pop();
+        app.mac.drafts[2].events.pop();
+        app.mac.drafts[2].events.pop();
+        app.mac.drafts[2].events.push(Ev::Delay(1));
+        assert!(app.mac.can_save());
+    }
+
+    #[test]
+    fn dangling_state_blocks_save_config_and_offers_two_fixes() {
+        let mut app = macro_app(Sub::Rules);
+        app.mac.sel = 0;
+        app.mac.delete(false); // `copy` is gone from the editor, `back = macro:copy` is still in the rules
+        let t = software(&mut app, SIZES[0]);
+        let l = lines(&t);
+        assert!(l.contains(&"line 2: macro 'copy' does not exist"), "{l:?}");
+        assert!(l.contains(&"INVALID") && l.contains(&"REMOVE RULE") && l.contains(&"PICK ANOTHER MACRO"), "{l:?}");
+        assert_eq!(t.iter().find(|(s, ..)| s.ends_with("SAVE CONFIG")).and_then(|(_, _, c)| *c), Some(app.pal.i45()), "Save config is disabled");
+        assert_eq!(app.conf_error.as_deref(), Some("line 2: macro 'copy' does not exist"));
+        // a syntax error keeps its own message and no fix buttons
+        app.conf_text = "back = ctrl+c\nforward KEY_F13\n".into();
+        let l2: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l2.iter().any(|s| s.starts_with("line 2: expected SOURCE = ACTION")) && !l2.iter().any(|s| s == "REMOVE RULE"));
+        // removing the rule clears it
+        app.conf_text = macro_ui::remove_line(RULES, 2);
+        software(&mut app, SIZES[0]);
+        assert_eq!(app.conf_error, None);
+    }
+
+    #[test]
+    fn delete_confirm_names_the_rule_it_would_orphan_and_unused_macros_just_go() {
+        let mut app = macro_app(Sub::Macros);
+        app.request_delete(); // `copy` is bound to BACK
+        assert!(app.mac.confirm_delete && app.mac.drafts.len() == 2, "a bound macro is not deleted yet");
+        let t = software(&mut app, SIZES[0]);
+        let l = lines(&t);
+        assert!(l.contains(&"Delete 'copy'?"), "{l:?}");
+        assert!(l.iter().any(|s| s.starts_with("It is used by 1 rule: BACK · TOGGLE. Deleting it leaves that rule pointing at nothing")), "{l:?}");
+        for b in ["DELETE AND REMOVE RULE", "DELETE MACRO ONLY", "CANCEL"] { assert!(l.contains(&b), "{b}: {l:?}"); }
+        assert!(!l.contains(&"NAME"), "the confirmation replaces the name row");
+        // an unused macro goes at once
+        let mut app = macro_app(Sub::Macros);
+        app.conf_text = "middle = ctrl+c\n".into();
+        app.request_delete();
+        assert!(!app.mac.confirm_delete && app.mac.drafts.len() == 1 && app.mac.dirty());
+    }
+
+    #[test]
+    fn host_banner_says_whether_macros_can_play() {
+        let mut app = macro_app(Sub::Macros);
+        assert_eq!(app.remap_state(), Remap::Running);
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l.iter().any(|s| s == "REMAP RUNNING") && l.iter().any(|s| s.starts_with("Macros play on this computer while the service runs.")));
+        assert!(!l.iter().any(|s| s.contains("GRABBED") || s.contains("PLAYING")), "no claim the GUI cannot check: {l:?}");
+        app.service_state = "inactive".into();
+        assert_eq!(app.remap_state(), Remap::Stopped);
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l.iter().any(|s| s == "REMAP NOT RUNNING") && l.iter().any(|s| s.ends_with("START SERVICE")), "{l:?}");
+        assert!(l.iter().any(|s| s.contains("stopped")), "the strip says it too: {l:?}");
+        app.service_state = "active".into();
+        app.info = None;
+        assert_eq!(app.remap_state(), Remap::NoDevice);
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l.iter().any(|s| s == "NO MOUSE") && l.iter().any(|s| s.starts_with("Remap is waiting for the mouse.")), "{l:?}");
+    }
+
+    #[test]
+    fn remap_chip_is_in_the_device_strip_on_every_tab() {
+        for tab in [Tab::Buttons, Tab::Device, Tab::Software] {
+            let mut app = macro_app(Sub::Rules);
+            let t = render(&mut app, tab, Mode::Dark, (1280.0, 900.0));
+            assert!(t.contains("REMAP") && t.contains("● running"), "{tab:?}");
+            app.service_state = "failed".into();
+            assert!(render(&mut app, tab, Mode::Dark, (1280.0, 900.0)).contains("○ stopped"), "{tab:?}");
+        }
+    }
+
+    #[test]
+    fn add_rule_appends_one_line_to_the_buffer_and_nothing_else() {
+        let mut app = macro_app(Sub::Rules);
+        app.mac.bind.macro_name = "scroll".into();
+        app.mac.bind.button = 3;
+        app.mac.bind.mode = 3;
+        let before = app.conf_text.clone();
+        let t = software(&mut app, SIZES[0]);
+        assert!(lines(&t).contains(&"back = macro:scroll,toggle"), "the preview shows the line");
+        assert_eq!(app.conf_text, before, "drawing adds nothing");
+        // Left can't loop: the strip says so and Add rule is off
+        app.mac.bind.button = 0;
+        app.mac.bind.mode = 2;
+        let t = software(&mut app, SIZES[0]);
+        assert!(lines(&t).iter().any(|s| s.starts_with("Left can't repeat while held or toggled")));
+        let add = t.iter().find(|(s, ..)| s.ends_with("ADD RULE  →")).and_then(|(_, _, c)| *c);
+        assert_eq!(add, Some(app.pal.i45()), "Add rule disabled for left + held");
+        assert!(!lines(&t).iter().any(|s| s.starts_with("left = ")));
+    }
+
+    /// Unique dir under the system temp dir, removed on drop (also when a test fails).
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            TempDir(std::env::temp_dir().join(format!("razerctl-gui-{tag}-{}-{nanos}", std::process::id())))
+        }
+        fn names(&self, sub: &str) -> Vec<String> {
+            let mut v: Vec<String> = std::fs::read_dir(self.0.join(sub)).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+            v.sort();
+            v
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// App whose two config files live in `dir`, with `MACROS` on disk and `RULES` in both the file and the editor.
+    fn saved_app(dir: &TempDir) -> App {
+        let mut app = macro_app(Sub::Macros);
+        app.conf_path = dir.0.join("razerctl/remap.conf");
+        app.macros_path = dir.0.join("razerctl/macros.conf");
+        std::fs::create_dir_all(dir.0.join("razerctl")).unwrap();
+        std::fs::write(&app.conf_path, RULES).unwrap();
+        std::fs::write(&app.macros_path, MACROS).unwrap();
+        app.mac = MacroUi::load(&app.macros_path);
+        app
+    }
+
+    #[test]
+    fn save_writes_macros_conf_through_a_temp_file_and_refuses_invalid_ones() {
+        let dir = TempDir::new("macros-save");
+        let mut app = saved_app(&dir);
+        app.mac.drafts[0].events.push(macro_ui::Ev::Wheel(2)); // copy: +1 event
+        assert!(app.save_macros_from_ui(), "{}", app.status);
+        assert!(!app.status_is_error && app.status.starts_with("Macros saved to ") && app.status.ends_with("Restart the service to apply."), "{}", app.status);
+        let back = macros::load_macros(&app.macros_path).unwrap();
+        assert_eq!(back["copy"].events.len(), 6);
+        assert_eq!(back["scroll"].events.len(), 3);
+        assert_eq!(dir.names("razerctl"), ["macros.conf", "remap.conf"], "no temp file left behind");
+        assert!(!app.mac.dirty(), "what is on screen is what is on disk");
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), RULES, "rules untouched when nothing was renamed");
+
+        // an invalid macro is refused before the file is touched
+        let on_disk = std::fs::read_to_string(&app.macros_path).unwrap();
+        app.mac.drafts[1].events.remove(1); // scroll: wheel, wheel... still valid; now make it empty
+        app.mac.drafts[1].events.clear();
+        assert!(!app.save_macros_from_ui());
+        assert!(app.status_is_error && app.status.starts_with("Macros not saved: macro 'scroll'") || app.status.contains("empty"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), on_disk);
+        // a key typed wrong is the same
+        app.mac.revert();
+        app.mac.drafts[0].events[0] = macro_ui::Ev::Key("nonsense_key".into(), true);
+        assert!(!app.save_macros_from_ui());
+        assert!(app.status.contains("unknown key/button"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), on_disk);
+    }
+
+    #[test]
+    fn rename_rewrites_the_rules_in_the_same_save() {
+        let dir = TempDir::new("macros-rename");
+        let mut app = saved_app(&dir);
+        app.conf_text = format!("{RULES}# unsaved edit\n"); // still in the editor, not on disk
+        app.mac.drafts[0].name = "copy-all".into();
+        assert!(app.mac.dangling(&app.conf_text).is_empty(), "the rule follows the rename, so it is not dangling");
+        assert!(app.save_macros_from_ui(), "{}", app.status);
+        let want = RULES.replace("macro:copy,", "macro:copy-all,");
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), want, "the file on disk has the new name");
+        assert_eq!(app.conf_text, format!("{want}# unsaved edit\n"), "the editor too, with its unsaved edit kept");
+        let m = macros::load_macros(&app.macros_path).unwrap();
+        assert_eq!(m.keys().collect::<Vec<_>>(), ["copy-all", "scroll"]);
+        assert!(razerctl::remap::check_macros(&remap::load_mapping(&app.conf_path, &[]).unwrap(), &m).is_ok(), "the saved pair is consistent");
+        assert_eq!(app.mac.drafts[0].orig.as_deref(), Some("copy-all"));
+        assert_eq!(app.mac.drafts[app.mac.sel].name, "copy-all", "selection follows the macro");
+    }
+
+    #[test]
+    fn delete_and_remove_rule_takes_the_rule_with_it() {
+        let dir = TempDir::new("macros-delete");
+        let mut app = saved_app(&dir);
+        app.mac.sel = 0;
+        app.mac.delete(true);
+        assert!(app.mac.dangling(&app.conf_text).is_empty(), "the rule is slated for removal");
+        assert!(app.save_macros_from_ui(), "{}", app.status);
+        let rules = std::fs::read_to_string(&app.conf_path).unwrap();
+        assert_eq!(rules, "# rules\nforward = macro:scroll,held\nmiddle = ctrl+c\n");
+        assert_eq!(app.conf_text, rules);
+        assert_eq!(macros::load_macros(&app.macros_path).unwrap().keys().collect::<Vec<_>>(), ["scroll"]);
+        // "Delete macro only" leaves the rule, and the GUI flags it
+        let mut app = saved_app(&dir);
+        app.mac.sel = 0;
+        app.mac.delete(false);
+        assert_eq!(app.mac.dangling(&app.conf_text), [(2, "copy".to_string())]);
+    }
+
+    #[test]
+    fn save_config_goes_through_a_temp_file_and_rename() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = TempDir::new("rules-atomic");
+        let mut app = saved_app(&dir);
+        let inode = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        let before = inode(&app.conf_path);
+        app.conf_text = format!("{RULES}# edited\n");
+        assert!(app.save_rules_from_ui(), "{}", app.status);
+        assert!(!app.status_is_error && app.status == "Config saved. Restart the service to apply.", "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), app.conf_text);
+        // a plain fs::write truncates the existing file in place and keeps its inode; temp file + rename replaces it
+        assert_ne!(inode(&app.conf_path), before, "remap.conf was rewritten in place instead of renamed over");
+        assert_eq!(dir.names("razerctl"), ["macros.conf", "remap.conf"], "no temp file left behind");
+
+        // a missing config dir is created, as before
+        app.conf_path = dir.0.join("fresh/razerctl/remap.conf");
+        assert!(app.save_rules_from_ui(), "{}", app.status);
+        assert_eq!(dir.names("fresh/razerctl"), ["remap.conf"]);
+
+        // a failed save leaves the old file whole: squat on the temp name so creating it fails
+        app.conf_path = dir.0.join("razerctl/remap.conf");
+        let old = std::fs::read_to_string(&app.conf_path).unwrap();
+        std::fs::create_dir(dir.0.join(format!("razerctl/remap.conf.tmp{}", std::process::id()))).unwrap();
+        app.conf_text = "back = ctrl+c\n".into();
+        assert!(!app.save_rules_from_ui());
+        assert!(app.status_is_error, "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), old, "a failed save must not touch the old file");
+    }
+
+    #[test]
+    fn a_failed_second_write_puts_macros_conf_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new("macros-rollback");
+        let mut app = saved_app(&dir);
+        // remap.conf lives in a directory that can be read but not written to
+        let conf_dir = dir.0.join("conf");
+        std::fs::create_dir_all(&conf_dir).unwrap();
+        app.conf_path = conf_dir.join("remap.conf");
+        std::fs::write(&app.conf_path, RULES).unwrap();
+        std::fs::set_permissions(&conf_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let writable = std::fs::File::create(conf_dir.join("probe")).is_ok(); // root ignores the mode
+        let before = std::fs::read_to_string(&app.macros_path).unwrap();
+        app.mac.drafts[0].name = "renamed".into();
+        let saved = app.save_macros_from_ui();
+        std::fs::set_permissions(&conf_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if writable { return; }
+        assert!(!saved, "{}", app.status);
+        assert!(app.status_is_error && app.status.starts_with("Nothing saved:") && app.status.contains("macros.conf was put back"), "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.macros_path).unwrap(), before, "macros.conf is as it was");
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), RULES);
+        assert!(app.mac.dirty(), "the edit is still on screen to retry");
+        assert_eq!(dir.names("razerctl"), ["macros.conf", "remap.conf"], "no temp file left");
+    }
+
+    #[test]
+    fn a_macros_conf_that_does_not_parse_is_shown_and_never_overwritten() {
+        let dir = TempDir::new("macros-broken");
+        std::fs::create_dir_all(dir.0.join("razerctl")).unwrap();
+        let path = dir.0.join("razerctl/macros.conf");
+        std::fs::write(&path, "[a]\nbogus\n").unwrap();
+        let mut app = macro_app(Sub::Macros);
+        app.macros_path = path.clone();
+        app.mac = MacroUi::load(&path);
+        app.mac.sub = Sub::Macros;
+        assert!(app.mac.load_error.as_deref().is_some_and(|e| e.contains("line 2: unknown command 'bogus'")));
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(l.iter().any(|s| s == "macros.conf can't be read.") && l.iter().any(|s| s.contains("unknown command 'bogus'")), "{l:?}");
+        assert!(l.iter().any(|s| s == "MACROS · !"));
+        assert!(app.mac.dangling(RULES).is_empty(), "rules are not called dangling when the list could not be read");
+        app.mac.new_macro();
+        assert!(!app.mac.can_save());
+        assert!(!app.save_macros_from_ui());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[a]\nbogus\n");
+        // a missing file is just an empty list
+        assert!(MacroUi::load(&dir.0.join("nope.conf")).load_error.is_none());
+    }
+    // ------------------------------------------------------------------------- DAN-1439: the service result
+
+    use service::tests::{Fake, CRASH_LOOP, HEALTHY};
+
+    const SHOW: &str = "systemctl --user show razerctl-remap.service -p LoadState -p ActiveState -p SubState -p NRestarts -p ExecMainStatus -p ExecStart";
+    const BIN: &str = "/home/u/.local/bin/razerctl";
+
+    /// `saved_app` with every systemctl / journalctl / service-binary call stubbed. The stub says the manager runs
+    /// with `XDG_CONFIG_HOME` = the temp dir, so the service reads the same files the window edits.
+    fn stubbed(dir: &TempDir, unit: &str) -> (App, Fake) {
+        let mut app = saved_app(dir);
+        let fake = Fake::default();
+        fake.on("systemctl --user show-environment", true, &format!("HOME=/home/u\nXDG_CONFIG_HOME={}\n", dir.0.display()), "");
+        fake.on(SHOW, true, unit, "");
+        fake.on("journalctl *", true, "grabbed nothing\nrazerctl: no remap rules\n", "");
+        app.sys = Box::new(fake.clone());
+        (app, fake)
+    }
+
+    fn check_cmd(dir: &TempDir) -> String {
+        format!("{BIN} macros check --config {} --file {}", dir.0.join("razerctl/remap.conf").display(), dir.0.join("razerctl/macros.conf").display())
+    }
+
+    #[test]
+    fn save_and_restart_says_when_the_service_crash_loops() {
+        let dir = TempDir::new("svc-crash");
+        let (mut app, fake) = stubbed(&dir, CRASH_LOOP);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.mac.drafts[0].events.push(macro_ui::Ev::Wheel(2));
+        app.apply(macro_ui::Act::Save { restart: true });
+        assert!(fake.calls().contains(&"systemctl --user restart razerctl-remap.service".to_string()), "{:?}", fake.calls());
+        assert!(!app.status_is_error && app.status.contains("Checking that the service stays up"), "{}", app.status);
+        assert!(app.svc_pending.is_some() && app.svc_failure.is_none(), "nothing is claimed before the unit is read back");
+        // the unit is read back: activating (auto-restart), not running
+        app.finish_service_check();
+        assert!(app.status_is_error && app.status.starts_with("Macros saved. The remap service failed: razerctl: no remap rules"), "{}", app.status);
+        assert!(app.status.contains("activating (auto-restart)"), "{}", app.status);
+        assert_eq!(app.remap_state(), Remap::Failed);
+        assert_eq!(app.service_state, "activating");
+        assert!(!app.mac.dirty(), "the macros were saved either way");
+        for mode in [Mode::Dark, Mode::Light] {
+            for size in SIZES {
+                app.pal = Pal::new(mode);
+                let l: Vec<String> = software(&mut app, size).into_iter().map(|(s, ..)| s).collect();
+                assert!(l.iter().any(|s| s == "REMAP FAILED") && l.iter().any(|s| s.contains("razerctl: no remap rules")), "{l:?}");
+                assert!(!l.iter().any(|s| s == "REMAP RUNNING"), "never looks healthy: {l:?}");
+                assert!(l.iter().any(|s| s.ends_with("TRY AGAIN")), "{l:?}");
+            }
+        }
+        assert!(render(&mut app, Tab::Device, Mode::Dark, SIZES[0]).contains("× failed"), "the strip on every tab");
+    }
+
+    #[test]
+    fn save_and_restart_confirms_only_when_the_unit_stays_up() {
+        let dir = TempDir::new("svc-ok");
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.apply(macro_ui::Act::Save { restart: true });
+        app.finish_service_check();
+        assert!(!app.status_is_error && app.status == "Macros saved and the service restarted. It is running.", "{}", app.status);
+        assert!(app.svc_failure.is_none() && app.svc_pending.is_none());
+        assert_eq!(app.remap_state(), Remap::Running);
+        // up when first read, but it has restarted itself since: also a failure
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.restart_after_save();
+        fake.on(SHOW, true, "LoadState=loaded\nActiveState=active\nSubState=running\nNRestarts=3\nExecMainStatus=0\n", "");
+        app.finish_service_check();
+        assert!(app.status_is_error && app.status.contains("started, then exited and was restarted"), "{}", app.status);
+    }
+
+    #[test]
+    fn restart_is_blocked_when_the_installed_binary_is_too_old_for_macros() {
+        let dir = TempDir::new("svc-old");
+        let (mut app, fake) = stubbed(&dir, CRASH_LOOP);
+        fake.on(&check_cmd(&dir), false, "", "razerctl: unknown command 'macros'\n\nUSAGE");
+        app.apply(macro_ui::Act::Save { restart: true });
+        assert!(app.status_is_error && app.status.starts_with("Macros saved, but the service was not restarted."), "{}", app.status);
+        assert!(app.status.contains("too old for macros") && app.status.contains("reinstall"), "{}", app.status);
+        assert!(!fake.calls().iter().any(|c| c.contains(" restart ") || c.contains(" start ")), "systemctl restart was never issued: {:?}", fake.calls());
+        assert!(app.svc_pending.is_none());
+        // and the banner's Start service is held to the same check
+        assert!(!app.systemctl(&["start", SERVICE]));
+        assert!(!fake.calls().iter().any(|c| c.contains(" start ")), "{:?}", fake.calls());
+        // a plain rule set never asks the binary, and stopping is never blocked
+        std::fs::write(&app.conf_path, "back = ctrl+c\n").unwrap();
+        let before = fake.calls().iter().filter(|c| c.contains("macros check")).count();
+        assert!(app.systemctl(&["start", SERVICE]));
+        assert_eq!(fake.calls().iter().filter(|c| c.contains("macros check")).count(), before);
+        assert!(app.systemctl(&["stop", SERVICE]) && app.svc_pending.is_none());
+    }
+
+    #[test]
+    fn refresh_names_a_failed_unit_with_the_services_last_log_line() {
+        let dir = TempDir::new("svc-refresh");
+        let (mut app, _fake) = stubbed(&dir, "LoadState=loaded\nActiveState=failed\nSubState=failed\nNRestarts=0\nExecMainStatus=78\n");
+        app.refresh_service();
+        assert_eq!(app.service_state, "failed");
+        assert_eq!(app.svc_failure.as_ref().map(|f| f.full()).as_deref(), Some("razerctl: no remap rules (failed (failed), exit status 78)"));
+        assert_eq!(app.remap_state(), Remap::Failed);
+        let (mut app, _fake) = stubbed(&dir, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nNRestarts=0\n");
+        app.refresh_service();
+        assert!(app.svc_failure.is_none() && app.remap_state() == Remap::Stopped, "stopped is not failed");
+    }
+
+    #[test]
+    fn a_window_on_another_config_dir_than_the_service_gets_one_warning_line() {
+        let dir = TempDir::new("svc-dir");
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        app.refresh_service();
+        assert_eq!(app.config_dir_warning(), None, "same file: no warning");
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(!l.iter().any(|s| s.contains("This window edits")));
+        // the board's case: the window under an XDG_CONFIG_HOME override, the service on the default
+        fake.on("systemctl --user show-environment", true, "HOME=/home/u\n", "");
+        app.refresh_service();
+        let w = app.config_dir_warning().expect("warned");
+        assert!(w.contains("the service reads /home/u/.config/razerctl/remap.conf"), "{w}");
+        for size in SIZES {
+            let l: Vec<String> = software(&mut app, size).into_iter().map(|(s, ..)| s).collect();
+            assert_eq!(l.iter().filter(|s| s.contains("This window edits")).count(), 1, "{l:?}");
+        }
+        assert!(!app.status_is_error, "a warning, not an error: it does not block");
     }
 }

@@ -86,3 +86,38 @@ cp systemd/razerctl-remap.service ~/.config/systemd/user/ && systemctl --user en
 ```
 Requirements: read access to the Razer `/dev/input/event*` nodes (openrazer group) and rw on
 `/dev/uinput` (your user already has both).
+
+`razerctl remap` exits 78 when the config is the problem (no rules, a rule that does not parse, an undefined macro)
+and the unit does not restart on that: it stays `failed` with the reason in `journalctl --user -u razerctl-remap`.
+Any other failure (no mouse yet, a crash) is retried every 2 s. After you change the unit file, `systemctl --user
+daemon-reload` (`./install.sh` does it). The GUI's "Save and restart service" / "Start service" check the unit's
+`ExecStart` binary first when the rules play macros, then read the unit back and show why it is not running.
+
+### Macros
+
+Synapse plays this mouse's macros on the computer, not from the mouse (`docs/macro-protocol.md`),
+and razerctl does the same: nothing is written to the device. Define macros in
+`~/.config/razerctl/macros.conf` and bind them in `remap.conf` with `macro:NAME[,once|xN|held|toggle]`:
+
+```
+# macros.conf                            # remap.conf
+[copy]                                   back = macro:copy
+down ctrl                                forward = macro:copy,x3
+tap c
+up ctrl
+```
+Events: `down`/`up`/`tap KEY`, `click BUTTON`, `delay MS`, `wheel N`, `hwheel N`, `move DX DY`.
+Like Synapse, playback adds a 3 ms pause after every 5th event and 20 ms at the end.
+
+`razerctl-gui` edits the same two files on its Software remap tab: **Macros** is a list plus an event table
+(saved to `macros.conf`; saving rewrites the file, so comments in it are not kept, and renaming a macro rewrites
+its `macro:` rules in `remap.conf` in the same save), and **Rules** has an *Add a rule* strip that appends one
+line to the rules text. A rule that names a macro that does not exist blocks *Save config*.
+
+```
+razerctl macros                          # list: events and run time
+razerctl macros show copy                # one macro, canonical form
+razerctl macros check                    # validate macros.conf and the macro: refs in remap.conf
+razerctl macros play copy --dry-run      # the exact evdev frames and sleeps, nothing is sent
+razerctl remap --macros FILE             # use another macros file (default above)
+```

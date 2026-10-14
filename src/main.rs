@@ -2,9 +2,10 @@
 //!
 //! See README.md for what was reverse engineered and what was intentionally left out.
 
-use razerctl::{battery, device, hidraw, onboard, protocol, remap};
+use razerctl::{battery, device, hidraw, macros, onboard, protocol, remap};
 
 use device::{Backend, Prefer};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 const USAGE: &str = "\
@@ -31,12 +32,22 @@ COMMANDS:
                                      forward wheel-up wheel-down dpi-up dpi-down dpi-cycle-up
                                      dpi-cycle-down double-click key:[ctrl+shift+alt+super+]KEY
     buttons                  Print button names as you press them (find what to remap)
-    remap [--map FROM=TO]... [--config FILE] [--device NAME]
+    remap [--map FROM=TO]... [--config FILE] [--device NAME] [--macros FILE]
                              Grab the mouse and remap buttons (Ctrl+C to stop).
                              Default config: ~/.config/razerctl/remap.conf, lines like
                                back = ctrl+c   forward = KEY_F13   middle = disable
                              Actions: key combos (ctrl+shift+t), any KEY_*/BTN_* name,
-                             scroll_up/down/left/right, disable
+                             scroll_up/down/left/right, disable,
+                             macro:NAME[,once|xN|held|toggle] (played on this computer)
+    macros [list] [--file FILE]
+                             List macros: events, run time incl. padding
+                             Default file: ~/.config/razerctl/macros.conf
+    macros show NAME         Print one macro in canonical form
+    macros check [--config FILE]
+                             Validate macros.conf and the macro:NAME refs in remap.conf
+    macros play NAME --dry-run
+                             Print the exact frames and sleeps a press would send
+                             (live playback only via remap; no device is opened)
 
 OPTIONS:
     --backend   auto (default): use OpenRazer sysfs when its driver is bound, else hidraw
@@ -49,7 +60,114 @@ fn parse_u8(s: &str) -> Result<u8, String> {
     u8::from_str_radix(t, 16).map_err(|e| format!("bad hex byte '{s}': {e}"))
 }
 
-fn run() -> Result<(), String> {
+/// The macros `remap` needs: None if the mapping has no macro:NAME (the file isn't read),
+/// else the loaded file with every referenced name present. Runs before any grab.
+fn remap_macros(map: &remap::Mapping, file: &Path) -> Result<Option<macros::Macros>, String> {
+    if !map.values().any(|a| matches!(a, remap::Action::Macro { .. })) {
+        return Ok(None);
+    }
+    if !file.exists() {
+        return Err(format!("{}: not found (the mapping uses macro:NAME; create it or pass --macros FILE)", file.display()));
+    }
+    let m = macros::load_macros(file)?;
+    remap::check_macros(map, &m).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(Some(m))
+}
+
+/// `macros [list|show NAME|check|play NAME --dry-run]`. Reads text files only, never a device.
+/// A missing default file means "no macros"/"no remap rules"; a missing explicit one is an error.
+fn macros_cmd(args: &[String]) -> Result<(), String> {
+    let (mut file, mut cfg, mut dry, mut pos) = (None::<PathBuf>, None::<PathBuf>, false, Vec::new());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--file" => file = Some(it.next().ok_or("--file needs a path")?.into()),
+            "--config" => cfg = Some(it.next().ok_or("--config needs a path")?.into()),
+            "--dry-run" => dry = true,
+            o if o.starts_with('-') => return Err(format!("unexpected argument '{o}'")),
+            o => pos.push(o),
+        }
+    }
+    let sub = pos.first().copied().unwrap_or("list");
+    if cfg.is_some() && sub != "check" {
+        return Err("--config only applies to `macros check`".into());
+    }
+    if dry && sub != "play" {
+        return Err("--dry-run only applies to `macros play`".into());
+    }
+    if sub == "play" && !dry {
+        return Err("live playback only happens inside `razerctl remap` (bind it with BUTTON = macro:NAME in \
+                    remap.conf), and testing it on the device needs the board's go-ahead; \
+                    use `macros play NAME --dry-run` to print what would be sent"
+            .into());
+    }
+    let explicit = file.is_some();
+    let file = file.unwrap_or_else(macros::macros_path);
+    if explicit && !file.exists() {
+        return Err(format!("{}: not found", file.display()));
+    }
+    let m = macros::load_macros(&file)?;
+    let get = |name: &str| m.get(name).ok_or_else(|| format!("no macro '{name}' in {}", file.display()));
+    match pos.as_slice() {
+        [] | ["list"] => {
+            if m.is_empty() { eprintln!("no macros in {}", file.display()); }
+            for l in macros::describe_macros(&m) { println!("{l}"); }
+        }
+        ["show", name] => {
+            let mac = get(name)?;
+            let s = macros::serialize_macros(&macros::Macros::from([(mac.name.clone(), mac.clone())]));
+            // drop the file header comment
+            print!("{}", s.split_once("\n\n").map_or(s.as_str(), |(_, body)| body));
+        }
+        ["check"] => {
+            println!("{}: {} macro{} OK", file.display(), m.len(), if m.len() == 1 { "" } else { "s" });
+            let explicit = cfg.is_some();
+            let cfg = cfg.unwrap_or_else(remap::config_path);
+            let text = match std::fs::read_to_string(&cfg) {
+                Ok(t) => t,
+                Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => return Err(format!("{}: {e}", cfg.display())),
+            };
+            let map = remap::parse_config(&text).map_err(|e| format!("{}: {e}", cfg.display()))?;
+            remap::check_macros(&map, &m).map_err(|e| format!("{}: {e} (not in {})", cfg.display(), file.display()))?;
+            let n = map.values().filter(|a| matches!(a, remap::Action::Macro { .. })).count();
+            println!("{}: {n} macro reference{} OK", cfg.display(), if n == 1 { "" } else { "s" });
+        }
+        ["play", name] => {
+            let mac = get(name)?;
+            eprintln!("{name}: {} events, {} ms (dry run, nothing is sent)", mac.events.len(), macros::play_ms(&mac.events));
+            for l in macros::describe_steps(&macros::to_steps(&macros::pad(&mac.events))) { println!("{l}"); }
+        }
+        _ => return Err("usage: macros [list | show NAME | check [--config FILE] | play NAME --dry-run] [--file FILE]".into()),
+    }
+    Ok(())
+}
+
+/// Exit status of `remap` when the config is the problem (no rules, a rule that does not parse, an undefined macro).
+/// Retrying cannot fix those, so the unit lists it in `RestartPreventExitStatus=` (`systemd/razerctl-remap.service`)
+/// and stops instead of crash-looping; every other failure is exit 1 and is retried. 78 is sysexits' EX_CONFIG.
+const EXIT_CONFIG: u8 = 78;
+
+/// A command's failure: the message for stderr and the exit status.
+struct Fail {
+    msg: String,
+    code: u8,
+}
+
+impl Fail {
+    fn config(msg: impl Into<String>) -> Fail {
+        Fail { msg: msg.into(), code: EXIT_CONFIG }
+    }
+}
+
+/// Any other error text is a plain exit-1 failure, so `?` on a `String` / `&str` error keeps working.
+impl<S: Into<String>> From<S> for Fail {
+    fn from(msg: S) -> Fail {
+        Fail { msg: msg.into(), code: 1 }
+    }
+}
+
+fn run() -> Result<(), Fail> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut prefer = Prefer::Auto;
     let mut tid = 0x1f;
@@ -62,7 +180,7 @@ fn run() -> Result<(), String> {
                     Some("auto") => Prefer::Auto,
                     Some("hidraw") => Prefer::Hidraw,
                     Some("openrazer") => Prefer::OpenRazer,
-                    o => return Err(format!("bad --backend {o:?}")),
+                    o => return Err(format!("bad --backend {o:?}").into()),
                 };
                 args.drain(i..i + 2);
             }
@@ -91,30 +209,47 @@ fn run() -> Result<(), String> {
         let mut inline = Vec::new();
         let mut cfg = remap::config_path();
         let mut filter: Option<String> = None;
+        let mut mfile = macros::macros_path();
         let mut it = rest.iter();
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--map" => inline.push(it.next().ok_or("--map needs FROM=TO")?.clone()),
                 "--config" => cfg = it.next().ok_or("--config needs a path")?.into(),
                 "--device" => filter = Some(it.next().ok_or("--device needs a name")?.clone()),
-                o => return Err(format!("unexpected argument '{o}'")),
+                "--macros" if command == "remap" => mfile = it.next().ok_or("--macros needs a path")?.into(),
+                o => return Err(format!("unexpected argument '{o}'").into()),
             }
         }
-        let sources = remap::find_sources(filter.as_deref()).map_err(|e| e.to_string())?;
-        if sources.is_empty() {
-            return Err("no readable Razer input devices in /dev/input (are you in the openrazer/input group?)".into());
-        }
+        let sources = || -> Result<Vec<remap::Source>, String> {
+            let s = remap::find_sources(filter.as_deref()).map_err(|e| e.to_string())?;
+            if s.is_empty() {
+                return Err("no readable Razer input devices in /dev/input (are you in the openrazer/input group?)".into());
+            }
+            Ok(s)
+        };
         if command == "buttons" {
+            let sources = sources()?;
             for s in &sources { eprintln!("watching {} ({})", s.path.display(), s.name); }
             eprintln!("press buttons; Ctrl+C to stop");
-            return remap::watch(&sources).map_err(|e| e.to_string());
+            return remap::watch(&sources).map_err(|e| e.to_string().into());
         }
-        let map = remap::load_mapping(&cfg, &inline)?;
+        // every config error before anything is grabbed
+        let map = remap::load_mapping(&cfg, &inline).map_err(Fail::config)?;
         if map.is_empty() {
-            return Err("no remap rules".into());
+            return Err(Fail::config("no remap rules"));
         }
+        let macros = remap_macros(&map, &mfile).map_err(Fail::config)?;
         for (k, v) in &map { eprintln!("  {k:?} -> {v:?}"); }
-        return remap::run(sources, map).map_err(|e| e.to_string());
+        let sources = sources()?;
+        return match macros {
+            Some(m) => remap::run_with_macros(sources, map, m),
+            None => remap::run(sources, map),
+        }
+        .map_err(|e| Fail::from(e.to_string()));
+    }
+
+    if command == "macros" {
+        return macros_cmd(rest).map_err(Fail::from);
     }
 
     if command == "battery-watch" {
@@ -123,7 +258,7 @@ fn run() -> Result<(), String> {
     if command == "battery-notify-test" {
         let (name, pct, _) = battery::read_battery().unwrap_or(("Razer mouse".into(), 0, false));
         return battery::notify(&format!("{name}: test notification"), &format!("Battery is at {pct}%. Low-battery alerts will look like this."), false)
-            .map_err(|e| format!("couldn't send notification: {e}"));
+            .map_err(|e| Fail::from(format!("couldn't send notification: {e}")));
     }
 
     if command == "list" {
@@ -150,7 +285,7 @@ fn run() -> Result<(), String> {
         return Err("no Razer (VID 1532) HID devices found".into());
     }
     if idx >= devs.len() {
-        return Err(format!("device index {idx} out of range (found {})", devs.len()));
+        return Err(format!("device index {idx} out of range (found {})", devs.len()).into());
     }
     let (node, dev) = devs.swap_remove(idx);
     let dev: Box<dyn Backend> = dev.map_err(|e| {
@@ -249,7 +384,7 @@ fn run() -> Result<(), String> {
             println!("-> {req:?}");
             println!("<- {:?}", h.transact(&req).map_err(e)?);
         }
-        other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        other => return Err(format!("unknown command '{other}'\n\n{USAGE}").into()),
     }
     Ok(())
 }
@@ -257,9 +392,33 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(m) => {
-            eprintln!("razerctl: {m}");
-            ExitCode::FAILURE
+        Err(f) => {
+            eprintln!("razerctl: {}", f.msg);
+            ExitCode::from(f.code)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remap_reads_macros_only_when_mapped_and_checks_names() {
+        let dir = std::env::temp_dir().join(format!("razerctl-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("macros.conf");
+        let plain = remap::parse_config("back = ctrl+c").unwrap();
+        let uses = remap::parse_config("back = macro:copy,held").unwrap();
+        // no macro actions: the file is never needed
+        assert_eq!(remap_macros(&plain, &file), Ok(None));
+        assert!(remap_macros(&uses, &file).unwrap_err().contains("not found"));
+        std::fs::write(&file, "[other]\ntap a\n").unwrap();
+        assert!(remap_macros(&uses, &file).unwrap_err().ends_with("undefined macro 'copy'"));
+        std::fs::write(&file, "[copy]\ndown a\n").unwrap();
+        assert!(remap_macros(&uses, &file).unwrap_err().contains("leaves KEY_A pressed"));
+        std::fs::write(&file, "[copy]\ntap ctrl\n").unwrap();
+        assert_eq!(remap_macros(&uses, &file).unwrap().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
