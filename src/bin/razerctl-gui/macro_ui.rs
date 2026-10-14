@@ -67,6 +67,17 @@ pub const BUTTON_CODES: [KeyCode; 5] = [
     KeyCode::BTN_EXTRA,
 ];
 
+/// The dropdown entries for a button row and the index of `k` in them. A code outside `BUTTON_CODES` (a hand-written
+/// `down BTN_TRIGGER`) is appended so the row shows what the file holds instead of the first entry.
+fn button_choices(k: KeyCode) -> (Vec<KeyCode>, usize) {
+    let mut codes = BUTTON_CODES.to_vec();
+    let cur = codes.iter().position(|b| *b == k).unwrap_or_else(|| {
+        codes.push(k);
+        codes.len() - 1
+    });
+    (codes, cur)
+}
+
 impl Ev {
     pub fn from_event(e: &MacroEvent) -> Ev {
         match e {
@@ -1819,18 +1830,13 @@ impl App {
                                             }
                                         }
                                         Ev::Button(k, _) => {
-                                            let items: Vec<String> = BUTTON_CODES
-                                                .iter()
-                                                .map(|b| format!("{b:?}"))
-                                                .collect();
-                                            let cur = BUTTON_CODES
-                                                .iter()
-                                                .position(|b| b == k)
-                                                .unwrap_or(0);
+                                            let (codes, cur) = button_choices(*k);
+                                            let items: Vec<String> =
+                                                codes.iter().map(|b| format!("{b:?}")).collect();
                                             if let Some(j) =
                                                 combo(ui, &p, ("evb", sel, i), 150.0, &items, cur)
                                             {
-                                                *k = BUTTON_CODES[j];
+                                                *k = codes[j];
                                             }
                                         }
                                         Ev::Wheel(n) | Ev::HWheel(n) => {
@@ -2155,6 +2161,36 @@ mod tests {
     }
     fn msgs(d: &Draft, all: &[Draft]) -> Vec<String> {
         issues(d, all).into_iter().map(|i| i.msg).collect()
+    }
+
+    #[test]
+    fn a_button_outside_the_list_is_shown_verbatim_and_survives_a_round_trip() {
+        let ev = Ev::from_event(&MacroEvent::Button(KeyCode::BTN_TRIGGER, true));
+        let Ev::Button(k, _) = ev else {
+            panic!("not a button row")
+        };
+        let (codes, cur) = button_choices(k);
+        assert_eq!(
+            codes[cur],
+            KeyCode::BTN_TRIGGER,
+            "dropdown must not fall back to BTN_LEFT"
+        );
+        assert_eq!(
+            &codes[..BUTTON_CODES.len()],
+            &BUTTON_CODES,
+            "the usual five stay first"
+        );
+        let (codes, cur) = button_choices(KeyCode::BTN_RIGHT);
+        assert_eq!(
+            (codes.len(), cur),
+            (BUTTON_CODES.len(), 1),
+            "a listed button adds nothing"
+        );
+        assert_eq!(
+            ev.to_event(),
+            Ok(MacroEvent::Button(KeyCode::BTN_TRIGGER, true)),
+            "Save writes BTN_TRIGGER back"
+        );
     }
 
     #[test]
