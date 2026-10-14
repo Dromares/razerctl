@@ -412,11 +412,30 @@ fn seg_dist(x: f32, y: f32, (ax, ay): (f32, f32), (bx, by): (f32, f32)) -> f32 {
     ((x - ax - t * dx).powi(2) + (y - ay - t * dy).powi(2)).sqrt()
 }
 
-fn in_tri(x: f32, y: f32, a: (f32, f32), b: (f32, f32), c: (f32, f32)) -> bool {
-    let s = |p: (f32, f32), q: (f32, f32)| (x - q.0) * (p.1 - q.1) - (p.0 - q.0) * (y - q.1);
-    let (d1, d2, d3) = (s(a, b), s(b, c), s(c, a));
-    !((d1 < 0.0 || d2 < 0.0 || d3 < 0.0) && (d1 > 0.0 || d2 > 0.0 || d3 > 0.0))
+/// Even-odd point-in-polygon, for the (concave) charging bolt.
+fn in_poly(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let mut j = poly.len() - 1;
+    for i in 0..poly.len() {
+        let ((xi, yi), (xj, yj)) = (poly[i], poly[j]);
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
 }
+
+/// The charging bolt of `razerctl-charging-symbolic.svg`: a solid silhouette, not a disc with a bolt cut out of it, so it
+/// differs from Low's round badge by outline even at 16 px (DAN-1472).
+const BOLT: [(f32, f32); 6] = [
+    (18.3, 11.2),
+    (13.2, 17.3),
+    (15.9, 17.3),
+    (14.4, 21.1),
+    (19.8, 14.9),
+    (17.0, 14.9),
+];
 
 /// The 22-unit glyph of `draw_icon` in the mockup's `tray.rs`, as a point test.
 fn glyph_covers(g: Glyph, x: f32, y: f32) -> bool {
@@ -434,22 +453,17 @@ fn glyph_covers(g: Glyph, x: f32, y: f32) -> bool {
     };
     let d = ((x - 16.2).powi(2) + (y - 16.2).powi(2)).sqrt();
     match g {
-        Glyph::Low | Glyph::Charging => {
+        Glyph::Low => {
             if d <= 5.8 {
                 on = d <= 4.4;
             }
-            if g == Glyph::Low {
-                if seg_dist(x, y, (16.2, 13.6), (16.2, 16.3)) <= 0.8
-                    || ((x - 16.2).powi(2) + (y - 18.4).powi(2)).sqrt() <= 0.9
-                {
-                    on = false;
-                }
-            } else if in_tri(x, y, (17.0, 12.8), (14.4, 16.6), (16.3, 16.6))
-                || in_tri(x, y, (16.1, 15.8), (18.0, 15.8), (15.4, 19.6))
+            if seg_dist(x, y, (16.2, 13.6), (16.2, 16.3)) <= 0.8
+                || ((x - 16.2).powi(2) + (y - 18.4).powi(2)).sqrt() <= 0.9
             {
                 on = false;
             }
         }
+        Glyph::Charging if d <= 5.8 => on = in_poly(x, y, &BOLT),
         Glyph::Remap if d <= 4.6 => on = d <= 2.9,
         _ => {}
     }
@@ -1131,10 +1145,26 @@ mod tests {
             assert!(!seen.contains(&p.data), "{g:?} looks like another state");
             seen.push(p.data);
         }
-        // the 16 px size of the sheet must keep Low and Charging apart too
-        assert_ne!(
-            pixmap(Glyph::Low, 16).data,
-            pixmap(Glyph::Charging, 16).data
+        // the 16 px size of the sheet must keep Low and Charging apart too, by shape and not by one stray pixel
+        // (DAN-1472: they differed by 7 px and none by more than 80/255 when both were a disc with a 1 px mark in it)
+        let (low, charging) = (pixmap(Glyph::Low, 16), pixmap(Glyph::Charging, 16));
+        let far_apart = low
+            .data
+            .chunks(4)
+            .zip(charging.data.chunks(4))
+            .filter(|(a, b)| a[0].abs_diff(b[0]) > 80)
+            .count();
+        assert!(
+            far_apart >= 20,
+            "Low and Charging differ in {far_apart} px at 16"
         );
+    }
+
+    #[test]
+    fn the_charging_svg_carries_the_bolt_the_pixmap_draws() {
+        let svg = include_str!("../../../packaging/icons/razerctl-charging-symbolic.svg");
+        assert!(svg.contains("M18.3 11.2L13.2 17.3H15.9L14.4 21.1L19.8 14.9H17.0Z"));
+        // a bare silhouette: no evenodd disc around it
+        assert!(!svg.contains("a4.4 4.4"));
     }
 }
