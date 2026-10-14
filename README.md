@@ -39,7 +39,7 @@ Hosted Actions are not available, so a non-author verifies a PR by running one c
 scripts/local-ci.sh /path/to/verify.log
 ```
 
-It prints the toolchain (`rustc -V`, `cargo -V`, pinned by `rust-toolchain.toml`), checks the GUI system libraries with `pkg-config`, then runs `cargo build --release --locked`, `cargo test --release --locked`, `cargo clippy --all-targets`, `cargo fmt --check`, and an `xvfb-run` smoke test that launches `razerctl-gui` for 5 s with an isolated `HOME` (no device writes). Clippy and fmt are compared with baselines recorded in the script (`CLIPPY_BASELINE`, `FMT_BASELINE`): a new warning or newly unformatted file fails; existing debt is reported, not reformatted. Exit status is 0 only on `RESULT: PASS`; attach the log to the PR.
+It prints the toolchain (`rustc -V`, `cargo -V`, pinned by `rust-toolchain.toml`), checks the GUI system libraries with `pkg-config`, then runs `cargo build --release --locked`, `cargo test --release --locked`, `cargo clippy --all-targets`, `cargo fmt --check`, and an `xvfb-run` smoke test that launches `razerctl-gui` for 5 s with an isolated `HOME` (no device writes). Clippy is compared with a baseline recorded in the script (`CLIPPY_BASELINE`): a new warning fails; existing debt is reported. `cargo fmt --check` is strict: any unformatted hunk fails. Exit status is 0 only on `RESULT: PASS`; attach the log to the PR.
 
 ## What was in the .pkg
 

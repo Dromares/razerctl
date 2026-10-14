@@ -17,8 +17,8 @@ pub const RAZER_VID: u16 = 0x1532;
 
 #[derive(Debug, Clone)]
 pub struct HidrawNode {
-    pub dev: PathBuf,      // /dev/hidrawN
-    pub sysfs: PathBuf,    // /sys/class/hidraw/hidrawN/device (the HID device dir)
+    pub dev: PathBuf,   // /dev/hidrawN
+    pub sysfs: PathBuf, // /sys/class/hidraw/hidrawN/device (the HID device dir)
     pub vid: u16,
     pub pid: u16,
     pub interface: Option<u8>,
@@ -54,7 +54,10 @@ pub fn descriptor_has_feature(desc: &[u8]) -> bool {
             i += 3 + size;
             continue;
         }
-        let size = match prefix & 0x03 { 3 => 4, n => n as usize };
+        let size = match prefix & 0x03 {
+            3 => 4,
+            n => n as usize,
+        };
         if prefix & 0xFC == 0xB0 {
             return true;
         }
@@ -89,13 +92,20 @@ pub fn enumerate() -> io::Result<Vec<HidrawNode>> {
     for entry in dir.flatten() {
         let name = entry.file_name().to_string_lossy().into_owned();
         let sysfs = entry.path().join("device");
-        let Ok(uevent) = fs::read_to_string(sysfs.join("uevent")) else { continue };
-        let Some((vid, pid)) = parse_hid_id(&uevent) else { continue };
+        let Ok(uevent) = fs::read_to_string(sysfs.join("uevent")) else {
+            continue;
+        };
+        let Some((vid, pid)) = parse_hid_id(&uevent) else {
+            continue;
+        };
         if vid != RAZER_VID {
             continue;
         }
         let hid_name = clean_hid_name(
-            uevent.lines().find_map(|l| l.strip_prefix("HID_NAME=")).unwrap_or(""),
+            uevent
+                .lines()
+                .find_map(|l| l.strip_prefix("HID_NAME="))
+                .unwrap_or(""),
         );
         let desc = fs::read(sysfs.join("report_descriptor")).unwrap_or_default();
         out.push(HidrawNode {
@@ -133,7 +143,11 @@ impl Hidraw {
         let req = hidioc(nr, buf.len());
         // SAFETY: buf is a valid, writable buffer of the length encoded in `req`.
         let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req as _, buf.as_mut_ptr()) };
-        if r < 0 { Err(io::Error::last_os_error()) } else { Ok(r as usize) }
+        if r < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(r as usize)
+        }
     }
 
     /// 91-byte feature report: report ID 0 + 90-byte payload (UsbRzDeviceAction.js).
@@ -175,11 +189,16 @@ impl Hidraw {
                 }
             }
             if !collided {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "device stayed busy"));
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "device stayed busy",
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        Err(io::Error::other(format!("response kept colliding with another program's command: {last:?}")))
+        Err(io::Error::other(format!(
+            "response kept colliding with another program's command: {last:?}"
+        )))
     }
 }
 
@@ -222,7 +241,9 @@ mod tests {
     #[test]
     fn feature_item_detection() {
         // Usage Page (vendor 0xFF00), Usage 1, Collection, Report Count 90, Feature(2), End
-        let with = [0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x95, 0x5A, 0xB1, 0x02, 0xC0];
+        let with = [
+            0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x95, 0x5A, 0xB1, 0x02, 0xC0,
+        ];
         let without = [0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x81, 0x02, 0xC0];
         assert!(descriptor_has_feature(&with));
         assert!(!descriptor_has_feature(&without));
