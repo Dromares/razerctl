@@ -28,6 +28,9 @@ WHEEL = [
     "M10 4.2h2v3.2h-2Z",          # wheel
 ]
 BC = (16.2, 16.2)
+# Charging is a bare bolt, not a disc with a bolt cut out: at 16 px Low (disc, 1 px "!") and Charging (disc, 1 px bolt) were
+# the same 6 px blob (DAN-1472), and reading Low as Charging is the dangerous mistake. Round vs spiky outline instead.
+BOLT = "M18.3 11.2L13.2 17.3H15.9L14.4 21.1L19.8 14.9H17.0Z"
 
 
 def dashed_ring(dash=2.6, gap=2.0, half=0.8, n=400):
@@ -85,7 +88,7 @@ icons = {
     "razerctl-low-symbolic": svg(
         {"body": mouse, "badge": [(circle(*BC, 4.4) + "M15.4 13.6h1.6v2.7h-1.6Z" + circle(16.2, 18.4, 0.9), True)]}, clip=circle(*BC, 5.8)),
     "razerctl-charging-symbolic": svg(
-        {"body": mouse, "badge": [(circle(*BC, 4.4) + "M17 12.8L14.4 16.6L15.953 16.6L15.4 19.6L18 15.8L16.447 15.8Z", True)]}, clip=circle(*BC, 5.8)),
+        {"body": mouse, "badge": [(BOLT, False)]}, clip=circle(*BC, 5.8)),
 }
 for name, text in icons.items():
     (OUT / f"{name}.svg").write_text(text)

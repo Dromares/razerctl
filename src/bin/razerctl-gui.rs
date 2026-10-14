@@ -1261,8 +1261,10 @@ impl App {
                             if btn(ui, &p, "Remove rule", Kind::Secondary, true).clicked() { fix = Some((line, None)); }
                             let names = self.mac.names();
                             let pick = egui::ComboBox::from_id_salt("pick-macro").width(150.0)
-                                .selected_text(tracked("PICK ANOTHER MACRO", mono_med(T_LABEL), p.i100(), 0.12))
+                                .selected_text(RichText::new("Pick another macro").font(sans(T_BODY - 1.0)).color(p.i100()))
                                 .show_ui(ui, |ui| {
+                                    ui.spacing_mut().interact_size.y = 24.0;
+                                    ui.spacing_mut().item_spacing.y = 2.0;
                                     let mut chosen = None;
                                     for n in &names { if ui.selectable_label(false, n).clicked() { chosen = Some(n.clone()); } }
                                     chosen
@@ -1893,7 +1895,7 @@ mod tests {
         let t = software(&mut app, SIZES[0]);
         let l = lines(&t);
         assert!(l.contains(&"line 2: macro 'copy' does not exist"), "{l:?}");
-        assert!(l.contains(&"INVALID") && l.contains(&"REMOVE RULE") && l.contains(&"PICK ANOTHER MACRO"), "{l:?}");
+        assert!(l.contains(&"INVALID") && l.contains(&"REMOVE RULE") && l.contains(&"Pick another macro"), "{l:?}");
         assert_eq!(t.iter().find(|(s, ..)| s.ends_with("SAVE CONFIG")).and_then(|(_, _, c)| *c), Some(app.pal.i45()), "Save config is disabled");
         assert_eq!(app.conf_error.as_deref(), Some("line 2: macro 'copy' does not exist"));
         // a syntax error keeps its own message and no fix buttons
