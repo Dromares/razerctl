@@ -63,6 +63,22 @@ pub fn descriptor_has_feature(desc: &[u8]) -> bool {
     false
 }
 
+/// usbhid builds `HID_NAME` as "<manufacturer> <product>", and Razer firmware
+/// already starts the product string with the vendor ("Razer Razer Viper ...").
+/// Collapse a leading word run that is immediately repeated ("A B A B C" ->
+/// "A B C"). Names that don't repeat are returned unchanged; no vendor prefix
+/// is ever added.
+fn clean_hid_name(raw: &str) -> String {
+    let words: Vec<&str> = raw.split_whitespace().collect();
+    for k in 1..=words.len() / 2 {
+        let (a, b) = (&words[..k], &words[k..2 * k]);
+        if a.iter().zip(b).all(|(x, y)| x.eq_ignore_ascii_case(y)) {
+            return words[k..].join(" ");
+        }
+    }
+    words.join(" ")
+}
+
 pub fn enumerate() -> io::Result<Vec<HidrawNode>> {
     let mut out = Vec::new();
     let dir = match fs::read_dir("/sys/class/hidraw") {
@@ -78,11 +94,9 @@ pub fn enumerate() -> io::Result<Vec<HidrawNode>> {
         if vid != RAZER_VID {
             continue;
         }
-        let hid_name = uevent
-            .lines()
-            .find_map(|l| l.strip_prefix("HID_NAME="))
-            .unwrap_or("")
-            .to_string();
+        let hid_name = clean_hid_name(
+            uevent.lines().find_map(|l| l.strip_prefix("HID_NAME=")).unwrap_or(""),
+        );
         let desc = fs::read(sysfs.join("report_descriptor")).unwrap_or_default();
         out.push(HidrawNode {
             dev: PathBuf::from("/dev").join(&name),
@@ -184,6 +198,25 @@ mod tests {
     fn hid_id_parsing() {
         let u = "DRIVER=razermouse\nHID_ID=0003:00001532:0000009F\nHID_NAME=Razer x\n";
         assert_eq!(parse_hid_id(u), Some((0x1532, 0x009f)));
+    }
+
+    #[test]
+    fn hid_name_collapses_duplicated_vendor_prefix() {
+        assert_eq!(
+            clean_hid_name("Razer Razer Viper Mini Signature Edition"),
+            "Razer Viper Mini Signature Edition"
+        );
+    }
+
+    #[test]
+    fn hid_name_with_single_vendor_prefix_is_unchanged() {
+        assert_eq!(clean_hid_name("Razer Viper Mini"), "Razer Viper Mini");
+    }
+
+    #[test]
+    fn hid_name_without_vendor_prefix_is_left_alone() {
+        assert_eq!(clean_hid_name("Viper Mini"), "Viper Mini");
+        assert_eq!(clean_hid_name(""), "");
     }
 
     #[test]
