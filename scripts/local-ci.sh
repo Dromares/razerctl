@@ -4,14 +4,13 @@
 #
 #   scripts/local-ci.sh [LOG_FILE]        # LOG_FILE defaults to ./local-ci-<sha>.log
 #
-# Steps: toolchain print, pkg-config libs, build, test, clippy (vs baseline), fmt --check (vs baseline),
+# Steps: toolchain print, pkg-config libs, build, test, clippy (vs baseline), fmt --check (strict, no baseline),
 # xvfb smoke of razerctl-gui (read-only, isolated HOME). Exit 0 only if every step passes.
-# Override CLIPPY_BASELINE / FMT_BASELINE only in the PR that lowers them; never raise them.
+# Override CLIPPY_BASELINE only in the PR that lowers it; never raise it.
 set -u
 cd "$(dirname "$0")/.." || exit 2
 
 CLIPPY_BASELINE=${CLIPPY_BASELINE:-11}  # warnings on main @ 0988034 (rustc 1.99.0); a new warning fails
-FMT_BASELINE=${FMT_BASELINE:-16}        # files `cargo fmt --check` flags on main @ 0988034 (476 hunks); not reformatted
 
 # Agent runs may redirect $HOME; the toolchain lives in the real home.
 real_home=$(getent passwd "$(id -u)" | cut -d: -f6)
@@ -51,13 +50,15 @@ n=$(grep '^warning: ' <<<"$clippy_out" | grep -vc 'generated [0-9]* warning\|war
 echo "clippy: rc=$clippy_rc warnings=$n baseline=$CLIPPY_BASELINE"
 if [ "$clippy_rc" -ne 0 ] || [ "$n" -gt "$CLIPPY_BASELINE" ]; then fail "clippy ($n > $CLIPPY_BASELINE)"; fi
 
-step "cargo fmt --check (baseline $FMT_BASELINE files)"
+step "cargo fmt --check (strict)"
 fmt_out=$(cargo fmt --check 2>&1); fmt_rc=$?
 files=$(grep '^Diff in ' <<<"$fmt_out" | sed 's/^Diff in \(.*\):[0-9]*:$/\1/' | sort -u | wc -l)
 hunks=$(grep -c '^Diff in ' <<<"$fmt_out")
-echo "fmt: rc=$fmt_rc files_with_diffs=$files hunks=$hunks baseline=$FMT_BASELINE"
-[ "$fmt_rc" -ne 0 ] && echo "(run 'cargo fmt' to see/fix; not auto-applied)"
-if [ "$fmt_rc" -ne 0 ] && [ "$files" -gt "$FMT_BASELINE" ]; then fail "fmt ($files > $FMT_BASELINE)"; fi
+echo "fmt: rc=$fmt_rc files_with_diffs=$files hunks=$hunks"
+if [ "$fmt_rc" -ne 0 ]; then
+  echo "(run 'cargo fmt' to fix; not auto-applied)"
+  fail "fmt ($hunks hunks in $files files)"
+fi
 
 step "xvfb smoke: razerctl-gui launches and stays up 5 s (read-only, isolated HOME)"
 if command -v xvfb-run >/dev/null; then

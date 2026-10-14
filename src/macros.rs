@@ -84,7 +84,10 @@ fn press(k: KeyCode, down: bool) -> MacroEvent {
 
 /// The file format has no quoting, so a guid must be one bare word without '#'.
 fn check_guid(g: &str) -> Result<(), String> {
-    if g.is_empty() || g.chars().any(|c| c.is_whitespace() || c.is_control() || c == '#') {
+    if g.is_empty()
+        || g.chars()
+            .any(|c| c.is_whitespace() || c.is_control() || c == '#')
+    {
         return Err(format!("bad guid '{g}' (one word, no '#')"));
     }
     Ok(())
@@ -100,7 +103,10 @@ fn check(m: &Macro) -> Result<(), (Option<usize>, String)> {
     let name = &m.name;
     let ok_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     if name.is_empty() || name.len() > MAX_NAME || !name.chars().all(ok_char) {
-        return Err((None, format!("bad macro name '{name}' (1 to {MAX_NAME} of A-Z a-z 0-9 _ -)")));
+        return Err((
+            None,
+            format!("bad macro name '{name}' (1 to {MAX_NAME} of A-Z a-z 0-9 _ -)"),
+        ));
     }
     if let Some(g) = &m.guid {
         check_guid(g).map_err(|e| (None, format!("macro '{name}': {e}")))?;
@@ -109,7 +115,10 @@ fn check(m: &Macro) -> Result<(), (Option<usize>, String)> {
         return Err((None, format!("macro '{name}' is empty")));
     }
     if m.events.len() > MAX_EVENTS {
-        let e = format!("macro '{name}' has {} events (max {MAX_EVENTS})", m.events.len());
+        let e = format!(
+            "macro '{name}' has {} events (max {MAX_EVENTS})",
+            m.events.len()
+        );
         return Err((Some(MAX_EVENTS), e));
     }
     // code -> index of the down that pressed it
@@ -124,7 +133,10 @@ fn check(m: &Macro) -> Result<(), (Option<usize>, String)> {
                 }
                 let btn = matches!(ev, MacroEvent::Button(..));
                 if btn != is_button(k) {
-                    return bad(format!("{k:?} is not a {}", if btn { "mouse button" } else { "key" }));
+                    return bad(format!(
+                        "{k:?} is not a {}",
+                        if btn { "mouse button" } else { "key" }
+                    ));
                 }
                 if down {
                     if held.insert(k.0, i).is_some() {
@@ -136,12 +148,19 @@ fn check(m: &Macro) -> Result<(), (Option<usize>, String)> {
             }
             MacroEvent::Wheel(n) | MacroEvent::HWheel(n) => {
                 if n == 0 || n.unsigned_abs() > MAX_WHEEL {
-                    return bad(format!("wheel {n} out of range (non-zero, at most {MAX_WHEEL} notches)"));
+                    return bad(format!(
+                        "wheel {n} out of range (non-zero, at most {MAX_WHEEL} notches)"
+                    ));
                 }
             }
             MacroEvent::Move(dx, dy) => {
-                if (dx == 0 && dy == 0) || dx.unsigned_abs() > MAX_MOVE || dy.unsigned_abs() > MAX_MOVE {
-                    return bad(format!("move {dx} {dy} out of range (not both 0, each at most {MAX_MOVE})"));
+                if (dx == 0 && dy == 0)
+                    || dx.unsigned_abs() > MAX_MOVE
+                    || dy.unsigned_abs() > MAX_MOVE
+                {
+                    return bad(format!(
+                        "move {dx} {dy} out of range (not both 0, each at most {MAX_MOVE})"
+                    ));
                 }
             }
             MacroEvent::Delay(ms) => {
@@ -153,7 +172,10 @@ fn check(m: &Macro) -> Result<(), (Option<usize>, String)> {
     }
     // a stuck key on the desktop is the worst outcome: point at the earliest press
     if let Some((&code, &i)) = held.iter().min_by_key(|(_, &i)| i) {
-        return Err((Some(i), format!("macro '{name}' leaves {:?} pressed", KeyCode::new(code))));
+        return Err((
+            Some(i),
+            format!("macro '{name}' leaves {:?} pressed", KeyCode::new(code)),
+        ));
     }
     Ok(())
 }
@@ -167,7 +189,10 @@ fn parse_line(w: &[&str]) -> Result<Vec<MacroEvent>, String> {
         if args.len() == n {
             Ok(())
         } else {
-            Err(format!("'{kw}' takes {n} argument{}", if n == 1 { "" } else { "s" }))
+            Err(format!(
+                "'{kw}' takes {n} argument{}",
+                if n == 1 { "" } else { "s" }
+            ))
         }
     };
     let int = |s: &str| s.parse::<i32>().map_err(|_| format!("bad number '{s}'"));
@@ -178,13 +203,17 @@ fn parse_line(w: &[&str]) -> Result<Vec<MacroEvent>, String> {
             match kw.as_str() {
                 "down" => vec![press(k, true)],
                 "up" => vec![press(k, false)],
-                "click" if !is_button(k) => return Err(format!("click takes a mouse button, not {k:?}")),
+                "click" if !is_button(k) => {
+                    return Err(format!("click takes a mouse button, not {k:?}"))
+                }
                 _ => vec![press(k, true), press(k, false)],
             }
         }
         "delay" => {
             want(1)?;
-            let ms = args[0].parse().map_err(|_| format!("bad delay '{}' (milliseconds)", args[0]))?;
+            let ms = args[0]
+                .parse()
+                .map_err(|_| format!("bad delay '{}' (milliseconds)", args[0]))?;
             vec![Delay(ms)]
         }
         "wheel" => {
@@ -207,7 +236,9 @@ fn parse_line(w: &[&str]) -> Result<Vec<MacroEvent>, String> {
 type Pending = (Macro, usize, Vec<usize>);
 
 fn finish(out: &mut Macros, cur: Option<Pending>) -> Result<(), String> {
-    let Some((m, header, lines)) = cur else { return Ok(()) };
+    let Some((m, header, lines)) = cur else {
+        return Ok(());
+    };
     check(&m).map_err(|(i, e)| format!("line {}: {e}", i.map_or(header, |i| lines[i])))?;
     out.insert(m.name.clone(), m);
     Ok(())
@@ -230,18 +261,31 @@ pub fn parse_macros(text: &str) -> Result<Macros, String> {
         }
         let err = |e: String| format!("line {}: {e}", n + 1);
         if let Some(rest) = line.strip_prefix('[') {
-            let name = rest.strip_suffix(']').ok_or_else(|| err("expected [name]".into()))?.trim();
+            let name = rest
+                .strip_suffix(']')
+                .ok_or_else(|| err("expected [name]".into()))?
+                .trim();
             finish(&mut out, cur.take())?;
             if out.contains_key(name) {
                 return Err(err(format!("duplicate macro name '{name}'")));
             }
-            cur = Some((Macro { name: name.into(), guid: None, events: vec![] }, n + 1, vec![]));
+            cur = Some((
+                Macro {
+                    name: name.into(),
+                    guid: None,
+                    events: vec![],
+                },
+                n + 1,
+                vec![],
+            ));
             continue;
         }
         let Some((m, _, lines)) = cur.as_mut() else {
             return Err(err("expected a [name] header before events".into()));
         };
-        let guid = line.split_once('=').filter(|(k, _)| k.trim().eq_ignore_ascii_case("guid"));
+        let guid = line
+            .split_once('=')
+            .filter(|(k, _)| k.trim().eq_ignore_ascii_case("guid"));
         if let Some((_, g)) = guid {
             if m.guid.is_some() || !m.events.is_empty() {
                 return Err(err("guid must directly follow the [name] header".into()));
@@ -296,7 +340,10 @@ pub fn save_macros(path: &Path, m: &Macros) -> Result<(), String> {
     let fail = |e: String| format!("{}: {e}", path.display());
     for (key, mac) in m {
         if *key != mac.name {
-            return Err(fail(format!("macro '{}' is stored under name '{key}'", mac.name)));
+            return Err(fail(format!(
+                "macro '{}' is stored under name '{key}'",
+                mac.name
+            )));
         }
         validate(mac).map_err(fail)?;
     }
@@ -371,7 +418,16 @@ pub fn to_steps(events: &[MacroEvent]) -> Vec<Step> {
 
 /// Run time of one playback, Synapse padding included (sum of the delays of `pad`).
 pub fn play_ms(events: &[MacroEvent]) -> u64 {
-    pad(events).iter().map(|e| if let MacroEvent::Delay(ms) = e { u64::from(*ms) } else { 0 }).sum()
+    pad(events)
+        .iter()
+        .map(|e| {
+            if let MacroEvent::Delay(ms) = e {
+                u64::from(*ms)
+            } else {
+                0
+            }
+        })
+        .sum()
 }
 
 /// `macros list`: one line per macro, name, events as written, padded run time.
@@ -380,7 +436,12 @@ pub fn describe_macros(m: &Macros) -> Vec<String> {
     m.values()
         .map(|mac| {
             let n = mac.events.len();
-            format!("{:<w$}  {n} event{}, {} ms", mac.name, if n == 1 { "" } else { "s" }, play_ms(&mac.events))
+            format!(
+                "{:<w$}  {n} event{}, {} ms",
+                mac.name,
+                if n == 1 { "" } else { "s" },
+                play_ms(&mac.events)
+            )
         })
         .collect()
 }
@@ -390,7 +451,11 @@ pub fn describe_macros(m: &Macros) -> Vec<String> {
 pub fn describe_steps(steps: &[Step]) -> Vec<String> {
     let ev = |e: &InputEvent| match e.event_type() {
         EventType::KEY => {
-            let v = match e.value() { 0 => "up".to_string(), 1 => "down".to_string(), v => v.to_string() };
+            let v = match e.value() {
+                0 => "up".to_string(),
+                1 => "down".to_string(),
+                v => v.to_string(),
+            };
             format!("{:?} {v}", KeyCode::new(e.code()))
         }
         EventType::RELATIVE => format!("{:?} {}", RelativeAxisCode(e.code()), e.value()),
@@ -421,7 +486,10 @@ pub fn capabilities(m: &Macro) -> (Vec<KeyCode>, Vec<RelativeAxisCode>) {
             MacroEvent::Delay(_) => {}
         }
     }
-    (keys.into_iter().collect(), rels.into_iter().map(RelativeAxisCode).collect())
+    (
+        keys.into_iter().collect(),
+        rels.into_iter().map(RelativeAxisCode).collect(),
+    )
 }
 
 #[cfg(test)]
@@ -453,7 +521,11 @@ TAP a
 ";
 
     fn mac(name: &str, events: Vec<MacroEvent>) -> Macro {
-        Macro { name: name.into(), guid: None, events }
+        Macro {
+            name: name.into(),
+            guid: None,
+            events,
+        }
     }
 
     fn parse_err(text: &str) -> String {
@@ -506,14 +578,18 @@ TAP a
         let text = serialize_macros(&m);
         assert_eq!(parse_macros(&text).unwrap(), m);
         assert_eq!(serialize_macros(&parse_macros(&text).unwrap()), text);
-        let one = parse_macros("[z]\ntap ctrl\nclick right\ndelay 5\n[a]\nmove 0 3\nhwheel 2\n").unwrap();
+        let one =
+            parse_macros("[z]\ntap ctrl\nclick right\ndelay 5\n[a]\nmove 0 3\nhwheel 2\n").unwrap();
         assert_eq!(
             serialize_macros(&one),
             "# razerctl macros (rewritten on save; comments are not kept)\n\
              \n[a]\nmove 0 3\nhwheel 2\n\
              \n[z]\ndown KEY_LEFTCTRL\nup KEY_LEFTCTRL\ndown BTN_RIGHT\nup BTN_RIGHT\ndelay 5\n"
         );
-        assert_eq!(serialize_macros(&Macros::new()), "# razerctl macros (rewritten on save; comments are not kept)\n");
+        assert_eq!(
+            serialize_macros(&Macros::new()),
+            "# razerctl macros (rewritten on save; comments are not kept)\n"
+        );
         assert!(parse_macros("").unwrap().is_empty());
     }
 
@@ -531,9 +607,15 @@ TAP a
 
     #[test]
     fn rejects_duplicate_and_empty_macros() {
-        assert_eq!(parse_err("[a]\ntap a\n\n[a]\ntap b"), "line 4: duplicate macro name 'a'");
+        assert_eq!(
+            parse_err("[a]\ntap a\n\n[a]\ntap b"),
+            "line 4: duplicate macro name 'a'"
+        );
         assert_eq!(parse_err("[a]\n[b]\ntap a"), "line 1: macro 'a' is empty");
-        assert_eq!(parse_err("[a]\ntap a\n[b]\n# nothing"), "line 3: macro 'b' is empty");
+        assert_eq!(
+            parse_err("[a]\ntap a\n[b]\n# nothing"),
+            "line 3: macro 'b' is empty"
+        );
         assert!(validate(&mac("a", vec![])).is_err());
     }
 
@@ -542,7 +624,10 @@ TAP a
         let ok = format!("[a]\n{}", "delay 1\n".repeat(MAX_EVENTS));
         assert_eq!(parse_macros(&ok).unwrap()["a"].events.len(), MAX_EVENTS);
         let bad = format!("[a]\n{}", "delay 1\n".repeat(MAX_EVENTS + 1));
-        assert_eq!(parse_err(&bad), "line 1002: macro 'a' has 1001 events (max 1000)");
+        assert_eq!(
+            parse_err(&bad),
+            "line 1002: macro 'a' has 1001 events (max 1000)"
+        );
         // tap counts as two events
         let taps = format!("[a]\n{}", "tap a\n".repeat(MAX_EVENTS / 2 + 1));
         assert!(parse_err(&taps).contains("has 1002 events"));
@@ -551,7 +636,9 @@ TAP a
     #[test]
     fn rejects_out_of_range_values() {
         assert!(parse_macros("[a]\ndelay 60000").is_ok());
-        assert!(parse_err("[a]\ndelay 1\ndelay 60001").starts_with("line 3: macro 'a': delay 60001 ms"));
+        assert!(
+            parse_err("[a]\ndelay 1\ndelay 60001").starts_with("line 3: macro 'a': delay 60001 ms")
+        );
         assert!(parse_err("[a]\ndelay -1").starts_with("line 2: bad delay"));
         assert!(parse_err("[a]\nwheel 0").starts_with("line 2: macro 'a': wheel 0"));
         assert!(parse_err("[a]\nwheel 101").starts_with("line 2:"));
@@ -568,13 +655,22 @@ TAP a
 
     #[test]
     fn rejects_unbalanced_presses() {
-        assert_eq!(parse_err("[x]\ndown a\ndelay 5"), "line 2: macro 'x' leaves KEY_A pressed");
+        assert_eq!(
+            parse_err("[x]\ndown a\ndelay 5"),
+            "line 2: macro 'x' leaves KEY_A pressed"
+        );
         assert_eq!(
             parse_err("[x]\ndown ctrl\ndown left\nup ctrl"),
             "line 3: macro 'x' leaves BTN_LEFT pressed"
         );
-        assert_eq!(parse_err("[x]\ntap a\nup a"), "line 3: macro 'x': up KEY_A but it is not down");
-        assert_eq!(parse_err("[x]\ndown a\ndown a\nup a"), "line 3: macro 'x': KEY_A is already down");
+        assert_eq!(
+            parse_err("[x]\ntap a\nup a"),
+            "line 3: macro 'x': up KEY_A but it is not down"
+        );
+        assert_eq!(
+            parse_err("[x]\ndown a\ndown a\nup a"),
+            "line 3: macro 'x': KEY_A is already down"
+        );
         assert_eq!(
             validate(&mac("x", vec![Key(KeyCode::KEY_A, true)])).unwrap_err(),
             "macro 'x' leaves KEY_A pressed"
@@ -584,13 +680,24 @@ TAP a
 
     #[test]
     fn rejects_mismatched_or_unknown_codes() {
-        assert!(validate(&mac("x", vec![Key(KeyCode::BTN_LEFT, true), Key(KeyCode::BTN_LEFT, false)])).is_err());
-        assert!(validate(&mac("x", vec![Button(KeyCode::KEY_A, true), Button(KeyCode::KEY_A, false)])).is_err());
+        assert!(validate(&mac(
+            "x",
+            vec![Key(KeyCode::BTN_LEFT, true), Key(KeyCode::BTN_LEFT, false)]
+        ))
+        .is_err());
+        assert!(validate(&mac(
+            "x",
+            vec![Button(KeyCode::KEY_A, true), Button(KeyCode::KEY_A, false)]
+        ))
+        .is_err());
         let unknown = KeyCode::new(0x2ff);
         assert!(validate(&mac("x", vec![Key(unknown, true), Key(unknown, false)])).is_err());
         let reserved = KeyCode::KEY_RESERVED;
         assert!(validate(&mac("x", vec![Key(reserved, true), Key(reserved, false)])).is_err());
-        let bad_guid = Macro { guid: Some("a b".into()), ..mac("x", vec![Delay(1)]) };
+        let bad_guid = Macro {
+            guid: Some("a b".into()),
+            ..mac("x", vec![Delay(1)])
+        };
         assert!(validate(&bad_guid).is_err());
     }
 
@@ -604,8 +711,12 @@ TAP a
         assert!(parse_err("[a]\ndown a b").starts_with("line 2: 'down' takes 1 argument"));
         assert!(parse_err("[a]\nmove 3").starts_with("line 2: 'move' takes 2 arguments"));
         assert!(parse_err("[a]\nwheel x").starts_with("line 2: bad number 'x'"));
-        assert!(parse_err("[a]\ntap a\nguid = {x}").starts_with("line 3: guid must directly follow"));
-        assert!(parse_err("[a]\nguid = 1\nguid = 2").starts_with("line 3: guid must directly follow"));
+        assert!(
+            parse_err("[a]\ntap a\nguid = {x}").starts_with("line 3: guid must directly follow")
+        );
+        assert!(
+            parse_err("[a]\nguid = 1\nguid = 2").starts_with("line 3: guid must directly follow")
+        );
         assert!(parse_err("[a]\nguid =\ntap a").starts_with("line 2: bad guid"));
         assert!(parse_err("[a]\nguid = a b\ntap a").starts_with("line 2: bad guid"));
         // guid may follow comments/blank lines, keyword is case-insensitive
@@ -626,7 +737,16 @@ TAP a
         let mut five = numbered(5);
         five.push(d20.clone());
         assert_eq!(pad(&numbered(5)), five);
-        let six = vec![Wheel(1), Wheel(2), Wheel(3), Wheel(4), Wheel(5), d3.clone(), Wheel(6), d20.clone()];
+        let six = vec![
+            Wheel(1),
+            Wheel(2),
+            Wheel(3),
+            Wheel(4),
+            Wheel(5),
+            d3.clone(),
+            Wheel(6),
+            d20.clone(),
+        ];
         assert_eq!(pad(&numbered(6)), six);
         let e = numbered(11);
         let mut eleven = e[..5].to_vec();
@@ -656,7 +776,11 @@ TAP a
         steps
             .iter()
             .map(|s| match s {
-                Step::Emit(v) => S::E(v.iter().map(|e| (e.event_type().0, e.code(), e.value())).collect()),
+                Step::Emit(v) => S::E(
+                    v.iter()
+                        .map(|e| (e.event_type().0, e.code(), e.value()))
+                        .collect(),
+                ),
                 Step::Sleep(d) => S::W(d.as_millis() as u64),
             })
             .collect()
@@ -677,7 +801,12 @@ TAP a
         ]);
         assert_eq!(
             dump(&steps),
-            vec![S::E(vec![(KEY, a, 1)]), S::E(vec![(KEY, a, 0)]), S::E(vec![(KEY, l, 1)]), S::E(vec![(KEY, l, 0)])]
+            vec![
+                S::E(vec![(KEY, a, 1)]),
+                S::E(vec![(KEY, a, 0)]),
+                S::E(vec![(KEY, l, 1)]),
+                S::E(vec![(KEY, l, 0)])
+            ]
         );
 
         use RelativeAxisCode as R;
@@ -685,8 +814,14 @@ TAP a
         assert_eq!(
             dump(&w),
             vec![
-                S::E(vec![(REL, R::REL_WHEEL.0, -1), (REL, R::REL_WHEEL_HI_RES.0, -120)]),
-                S::E(vec![(REL, R::REL_HWHEEL.0, 2), (REL, R::REL_HWHEEL_HI_RES.0, 240)]),
+                S::E(vec![
+                    (REL, R::REL_WHEEL.0, -1),
+                    (REL, R::REL_WHEEL_HI_RES.0, -120)
+                ]),
+                S::E(vec![
+                    (REL, R::REL_HWHEEL.0, 2),
+                    (REL, R::REL_HWHEEL_HI_RES.0, 240)
+                ]),
             ]
         );
 
@@ -694,7 +829,11 @@ TAP a
         let (x, y) = (R::REL_X.0, R::REL_Y.0);
         assert_eq!(
             dump(&m),
-            vec![S::E(vec![(REL, x, 7)]), S::E(vec![(REL, y, -3)]), S::E(vec![(REL, x, 1), (REL, y, 2)])]
+            vec![
+                S::E(vec![(REL, x, 7)]),
+                S::E(vec![(REL, y, -3)]),
+                S::E(vec![(REL, x, 1), (REL, y, 2)])
+            ]
         );
     }
 
@@ -702,11 +841,35 @@ TAP a
     fn steps_merge_consecutive_delays() {
         let a = KeyCode::KEY_A.0;
         let (down, up) = (Key(KeyCode::KEY_A, true), Key(KeyCode::KEY_A, false));
-        let s = to_steps(&[Delay(5), down, Delay(30), Delay(3), Delay(20), up, Delay(20)]);
-        assert_eq!(dump(&s), vec![S::W(5), S::E(vec![(KEY, a, 1)]), S::W(53), S::E(vec![(KEY, a, 0)]), S::W(20)]);
+        let s = to_steps(&[
+            Delay(5),
+            down,
+            Delay(30),
+            Delay(3),
+            Delay(20),
+            up,
+            Delay(20),
+        ]);
+        assert_eq!(
+            dump(&s),
+            vec![
+                S::W(5),
+                S::E(vec![(KEY, a, 1)]),
+                S::W(53),
+                S::E(vec![(KEY, a, 0)]),
+                S::W(20)
+            ]
+        );
         // padded output keeps one Sleep where pad and user delays meet
-        let p = to_steps(&pad(&[Key(KeyCode::KEY_A, true), Key(KeyCode::KEY_A, false), Delay(10)]));
-        assert_eq!(dump(&p), vec![S::E(vec![(KEY, a, 1)]), S::E(vec![(KEY, a, 0)]), S::W(30)]);
+        let p = to_steps(&pad(&[
+            Key(KeyCode::KEY_A, true),
+            Key(KeyCode::KEY_A, false),
+            Delay(10),
+        ]));
+        assert_eq!(
+            dump(&p),
+            vec![S::E(vec![(KEY, a, 1)]), S::E(vec![(KEY, a, 0)]), S::W(30)]
+        );
         assert!(to_steps(&[]).is_empty());
     }
 
@@ -750,11 +913,16 @@ TAP a
         assert_eq!(play_ms(&[]), 20);
         assert_eq!(play_ms(&numbered(5)), 20);
         assert_eq!(play_ms(&numbered(11)), 3 + 3 + 20);
-        let m = parse_macros("[w]\nwheel 1\n[long-name]\ndelay 100\ndelay 50\ntap x\n[a]\ntap a\n").unwrap();
+        let m = parse_macros("[w]\nwheel 1\n[long-name]\ndelay 100\ndelay 50\ntap x\n[a]\ntap a\n")
+            .unwrap();
         assert_eq!(play_ms(&m["long-name"].events), 170);
         assert_eq!(
             describe_macros(&m),
-            ["a          2 events, 20 ms", "long-name  4 events, 170 ms", "w          1 event, 20 ms"]
+            [
+                "a          2 events, 20 ms",
+                "long-name  4 events, 170 ms",
+                "w          1 event, 20 ms"
+            ]
         );
         assert!(describe_macros(&Macros::new()).is_empty());
     }
@@ -765,7 +933,13 @@ TAP a
         let (keys, rels) = capabilities(&m["copy"]);
         assert_eq!(
             keys,
-            vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_C, KeyCode::KEY_F13, KeyCode::BTN_LEFT, KeyCode::BTN_SIDE]
+            vec![
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_C,
+                KeyCode::KEY_F13,
+                KeyCode::BTN_LEFT,
+                KeyCode::BTN_SIDE
+            ]
         );
         let rels: Vec<u16> = rels.iter().map(|r| r.0).collect();
         let mut want = vec![
@@ -780,7 +954,13 @@ TAP a
         assert_eq!(rels, want);
         let (keys, rels) = capabilities(&mac("d", vec![Delay(1), Wheel(1), Wheel(2)]));
         assert!(keys.is_empty());
-        assert_eq!(rels, vec![RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_WHEEL_HI_RES]);
+        assert_eq!(
+            rels,
+            vec![
+                RelativeAxisCode::REL_WHEEL,
+                RelativeAxisCode::REL_WHEEL_HI_RES
+            ]
+        );
     }
 
     #[test]
@@ -794,7 +974,10 @@ TAP a
 
     impl TempDir {
         fn new(tag: &str) -> Self {
-            let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
             let name = format!("razerctl-macros-{tag}-{}-{nanos}", std::process::id());
             TempDir(std::env::temp_dir().join(name))
         }
@@ -809,7 +992,10 @@ TAP a
     #[test]
     fn load_missing_file_is_empty() {
         let dir = TempDir::new("missing");
-        assert_eq!(load_macros(&dir.0.join("nope/macros.conf")).unwrap(), Macros::new());
+        assert_eq!(
+            load_macros(&dir.0.join("nope/macros.conf")).unwrap(),
+            Macros::new()
+        );
         assert!(!dir.0.exists());
     }
 
@@ -825,19 +1011,29 @@ TAP a
         fewer.remove("b-2");
         save_macros(&path, &fewer).unwrap();
         assert_eq!(load_macros(&path).unwrap(), fewer);
-        let names: Vec<_> = fs::read_dir(dir.0.join("sub")).unwrap().map(|e| e.unwrap().file_name()).collect();
+        let names: Vec<_> = fs::read_dir(dir.0.join("sub"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
         assert_eq!(names, ["macros.conf"]);
         // invalid input is refused before touching the file
         let mut bad = fewer.clone();
         bad.insert("other".into(), mac("copy", vec![Delay(1)]));
-        assert!(save_macros(&path, &bad).unwrap_err().contains("stored under name 'other'"));
+        assert!(save_macros(&path, &bad)
+            .unwrap_err()
+            .contains("stored under name 'other'"));
         bad.remove("other");
         bad.insert("x".into(), mac("x", vec![Key(KeyCode::KEY_A, true)]));
-        assert!(save_macros(&path, &bad).unwrap_err().ends_with("macro 'x' leaves KEY_A pressed"));
+        assert!(save_macros(&path, &bad)
+            .unwrap_err()
+            .ends_with("macro 'x' leaves KEY_A pressed"));
         assert_eq!(load_macros(&path).unwrap(), fewer);
         // parse errors carry the path
         fs::write(&path, "[a]\nbogus").unwrap();
         let e = load_macros(&path).unwrap_err();
-        assert!(e.starts_with(&format!("{}: line 2:", path.display())), "{e}");
+        assert!(
+            e.starts_with(&format!("{}: line 2:", path.display())),
+            "{e}"
+        );
     }
 }

@@ -12,8 +12,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use eframe::egui::{
-    self, epaint::RectShape, pos2, vec2, Align, Color32, ComboBox, DragValue, Frame, Layout, Margin, Rect, RichText,
-    Sense, Shape, Stroke, TextEdit, Ui,
+    self, epaint::RectShape, pos2, vec2, Align, Color32, ComboBox, DragValue, Frame, Layout,
+    Margin, Rect, RichText, Sense, Shape, Stroke, TextEdit, Ui,
 };
 use evdev::KeyCode;
 use razerctl::macros::{self, Macro, MacroEvent, Macros};
@@ -59,8 +59,13 @@ fn is_button(k: KeyCode) -> bool {
 }
 
 /// The mouse buttons a macro can press (what `BTN_*` rows offer).
-pub const BUTTON_CODES: [KeyCode; 5] =
-    [KeyCode::BTN_LEFT, KeyCode::BTN_RIGHT, KeyCode::BTN_MIDDLE, KeyCode::BTN_SIDE, KeyCode::BTN_EXTRA];
+pub const BUTTON_CODES: [KeyCode; 5] = [
+    KeyCode::BTN_LEFT,
+    KeyCode::BTN_RIGHT,
+    KeyCode::BTN_MIDDLE,
+    KeyCode::BTN_SIDE,
+    KeyCode::BTN_EXTRA,
+];
 
 impl Ev {
     pub fn from_event(e: &MacroEvent) -> Ev {
@@ -82,7 +87,10 @@ impl Ev {
                 }
                 let k = remap::parse_key(t)?;
                 if is_button(k) {
-                    return Err(format!("'{}' is a mouse button. Use a BTN row or + Click.", t.trim()));
+                    return Err(format!(
+                        "'{}' is a mouse button. Use a BTN row or + Click.",
+                        t.trim()
+                    ));
                 }
                 MacroEvent::Key(k, *d)
             }
@@ -130,13 +138,26 @@ impl Draft {
     }
 
     pub fn new(name: &str, events: Vec<Ev>) -> Draft {
-        Draft { name: name.into(), guid: None, events, orig: None }
+        Draft {
+            name: name.into(),
+            guid: None,
+            events,
+            orig: None,
+        }
     }
 
     /// The macro the file will hold, or the first thing wrong with a row.
     pub fn to_macro(&self) -> Result<Macro, String> {
-        let events = self.events.iter().map(Ev::to_event).collect::<Result<Vec<_>, _>>()?;
-        Ok(Macro { name: self.name.clone(), guid: self.guid.clone(), events })
+        let events = self
+            .events
+            .iter()
+            .map(Ev::to_event)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Macro {
+            name: self.name.clone(),
+            guid: self.guid.clone(),
+            events,
+        })
     }
 
     /// Run time of one playback, padding included (the engine's own `play_ms`, fed stand-ins for the events whose
@@ -145,7 +166,13 @@ impl Draft {
         let stand_in: Vec<MacroEvent> = self
             .events
             .iter()
-            .map(|e| if let Ev::Delay(n) = e { MacroEvent::Delay(*n) } else { MacroEvent::Wheel(1) })
+            .map(|e| {
+                if let Ev::Delay(n) = e {
+                    MacroEvent::Delay(*n)
+                } else {
+                    MacroEvent::Wheel(1)
+                }
+            })
             .collect();
         macros::play_ms(&stand_in)
     }
@@ -159,7 +186,10 @@ pub struct Issue {
 }
 
 pub fn valid_name(s: &str) -> bool {
-    !s.is_empty() && s.len() <= macros::MAX_NAME && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    !s.is_empty()
+        && s.len() <= macros::MAX_NAME
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Everything that blocks saving `d`, in plain language, with row numbers. `all` is the whole list, for the
@@ -168,16 +198,32 @@ pub fn issues(d: &Draft, all: &[Draft]) -> Vec<Issue> {
     let mut out = Vec::new();
     let mut add = |ev: Option<usize>, msg: String| out.push(Issue { ev, msg });
     if !valid_name(&d.name) {
-        add(None, format!("The name must be 1 to {} letters, digits, - or _.", macros::MAX_NAME));
+        add(
+            None,
+            format!(
+                "The name must be 1 to {} letters, digits, - or _.",
+                macros::MAX_NAME
+            ),
+        );
     } else if all.iter().filter(|o| o.name == d.name).count() > 1 {
-        add(None, format!("Another macro is already called '{}'.", d.name));
+        add(
+            None,
+            format!("Another macro is already called '{}'.", d.name),
+        );
     }
     if d.events.is_empty() {
         add(None, "No events. A macro needs at least one event.".into());
         return out;
     }
     if d.events.len() > macros::MAX_EVENTS {
-        add(Some(macros::MAX_EVENTS), format!("{} events is too many (the most is {}).", d.events.len(), macros::MAX_EVENTS));
+        add(
+            Some(macros::MAX_EVENTS),
+            format!(
+                "{} events is too many (the most is {}).",
+                d.events.len(),
+                macros::MAX_EVENTS
+            ),
+        );
     }
     let mut held: Vec<(KeyCode, usize)> = Vec::new();
     for (i, e) in d.events.iter().enumerate() {
@@ -193,29 +239,50 @@ pub fn issues(d: &Draft, all: &[Draft]) -> Vec<Issue> {
             MacroEvent::Key(k, down) | MacroEvent::Button(k, down) => {
                 if down {
                     if held.iter().any(|(h, _)| *h == k) {
-                        add(Some(i), format!("{k:?} is pressed again at #{n:02} while it is still down."));
+                        add(
+                            Some(i),
+                            format!("{k:?} is pressed again at #{n:02} while it is still down."),
+                        );
                     } else {
                         held.push((k, i));
                     }
                 } else if let Some(pos) = held.iter().position(|(h, _)| *h == k) {
                     held.remove(pos);
                 } else {
-                    add(Some(i), format!("{k:?} is released at #{n:02} but was never pressed."));
+                    add(
+                        Some(i),
+                        format!("{k:?} is released at #{n:02} but was never pressed."),
+                    );
                 }
             }
             MacroEvent::Wheel(v) | MacroEvent::HWheel(v) => {
                 if v == 0 || v.unsigned_abs() > macros::MAX_WHEEL {
-                    add(Some(i), format!("#{n:02}: scroll {v} is out of range (1 to {} ticks, up or down).", macros::MAX_WHEEL));
+                    add(
+                        Some(i),
+                        format!(
+                            "#{n:02}: scroll {v} is out of range (1 to {} ticks, up or down).",
+                            macros::MAX_WHEEL
+                        ),
+                    );
                 }
             }
             MacroEvent::Move(dx, dy) => {
-                if (dx == 0 && dy == 0) || dx.unsigned_abs() > macros::MAX_MOVE || dy.unsigned_abs() > macros::MAX_MOVE {
+                if (dx == 0 && dy == 0)
+                    || dx.unsigned_abs() > macros::MAX_MOVE
+                    || dy.unsigned_abs() > macros::MAX_MOVE
+                {
                     add(Some(i), format!("#{n:02}: move {dx},{dy} is out of range (not both 0, each at most {}).", macros::MAX_MOVE));
                 }
             }
             MacroEvent::Delay(ms) => {
                 if ms > macros::MAX_DELAY_MS {
-                    add(Some(i), format!("#{n:02}: {ms} ms is too long (the most is {} ms).", macros::MAX_DELAY_MS));
+                    add(
+                        Some(i),
+                        format!(
+                            "#{n:02}: {ms} ms is too long (the most is {} ms).",
+                            macros::MAX_DELAY_MS
+                        ),
+                    );
                 }
             }
         }
@@ -251,7 +318,12 @@ pub fn rule_refs(conf: &str) -> Vec<RuleRef> {
         .filter_map(|(i, l)| {
             let (from, to) = l.split('#').next()?.split_once('=')?;
             match remap::parse_action(to) {
-                Ok(Action::Macro { name, mode }) => Some(RuleRef { line: i + 1, source: from.trim().into(), name, mode }),
+                Ok(Action::Macro { name, mode }) => Some(RuleRef {
+                    line: i + 1,
+                    source: from.trim().into(),
+                    name,
+                    mode,
+                }),
                 _ => None,
             }
         })
@@ -341,7 +413,11 @@ pub fn fix_text(text: &str, fixes: &[RuleFix]) -> String {
 
 /// Remove line `n` (1-based) of `text`.
 pub fn remove_line(text: &str, n: usize) -> String {
-    text.split_inclusive('\n').enumerate().filter(|(i, _)| i + 1 != n).map(|(_, l)| l).collect()
+    text.split_inclusive('\n')
+        .enumerate()
+        .filter(|(i, _)| i + 1 != n)
+        .map(|(_, l)| l)
+        .collect()
 }
 
 /// Point line `n` (1-based) at another macro, keeping the mode and everything else on the line.
@@ -357,10 +433,22 @@ pub fn retarget_line(text: &str, n: usize, to: &str) -> String {
 
 // -------------------------------------------------------------------------------- the ADD A RULE strip
 
-pub const BUTTONS: [(&str, &str); 5] =
-    [("Left", "left"), ("Right", "right"), ("Middle", "middle"), ("Back", "back"), ("Forward", "forward")];
-pub const DOES: [&str; 7] =
-    ["Keyboard key…", "Disable", "Scroll up", "Scroll down", "Scroll left", "Scroll right", "Play a macro…"];
+pub const BUTTONS: [(&str, &str); 5] = [
+    ("Left", "left"),
+    ("Right", "right"),
+    ("Middle", "middle"),
+    ("Back", "back"),
+    ("Forward", "forward"),
+];
+pub const DOES: [&str; 7] = [
+    "Keyboard key…",
+    "Disable",
+    "Scroll up",
+    "Scroll down",
+    "Scroll left",
+    "Scroll right",
+    "Play a macro…",
+];
 pub const DOES_MACRO: usize = 6;
 pub const MODES: [&str; 5] = ["Once", "Times", "While held", "Toggle", "Sequence"];
 /// Sequence has no engine behind it yet: drawn, not selectable.
@@ -378,7 +466,14 @@ pub struct Bind {
 
 impl Default for Bind {
     fn default() -> Self {
-        Bind { button: 4, does: DOES_MACRO, macro_name: String::new(), key: String::new(), mode: 0, times: 5 }
+        Bind {
+            button: 4,
+            does: DOES_MACRO,
+            macro_name: String::new(),
+            key: String::new(),
+            mode: 0,
+            times: 5,
+        }
     }
 }
 
@@ -478,13 +573,20 @@ impl MacroUi {
 
     pub fn from_macros(m: &Macros) -> Self {
         let drafts: Vec<Draft> = m.values().map(Draft::from_macro).collect();
-        MacroUi { saved: drafts.clone(), drafts, ..Self::empty() }
+        MacroUi {
+            saved: drafts.clone(),
+            drafts,
+            ..Self::empty()
+        }
     }
 
     pub fn load(path: &Path) -> Self {
         match macros::load_macros(path) {
             Ok(m) => Self::from_macros(&m),
-            Err(e) => MacroUi { load_error: Some(e), ..Self::empty() },
+            Err(e) => MacroUi {
+                load_error: Some(e),
+                ..Self::empty()
+            },
         }
     }
 
@@ -502,7 +604,10 @@ impl MacroUi {
 
     /// Per macro, what is wrong with it (parallel to `drafts`).
     pub fn all_issues(&self) -> Vec<Vec<Issue>> {
-        self.drafts.iter().map(|d| issues(d, &self.drafts)).collect()
+        self.drafts
+            .iter()
+            .map(|d| issues(d, &self.drafts))
+            .collect()
     }
 
     pub fn invalid_count(&self) -> usize {
@@ -516,7 +621,10 @@ impl MacroUi {
     /// Rule rewrites the next save makes: a rename follows its rules, a deleted macro takes its rules with it.
     pub fn fixes(&self) -> Vec<RuleFix> {
         let renames = self.drafts.iter().filter_map(|d| match &d.orig {
-            Some(o) if *o != d.name => Some(RuleFix::Rename { from: o.clone(), to: d.name.clone() }),
+            Some(o) if *o != d.name => Some(RuleFix::Rename {
+                from: o.clone(),
+                to: d.name.clone(),
+            }),
             _ => None,
         });
         let removes = self
@@ -557,7 +665,10 @@ impl MacroUi {
         if !taken(base) {
             return base.into();
         }
-        (2..).map(|i| format!("{base}-{i}")).find(|n| !taken(n)).unwrap()
+        (2..)
+            .map(|i| format!("{base}-{i}"))
+            .find(|n| !taken(n))
+            .unwrap()
     }
 
     /// Append a macro and select it.
@@ -569,14 +680,23 @@ impl MacroUi {
     }
 
     pub fn new_macro(&mut self) {
-        let name = (1..).map(|i| format!("untitled-{i}")).find(|n| !self.drafts.iter().any(|d| d.name == *n)).unwrap();
+        let name = (1..)
+            .map(|i| format!("untitled-{i}"))
+            .find(|n| !self.drafts.iter().any(|d| d.name == *n))
+            .unwrap();
         self.push(Draft::new(&name, Vec::new()));
     }
 
     pub fn duplicate(&mut self) {
-        let Some(d) = self.drafts.get(self.sel) else { return };
+        let Some(d) = self.drafts.get(self.sel) else {
+            return;
+        };
         let name = self.free_name(&format!("{}-copy", d.name));
-        let copy = Draft { name, orig: None, ..d.clone() };
+        let copy = Draft {
+            name,
+            orig: None,
+            ..d.clone()
+        };
         self.push(copy);
     }
 
@@ -598,8 +718,14 @@ impl MacroUi {
     /// Insert `evs` after the selected row (at the end when none is selected) and select the last one added.
     pub fn insert_events(&mut self, evs: Vec<Ev>) {
         let sel_ev = self.sel_ev;
-        let Some(d) = self.drafts.get_mut(self.sel) else { return };
-        let at = if d.events.is_empty() { 0 } else { (sel_ev + 1).min(d.events.len()) };
+        let Some(d) = self.drafts.get_mut(self.sel) else {
+            return;
+        };
+        let at = if d.events.is_empty() {
+            0
+        } else {
+            (sel_ev + 1).min(d.events.len())
+        };
         let n = evs.len();
         d.events.splice(at..at, evs);
         self.sel_ev = at + n - 1;
@@ -609,7 +735,9 @@ impl MacroUi {
     pub fn to_macros(&self) -> Result<Macros, String> {
         let mut out = Macros::new();
         for d in &self.drafts {
-            let m = d.to_macro().map_err(|e| format!("macro '{}': {e}", d.name))?;
+            let m = d
+                .to_macro()
+                .map_err(|e| format!("macro '{}': {e}", d.name))?;
             out.insert(d.name.clone(), m);
         }
         if out.len() != self.drafts.len() {
@@ -626,7 +754,9 @@ impl MacroUi {
             d.orig = Some(d.name.clone());
         }
         self.drafts.sort_by(|a, b| a.name.cmp(&b.name));
-        self.sel = name.and_then(|n| self.drafts.iter().position(|d| d.name == n)).unwrap_or(0);
+        self.sel = name
+            .and_then(|n| self.drafts.iter().position(|d| d.name == n))
+            .unwrap_or(0);
         self.saved = self.drafts.clone();
         self.remove_rules.clear();
         self.confirm_delete = false;
@@ -638,11 +768,20 @@ pub fn starter(name: &str) -> Option<Draft> {
     use Ev::*;
     let tap = |k: &str| [Key(k.into(), true), Key(k.into(), false)];
     let events = match name {
-        "rapid-click" => vec![Button(KeyCode::BTN_LEFT, true), Delay(12), Button(KeyCode::BTN_LEFT, false), Delay(38)],
+        "rapid-click" => vec![
+            Button(KeyCode::BTN_LEFT, true),
+            Delay(12),
+            Button(KeyCode::BTN_LEFT, false),
+            Delay(38),
+        ],
         "copy-paste" => {
             let mut v = vec![Key("KEY_LEFTCTRL".into(), true)];
             v.extend(tap("KEY_C"));
-            v.extend([Key("KEY_LEFTCTRL".into(), false), Delay(100), Key("KEY_LEFTCTRL".into(), true)]);
+            v.extend([
+                Key("KEY_LEFTCTRL".into(), false),
+                Delay(100),
+                Key("KEY_LEFTCTRL".into(), true),
+            ]);
             v.extend(tap("KEY_V"));
             v.push(Key("KEY_LEFTCTRL".into(), false));
             v
@@ -660,7 +799,9 @@ pub fn starter(name: &str) -> Option<Draft> {
 
 /// `~/.config/razerctl/macros.conf` for a path under $HOME.
 pub fn tilde(p: &Path) -> String {
-    match std::env::var_os("HOME").and_then(|h| p.strip_prefix(h).ok().map(|r| r.display().to_string())) {
+    match std::env::var_os("HOME")
+        .and_then(|h| p.strip_prefix(h).ok().map(|r| r.display().to_string()))
+    {
         Some(rest) => format!("~/{rest}"),
         None => p.display().to_string(),
     }
@@ -674,7 +815,9 @@ impl App {
     pub fn save_macros_from_ui(&mut self) -> bool {
         if let Some(e) = &self.mac.load_error {
             let e = e.clone();
-            self.err(format!("Macros not saved: macros.conf could not be read ({e})."));
+            self.err(format!(
+                "Macros not saved: macros.conf could not be read ({e})."
+            ));
             return false;
         }
         let map = match self.mac.to_macros() {
@@ -688,7 +831,10 @@ impl App {
         let before = std::fs::read_to_string(&self.macros_path).ok();
         // remap.conf on disk, rewritten in place: only the renamed / removed rules change, not edits still
         // sitting in the rules editor
-        let disk_conf = std::fs::read_to_string(&self.conf_path).ok().map(|t| (fix_text(&t, &fixes), t)).filter(|(n, o)| n != o);
+        let disk_conf = std::fs::read_to_string(&self.conf_path)
+            .ok()
+            .map(|t| (fix_text(&t, &fixes), t))
+            .filter(|(n, o)| n != o);
         if let Err(e) = macros::save_macros(&self.macros_path, &map) {
             self.err(format!("Macros not saved: {e}"));
             return false;
@@ -699,14 +845,24 @@ impl App {
                     Some(t) => write_atomic(&self.macros_path, t),
                     None => std::fs::remove_file(&self.macros_path),
                 };
-                let note = if back.is_ok() { "macros.conf was put back" } else { "macros.conf could NOT be put back" };
-                self.err(format!("Nothing saved: {}: {e} ({note}).", self.conf_path.display()));
+                let note = if back.is_ok() {
+                    "macros.conf was put back"
+                } else {
+                    "macros.conf could NOT be put back"
+                };
+                self.err(format!(
+                    "Nothing saved: {}: {e} ({note}).",
+                    self.conf_path.display()
+                ));
                 return false;
             }
         }
         self.conf_text = fix_text(&self.conf_text, &fixes);
         self.mac.mark_saved();
-        self.ok(format!("Macros saved to {}. Restart the service to apply.", tilde(&self.macros_path)));
+        self.ok(format!(
+            "Macros saved to {}. Restart the service to apply.",
+            tilde(&self.macros_path)
+        ));
         true
     }
 
@@ -733,7 +889,14 @@ pub struct BannerClick {
 // --------------------------------------------------------------------------------------------- drawing
 
 /// Combo box over `items`; returns the index picked this frame.
-fn combo(ui: &mut Ui, p: &Pal, id: impl std::hash::Hash + std::fmt::Debug, w: f32, items: &[String], cur: usize) -> Option<usize> {
+fn combo(
+    ui: &mut Ui,
+    p: &Pal,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    w: f32,
+    items: &[String],
+    cur: usize,
+) -> Option<usize> {
     let mut picked = None;
     let text = items.get(cur).cloned().unwrap_or_default();
     ComboBox::from_id_salt(id)
@@ -768,41 +931,55 @@ fn field(ui: &mut Ui, p: &Pal, label: &str, add: impl FnOnce(&mut Ui)) {
 /// segment clicked.
 fn mode_seg(ui: &mut Ui, p: &Pal, active: usize, disabled: &[usize]) -> Option<usize> {
     let mut clicked = None;
-    Frame::new().stroke(Stroke::new(1.0, p.i45())).show(ui, |ui| {
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 0.0;
-            for (i, l) in MODES.iter().enumerate() {
-                let (on, dis) = (i == active, disabled.contains(&i));
-                let (fg, fill) = if on {
-                    (p.stamp_fg, p.stamp_bg)
-                } else if dis {
-                    (p.i45(), Color32::TRANSPARENT)
-                } else {
-                    (p.i65(), Color32::TRANSPARENT)
-                };
-                let mut b = egui::Button::new(tracked(&l.to_uppercase(), mono_med(T_LABEL), fg, TRACK_LABEL))
+    Frame::new()
+        .stroke(Stroke::new(1.0, p.i45()))
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+                for (i, l) in MODES.iter().enumerate() {
+                    let (on, dis) = (i == active, disabled.contains(&i));
+                    let (fg, fill) = if on {
+                        (p.stamp_fg, p.stamp_bg)
+                    } else if dis {
+                        (p.i45(), Color32::TRANSPARENT)
+                    } else {
+                        (p.i65(), Color32::TRANSPARENT)
+                    };
+                    let mut b = egui::Button::new(tracked(
+                        &l.to_uppercase(),
+                        mono_med(T_LABEL),
+                        fg,
+                        TRACK_LABEL,
+                    ))
                     .fill(fill)
                     .stroke(Stroke::NONE)
                     .corner_radius(R0)
                     .min_size(vec2(88.0, 32.0));
-                if dis {
-                    b = b.sense(Sense::hover());
+                    if dis {
+                        b = b.sense(Sense::hover());
+                    }
+                    if ui.add(b).clicked() {
+                        clicked = Some(i);
+                    }
+                    if i + 1 < MODES.len() {
+                        let r = ui.min_rect();
+                        ui.painter()
+                            .vline(r.right(), r.y_range(), Stroke::new(1.0, p.i18()));
+                    }
                 }
-                if ui.add(b).clicked() {
-                    clicked = Some(i);
-                }
-                if i + 1 < MODES.len() {
-                    let r = ui.min_rect();
-                    ui.painter().vline(r.right(), r.y_range(), Stroke::new(1.0, p.i18()));
-                }
-            }
+            });
         });
-    });
     clicked
 }
 
 fn mono_field(ui: &mut Ui, p: &Pal, text: &mut String, w: f32) -> egui::Response {
-    ui.add(TextEdit::singleline(text).desired_width(w).font(mono(T_DATA + 1.0)).text_color(p.i100()).margin(Margin::symmetric(8, 3)))
+    ui.add(
+        TextEdit::singleline(text)
+            .desired_width(w)
+            .font(mono(T_DATA + 1.0))
+            .text_color(p.i100())
+            .margin(Margin::symmetric(8, 3)),
+    )
 }
 
 fn small_btn(ui: &mut Ui, p: &Pal, glyph: &str, enabled: bool) -> bool {
@@ -835,10 +1012,27 @@ fn cell(ui: &mut Ui, w: f32, h: f32, add: impl FnOnce(&mut Ui)) {
 const LIST_ROWS_NARROW: f32 = 3.5;
 
 /// `add`, inside a vertical scroll area of fixed height `h` when `scroll` (long lists), else as it is.
-fn scroll_if(ui: &mut Ui, scroll: bool, id: &str, h: f32, bar_visible: bool, add: impl FnOnce(&mut Ui)) {
+fn scroll_if(
+    ui: &mut Ui,
+    scroll: bool,
+    id: &str,
+    h: f32,
+    bar_visible: bool,
+    add: impl FnOnce(&mut Ui),
+) {
     if scroll {
-        let vis = if bar_visible { egui::scroll_area::ScrollBarVisibility::AlwaysVisible } else { egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded };
-        egui::ScrollArea::vertical().id_salt(id).max_height(h).min_scrolled_height(h).auto_shrink([false, false]).scroll_bar_visibility(vis).show(ui, add);
+        let vis = if bar_visible {
+            egui::scroll_area::ScrollBarVisibility::AlwaysVisible
+        } else {
+            egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded
+        };
+        egui::ScrollArea::vertical()
+            .id_salt(id)
+            .max_height(h)
+            .min_scrolled_height(h)
+            .auto_shrink([false, false])
+            .scroll_bar_visibility(vis)
+            .show(ui, add);
     } else {
         add(ui);
     }
@@ -938,10 +1132,18 @@ impl App {
         let p = self.pal;
         let total = ui.available_width();
         let narrow = total < 900.0;
-        let right_w = if narrow { total } else { (total * 0.30).clamp(260.0, 340.0) };
+        let right_w = if narrow {
+            total
+        } else {
+            (total * 0.30).clamp(260.0, 340.0)
+        };
         let gap = S4;
         let left_w = if narrow { total } else { total - right_w - gap };
-        let layout = if narrow { Layout::top_down(Align::Min) } else { Layout::left_to_right(Align::Min) };
+        let layout = if narrow {
+            Layout::top_down(Align::Min)
+        } else {
+            Layout::left_to_right(Align::Min)
+        };
         ui.with_layout(layout, |ui| {
             ui.spacing_mut().item_spacing.x = gap;
             ui.allocate_ui_with_layout(vec2(left_w, 0.0), Layout::top_down(Align::Min), |ui| {
@@ -974,20 +1176,32 @@ impl App {
                 ui.spacing_mut().item_spacing.x = S3;
                 field(ui, &p, "Button", |ui| {
                     let items: Vec<String> = BUTTONS.iter().map(|(l, _)| l.to_string()).collect();
-                    if let Some(i) = combo(ui, &p, "bind-button", 150.0, &items, b.button) { b.button = i; }
+                    if let Some(i) = combo(ui, &p, "bind-button", 150.0, &items, b.button) {
+                        b.button = i;
+                    }
                 });
                 field(ui, &p, "Does", |ui| {
-                    if let Some(i) = combo(ui, &p, "bind-does", 180.0, &strings(&DOES), b.does) { b.does = i; }
+                    if let Some(i) = combo(ui, &p, "bind-does", 180.0, &strings(&DOES), b.does) {
+                        b.does = i;
+                    }
                 });
                 if b.does == DOES_MACRO {
                     field(ui, &p, "Macro", |ui| {
                         let cur = names.iter().position(|n| *n == b.macro_name).unwrap_or(0);
-                        if let Some(i) = combo(ui, &p, "bind-macro", 200.0, &names, cur) { b.macro_name = names[i].clone(); }
+                        if let Some(i) = combo(ui, &p, "bind-macro", 200.0, &names, cur) {
+                            b.macro_name = names[i].clone();
+                        }
                     });
                 } else if b.does == 0 {
                     field(ui, &p, "Key", |ui| {
-                        ui.add(TextEdit::singleline(&mut b.key).hint_text("e.g. ctrl+c, f13, space").desired_width(200.0)
-                            .font(mono(T_DATA + 1.0)).text_color(p.i100()).margin(Margin::symmetric(8, 6)));
+                        ui.add(
+                            TextEdit::singleline(&mut b.key)
+                                .hint_text("e.g. ctrl+c, f13, space")
+                                .desired_width(200.0)
+                                .font(mono(T_DATA + 1.0))
+                                .text_color(p.i100())
+                                .margin(Margin::symmetric(8, 6)),
+                        );
                     });
                 }
                 ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
@@ -999,11 +1213,21 @@ impl App {
                 field(ui, &p, "How it plays", |ui| {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = S3;
-                        if let Some(i) = mode_seg(ui, &p, b.mode, &[MODE_SEQUENCE]) { b.mode = i; }
-                        if b.mode == 1 {
-                            ui.add(DragValue::new(&mut b.times).range(1..=remap::MAX_TIMES).prefix("× "));
+                        if let Some(i) = mode_seg(ui, &p, b.mode, &[MODE_SEQUENCE]) {
+                            b.mode = i;
                         }
-                        ui.label(RichText::new(b.mode_help()).font(sans(T_SMALL)).color(p.i65()));
+                        if b.mode == 1 {
+                            ui.add(
+                                DragValue::new(&mut b.times)
+                                    .range(1..=remap::MAX_TIMES)
+                                    .prefix("× "),
+                            );
+                        }
+                        ui.label(
+                            RichText::new(b.mode_help())
+                                .font(sans(T_SMALL))
+                                .color(p.i65()),
+                        );
                     });
                 });
             }
@@ -1013,14 +1237,31 @@ impl App {
                 ui.label(caps(&p, "Adds this line"));
                 match &line {
                     Ok(l) => {
-                        Frame::new().fill(p.sunken).stroke(Stroke::new(1.0, p.i18())).inner_margin(Margin::symmetric(10, 4)).show(ui, |ui| {
-                            ui.label(RichText::new(l).font(mono_med(T_DATA + 1.0)).color(p.i100()));
-                        });
-                        ui.label(RichText::new("Nothing is saved until you press Save config.").font(sans(T_SMALL)).color(p.i65()));
+                        Frame::new()
+                            .fill(p.sunken)
+                            .stroke(Stroke::new(1.0, p.i18()))
+                            .inner_margin(Margin::symmetric(10, 4))
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new(l)
+                                        .font(mono_med(T_DATA + 1.0))
+                                        .color(p.i100()),
+                                );
+                            });
+                        ui.label(
+                            RichText::new("Nothing is saved until you press Save config.")
+                                .font(sans(T_SMALL))
+                                .color(p.i65()),
+                        );
                     }
                     Err(why) => {
                         ui.label(RichText::new("▲").font(mono(T_LABEL + 1.0)).color(p.warn));
-                        ui.add(egui::Label::new(RichText::new(why).font(sans(T_SMALL)).color(p.i100())).wrap());
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(why).font(sans(T_SMALL)).color(p.i100()),
+                            )
+                            .wrap(),
+                        );
                     }
                 }
             });
@@ -1032,7 +1273,9 @@ impl App {
                 }
                 self.conf_text.push_str(&l);
                 self.conf_text.push('\n');
-                self.ok(format!("Added \"{l}\" to the rules. Nothing is saved until you press Save config."));
+                self.ok(format!(
+                    "Added \"{l}\" to the rules. Nothing is saved until you press Save config."
+                ));
             }
         }
     }
@@ -1044,16 +1287,26 @@ impl App {
         let list_w = if narrow { total } else { 300.0 };
         let gap = S4;
         let right_w = if narrow { total } else { total - list_w - gap };
-        let layout = if narrow { Layout::top_down(Align::Min) } else { Layout::left_to_right(Align::Min) };
+        let layout = if narrow {
+            Layout::top_down(Align::Min)
+        } else {
+            Layout::left_to_right(Align::Min)
+        };
         if let Some(e) = self.mac.load_error.clone() {
             section(ui, &p, "01", "Macros");
             panel(ui, &p, 20, |ui| {
-                ui.label(RichText::new("macros.conf can't be read.").font(serif(T_TITLE)).color(p.i100()));
+                ui.label(
+                    RichText::new("macros.conf can't be read.")
+                        .font(serif(T_TITLE))
+                        .color(p.i100()),
+                );
                 ui.add_space(S2);
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = S3;
                     chip(ui, &p, Some("×"), "Invalid", ChipStyle::Outline, p.bad);
-                    ui.add(egui::Label::new(RichText::new(&e).font(mono(T_DATA)).color(p.bad)).wrap());
+                    ui.add(
+                        egui::Label::new(RichText::new(&e).font(mono(T_DATA)).color(p.bad)).wrap(),
+                    );
                 });
                 ui.add_space(S2);
                 ui.add(egui::Label::new(RichText::new(
@@ -1061,7 +1314,10 @@ impl App {
                 ).font(sans(T_BODY - 1.0)).color(p.i65())).wrap());
                 ui.add_space(S3);
                 if btn(ui, &p, "↻  Reload", Kind::Primary, true).clicked() {
-                    self.mac = MacroUi { sub: Sub::Macros, ..MacroUi::load(&self.macros_path) };
+                    self.mac = MacroUi {
+                        sub: Sub::Macros,
+                        ..MacroUi::load(&self.macros_path)
+                    };
                 }
             });
             return;
@@ -1074,11 +1330,15 @@ impl App {
                     section(ui, &p, "01", "Macros");
                     self.empty_list(ui);
                 });
-                ui.allocate_ui_with_layout(vec2(right_w, 0.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(right_w);
-                    section(ui, &p, "02", "How macros run");
-                    how_macros_run(ui, &p);
-                });
+                ui.allocate_ui_with_layout(
+                    vec2(right_w, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(right_w);
+                        section(ui, &p, "02", "How macros run");
+                        how_macros_run(ui, &p);
+                    },
+                );
             });
             return;
         }
@@ -1103,26 +1363,54 @@ impl App {
         let mut pick: Option<&'static str> = None;
         let mut new = false;
         panel(ui, &p, 16, |ui| {
-            ui.label(RichText::new("No macros yet.").font(serif(T_TITLE)).color(p.i100()));
+            ui.label(
+                RichText::new("No macros yet.")
+                    .font(serif(T_TITLE))
+                    .color(p.i100()),
+            );
             ui.add_space(4.0);
             ui.add(egui::Label::new(RichText::new("A macro is a named list of key presses, clicks, scrolls and waits. Make one, then bind it to a button.")
                 .font(sans(T_BODY - 1.0)).color(p.i65())).wrap());
             ui.add_space(S4);
-            new = btn_w(ui, &p, "+  New macro", Kind::Primary, true, ui.available_width()).clicked();
+            new = btn_w(
+                ui,
+                &p,
+                "+  New macro",
+                Kind::Primary,
+                true,
+                ui.available_width(),
+            )
+            .clicked();
             ui.add_space(S4);
             hair(ui, &p);
             ui.add_space(S3);
             ui.label(caps(&p, "Or start from"));
             ui.add_space(S2);
-            for (n, d) in [("rapid-click", "left click every 50 ms"), ("copy-paste", "ctrl+c, wait, ctrl+v"), ("double-tap", "one key, twice, 80 ms apart")] {
-                let r = Frame::new().stroke(Stroke::new(1.0, p.i28())).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.label(RichText::new(n).font(mono_bold(T_DATA)).color(p.i100()));
-                    ui.label(RichText::new(d).font(sans(T_SMALL)).color(p.i65()));
-                });
-                let hit = ui.interact(r.response.rect, ui.id().with(("starter", n)), Sense::click());
+            for (n, d) in [
+                ("rapid-click", "left click every 50 ms"),
+                ("copy-paste", "ctrl+c, wait, ctrl+v"),
+                ("double-tap", "one key, twice, 80 ms apart"),
+            ] {
+                let r = Frame::new()
+                    .stroke(Stroke::new(1.0, p.i28()))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(n).font(mono_bold(T_DATA)).color(p.i100()));
+                        ui.label(RichText::new(d).font(sans(T_SMALL)).color(p.i65()));
+                    });
+                let hit = ui.interact(
+                    r.response.rect,
+                    ui.id().with(("starter", n)),
+                    Sense::click(),
+                );
                 if hit.hovered() {
-                    ui.painter().rect_stroke(r.response.rect, R0, Stroke::new(1.0, p.i100()), egui::StrokeKind::Inside);
+                    ui.painter().rect_stroke(
+                        r.response.rect,
+                        R0,
+                        Stroke::new(1.0, p.i100()),
+                        egui::StrokeKind::Inside,
+                    );
                 }
                 if hit.clicked() {
                     pick = Some(n);
@@ -1149,74 +1437,151 @@ impl App {
         // 3.5 rows (the half row says "more below") with a solid scrollbar, and the selected row scrolled into view
         let scroll_sel = self.mac.list_seen != Some(sel);
         self.mac.list_seen = Some(sel);
-        Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.i18())).show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            let row_h = if narrow { 54.0 } else { 76.0 };
-            let (capped, cap_h) = if narrow { (self.mac.drafts.len() > 3, row_h * LIST_ROWS_NARROW) } else { (self.mac.drafts.len() > 8, row_h * 8.0) };
-            if narrow {
-                // egui's handle is `bg_fill` of the inactive widget, which this theme sets to the track colour (invisible)
-                let st = ui.style_mut();
-                st.spacing.scroll = egui::style::ScrollStyle::solid();
-                st.spacing.scroll.bar_width = 8.0;
-                st.spacing.scroll.floating_allocated_width = 0.0;
-                st.visuals.widgets.inactive.bg_fill = p.i65_on(p.sunken);
-                st.visuals.widgets.hovered.bg_fill = p.i100();
-                st.visuals.widgets.active.bg_fill = p.i100();
-            }
-            scroll_if(ui, capped, "macro-list", cap_h, narrow, |ui| {
-                for (i, d) in self.mac.drafts.iter().enumerate() {
-                    let w = ui.available_width();
-                    let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
-                    let is_sel = i == sel;
-                    let fill = if is_sel { p.i10() } else if resp.hovered() { p.i06() } else { Color32::TRANSPARENT };
-                    ui.painter().add(Shape::Rect(RectShape::filled(rect, R0, fill)));
-                    if is_sel {
-                        ui.painter().add(Shape::Rect(RectShape::filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), R0, p.stamp_bg)));
-                    }
-                    ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.i18()));
-                    if is_sel && scroll_sel { ui.scroll_to_rect(rect, Some(Align::Center)); }
-                    let inner = Rect::from_min_max(pos2(rect.left() + S4, rect.top()), pos2(rect.right() - S3, rect.bottom()));
-                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
-                    c.spacing_mut().item_spacing.y = 2.0;
-                    if narrow { c.spacing_mut().interact_size.y = 18.0; }
-                    c.add_space(if narrow { 8.0 } else { 10.0 });
-                    c.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let name = if d.name.is_empty() { "(no name)" } else { d.name.as_str() };
-                        ui.add(egui::Label::new(RichText::new(name).font(mono_bold(T_DATA + 1.0)).color(p.i100())).truncate());
-                        if !issues[i].is_empty() {
-                            chip(ui, &p, Some("×"), "Invalid", ChipStyle::Plain, p.bad);
-                        }
-                    });
-                    let detail = if d.events.is_empty() {
-                        "NO EVENTS".to_string()
-                    } else {
-                        format!("{} EVENT{} · {}", d.events.len(), if d.events.len() == 1 { "" } else { "S" }, fmt_s(d.run_ms()).to_uppercase())
-                    };
-                    let used = used_by(d, &refs);
-                    let used_txt = if used.is_empty() { "UNUSED".to_string() } else { used.join("  /  ") };
-                    let used_col = if used.is_empty() { p.i45() } else { p.i65() };
-                    if narrow {
-                        // one meta line: what it is, then where it is used (one label: a `horizontal` row would be as
-                        // tall as a button and push the line out of its 54 px)
-                        c.add(egui::Label::new(tracked(&format!("{detail}   → {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
-                    } else {
-                        c.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
-                        c.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
-                    }
-                    if resp.clicked() {
-                        clicked = Some(i);
-                    }
+        Frame::new()
+            .fill(p.raised)
+            .stroke(Stroke::new(1.0, p.i18()))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                let row_h = if narrow { 54.0 } else { 76.0 };
+                let (capped, cap_h) = if narrow {
+                    (self.mac.drafts.len() > 3, row_h * LIST_ROWS_NARROW)
+                } else {
+                    (self.mac.drafts.len() > 8, row_h * 8.0)
+                };
+                if narrow {
+                    // egui's handle is `bg_fill` of the inactive widget, which this theme sets to the track colour (invisible)
+                    let st = ui.style_mut();
+                    st.spacing.scroll = egui::style::ScrollStyle::solid();
+                    st.spacing.scroll.bar_width = 8.0;
+                    st.spacing.scroll.floating_allocated_width = 0.0;
+                    st.visuals.widgets.inactive.bg_fill = p.i65_on(p.sunken);
+                    st.visuals.widgets.hovered.bg_fill = p.i100();
+                    st.visuals.widgets.active.bg_fill = p.i100();
                 }
+                scroll_if(ui, capped, "macro-list", cap_h, narrow, |ui| {
+                    for (i, d) in self.mac.drafts.iter().enumerate() {
+                        let w = ui.available_width();
+                        let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
+                        let is_sel = i == sel;
+                        let fill = if is_sel {
+                            p.i10()
+                        } else if resp.hovered() {
+                            p.i06()
+                        } else {
+                            Color32::TRANSPARENT
+                        };
+                        ui.painter()
+                            .add(Shape::Rect(RectShape::filled(rect, R0, fill)));
+                        if is_sel {
+                            ui.painter().add(Shape::Rect(RectShape::filled(
+                                Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+                                R0,
+                                p.stamp_bg,
+                            )));
+                        }
+                        ui.painter().hline(
+                            rect.x_range(),
+                            rect.bottom(),
+                            Stroke::new(1.0, p.i18()),
+                        );
+                        if is_sel && scroll_sel {
+                            ui.scroll_to_rect(rect, Some(Align::Center));
+                        }
+                        let inner = Rect::from_min_max(
+                            pos2(rect.left() + S4, rect.top()),
+                            pos2(rect.right() - S3, rect.bottom()),
+                        );
+                        let mut c = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(inner)
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        c.spacing_mut().item_spacing.y = 2.0;
+                        if narrow {
+                            c.spacing_mut().interact_size.y = 18.0;
+                        }
+                        c.add_space(if narrow { 8.0 } else { 10.0 });
+                        c.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let name = if d.name.is_empty() {
+                                "(no name)"
+                            } else {
+                                d.name.as_str()
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(name)
+                                        .font(mono_bold(T_DATA + 1.0))
+                                        .color(p.i100()),
+                                )
+                                .truncate(),
+                            );
+                            if !issues[i].is_empty() {
+                                chip(ui, &p, Some("×"), "Invalid", ChipStyle::Plain, p.bad);
+                            }
+                        });
+                        let detail = if d.events.is_empty() {
+                            "NO EVENTS".to_string()
+                        } else {
+                            format!(
+                                "{} EVENT{} · {}",
+                                d.events.len(),
+                                if d.events.len() == 1 { "" } else { "S" },
+                                fmt_s(d.run_ms()).to_uppercase()
+                            )
+                        };
+                        let used = used_by(d, &refs);
+                        let used_txt = if used.is_empty() {
+                            "UNUSED".to_string()
+                        } else {
+                            used.join("  /  ")
+                        };
+                        let used_col = if used.is_empty() { p.i45() } else { p.i65() };
+                        if narrow {
+                            // one meta line: what it is, then where it is used (one label: a `horizontal` row would be as
+                            // tall as a button and push the line out of its 54 px)
+                            c.add(
+                                egui::Label::new(tracked(
+                                    &format!("{detail}   → {used_txt}"),
+                                    mono(T_MICRO),
+                                    used_col,
+                                    0.10,
+                                ))
+                                .truncate(),
+                            );
+                        } else {
+                            c.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
+                            c.add(
+                                egui::Label::new(tracked(
+                                    &format!("→ {used_txt}"),
+                                    mono(T_MICRO),
+                                    used_col,
+                                    0.10,
+                                ))
+                                .truncate(),
+                            );
+                        }
+                        if resp.clicked() {
+                            clicked = Some(i);
+                        }
+                    }
+                });
+                ui.add_space(S3);
+                ui.horizontal(|ui| {
+                    ui.add_space(S4);
+                    new = btn_w(
+                        ui,
+                        &p,
+                        "+  New macro",
+                        Kind::Primary,
+                        true,
+                        ui.available_width() - S4,
+                    )
+                    .clicked();
+                });
+                ui.add_space(S3);
             });
-            ui.add_space(S3);
-            ui.horizontal(|ui| {
-                ui.add_space(S4);
-                new = btn_w(ui, &p, "+  New macro", Kind::Primary, true, ui.available_width() - S4).clicked();
-            });
-            ui.add_space(S3);
-        });
         if let Some(i) = clicked {
             self.mac.sel = i;
             self.mac.sel_ev = 0;
@@ -1273,10 +1638,18 @@ impl App {
                     ui.spacing_mut().item_spacing.x = S3;
                     ui.label(caps(&p, "Name"));
                     mono_field(ui, &p, &mut d.name, 220.0);
-                    ui.label(RichText::new("letters, digits, - and _").font(sans(T_SMALL)).color(p.i65()));
+                    ui.label(
+                        RichText::new("letters, digits, - and _")
+                            .font(sans(T_SMALL))
+                            .color(p.i65()),
+                    );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if btn(ui, &p, "Delete", Kind::Secondary, true).clicked() { act = Act::Delete; }
-                        if btn(ui, &p, "Duplicate", Kind::Secondary, true).clicked() { act = Act::Duplicate; }
+                        if btn(ui, &p, "Delete", Kind::Secondary, true).clicked() {
+                            act = Act::Delete;
+                        }
+                        if btn(ui, &p, "Duplicate", Kind::Secondary, true).clicked() {
+                            act = Act::Duplicate;
+                        }
                     });
                 });
                 ui.add_space(S1);
@@ -1285,116 +1658,243 @@ impl App {
                     ui.spacing_mut().item_spacing.x = S2;
                     ui.label(caps(&p, "Used by"));
                     if used.is_empty() {
-                        ui.label(RichText::new("no button yet").font(sans(T_SMALL)).color(p.i65()));
+                        ui.label(
+                            RichText::new("no button yet")
+                                .font(sans(T_SMALL))
+                                .color(p.i65()),
+                        );
                     }
                     for u in &used {
                         chip(ui, &p, None, u, ChipStyle::Outline, p.i100());
                     }
                     // the caption goes first when the panel is narrow, or the Bind button would be pushed out of it
                     if !used.is_empty() && roomy {
-                        ui.label(RichText::new("Renaming updates these rules in the config.").font(sans(T_SMALL)).color(p.i65()));
+                        ui.label(
+                            RichText::new("Renaming updates these rules in the config.")
+                                .font(sans(T_SMALL))
+                                .color(p.i65()),
+                        );
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if btn(ui, &p, "Bind to a button  →", Kind::Secondary, true).clicked() { act = Act::BindTo; }
+                        if btn(ui, &p, "Bind to a button  →", Kind::Secondary, true).clicked() {
+                            act = Act::BindTo;
+                        }
                     });
                 });
             }
             ui.add_space(S2);
             // --- event table
             let w = ui.available_width();
-            let cols = [32.0, 22.0, 80.0, w - 32.0 - 22.0 - 80.0 - 84.0 - 104.0, 84.0, 104.0];
+            let cols = [
+                32.0,
+                22.0,
+                80.0,
+                w - 32.0 - 22.0 - 80.0 - 84.0 - 104.0,
+                84.0,
+                104.0,
+            ];
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 for (i, h) in ["#", "", "Event", "Value", "At", ""].iter().enumerate() {
-                    cell(ui, cols[i], 16.0, |ui| { ui.label(caps(&p, h)); });
+                    cell(ui, cols[i], 16.0, |ui| {
+                        ui.label(caps(&p, h));
+                    });
                 }
             });
             ui.add_space(S1);
             let n_events = d.events.len();
-            Frame::new().fill(p.sunken).stroke(Stroke::new(1.0, p.i18())).show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                if d.events.is_empty() {
-                    let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 84.0), Sense::hover());
-                    let mut c = ui.new_child(egui::UiBuilder::new().max_rect(r.shrink(S4)).layout(Layout::top_down(Align::Min)));
-                    c.label(RichText::new("No events yet.").font(serif(T_TITLE - 2.0)).color(p.i100()));
-                    c.label(RichText::new("Add a key press, a click or a delay below.").font(sans(T_BODY - 1.0)).color(p.i65()));
-                }
-                scroll_if(ui, n_events > 14, "macro-events", 26.0 * 14.0, false, |ui| {
+            Frame::new()
+                .fill(p.sunken)
+                .stroke(Stroke::new(1.0, p.i18()))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                    let mut at: u32 = 0;
-                    for (i, e) in d.events.iter_mut().enumerate() {
-                        let is_delay = matches!(e, Ev::Delay(_));
-                        let row_h = if is_delay { 20.0 } else { 26.0 };
-                        let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), row_h), Sense::click());
-                        let bad = issues.iter().any(|x| x.ev == Some(i));
-                        let is_sel = i == sel_ev;
-                        if ui.rect_contains_pointer(rect) && ui.input(|inp| inp.pointer.primary_pressed()) { new_sel_ev = Some(i); }
-                        if is_sel {
-                            ui.painter().add(Shape::Rect(RectShape::filled(rect, R0, p.i10())));
-                            ui.painter().add(Shape::Rect(RectShape::filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), R0, p.stamp_bg)));
-                        } else if is_delay {
-                            ui.painter().add(Shape::Rect(RectShape::filled(rect, R0, p.i06())));
-                        }
-                        ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.i18()));
-                        let mut c = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(Layout::left_to_right(Align::Center)));
-                        c.spacing_mut().item_spacing = vec2(0.0, 0.0);
-                        c.spacing_mut().interact_size.y = 20.0;
-                        // ink-65 on the selected row of the light theme is 4.45:1, so its secondary text goes to full ink
-                        let sec = if is_sel { p.i100() } else { p.i65() };
-                        let dim = if is_delay { sec } else { p.i100() };
-                        cell(&mut c, cols[0], row_h, |ui| { ui.add_space(S3); ui.label(RichText::new(format!("{:02}", i + 1)).font(mono(T_DATA)).color(sec)); });
-                        cell(&mut c, cols[1], row_h, |ui| { if bad { ui.label(RichText::new("×").font(mono_bold(T_DATA + 2.0)).color(p.bad)); } });
-                        cell(&mut c, cols[2], row_h, |ui| { ui.label(tracked(e.kind(), mono_med(T_LABEL), dim, 0.10)); });
-                        let kind = e.kind();
-                        cell(&mut c, cols[3], row_h, |ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.style_mut().override_font_id = Some(mono(T_DATA + 1.0));
-                            match e {
-                                Ev::Key(t, _) => {
-                                    let r = mono_field(ui, &p, t, 190.0);
-                                    if r.lost_focus() {
-                                        // spell it the way the file will (`ctrl` -> KEY_LEFTCTRL)
-                                        if let Ok(k) = remap::parse_key(t) { *t = format!("{k:?}"); }
+                    if d.events.is_empty() {
+                        let (r, _) = ui
+                            .allocate_exact_size(vec2(ui.available_width(), 84.0), Sense::hover());
+                        let mut c = ui.new_child(
+                            egui::UiBuilder::new()
+                                .max_rect(r.shrink(S4))
+                                .layout(Layout::top_down(Align::Min)),
+                        );
+                        c.label(
+                            RichText::new("No events yet.")
+                                .font(serif(T_TITLE - 2.0))
+                                .color(p.i100()),
+                        );
+                        c.label(
+                            RichText::new("Add a key press, a click or a delay below.")
+                                .font(sans(T_BODY - 1.0))
+                                .color(p.i65()),
+                        );
+                    }
+                    scroll_if(
+                        ui,
+                        n_events > 14,
+                        "macro-events",
+                        26.0 * 14.0,
+                        false,
+                        |ui| {
+                            ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                            let mut at: u32 = 0;
+                            for (i, e) in d.events.iter_mut().enumerate() {
+                                let is_delay = matches!(e, Ev::Delay(_));
+                                let row_h = if is_delay { 20.0 } else { 26.0 };
+                                let (rect, _) = ui.allocate_exact_size(
+                                    vec2(ui.available_width(), row_h),
+                                    Sense::click(),
+                                );
+                                let bad = issues.iter().any(|x| x.ev == Some(i));
+                                let is_sel = i == sel_ev;
+                                if ui.rect_contains_pointer(rect)
+                                    && ui.input(|inp| inp.pointer.primary_pressed())
+                                {
+                                    new_sel_ev = Some(i);
+                                }
+                                if is_sel {
+                                    ui.painter().add(Shape::Rect(RectShape::filled(
+                                        rect,
+                                        R0,
+                                        p.i10(),
+                                    )));
+                                    ui.painter().add(Shape::Rect(RectShape::filled(
+                                        Rect::from_min_size(rect.min, vec2(3.0, rect.height())),
+                                        R0,
+                                        p.stamp_bg,
+                                    )));
+                                } else if is_delay {
+                                    ui.painter().add(Shape::Rect(RectShape::filled(
+                                        rect,
+                                        R0,
+                                        p.i06(),
+                                    )));
+                                }
+                                ui.painter().hline(
+                                    rect.x_range(),
+                                    rect.bottom(),
+                                    Stroke::new(1.0, p.i18()),
+                                );
+                                let mut c = ui.new_child(
+                                    egui::UiBuilder::new()
+                                        .max_rect(rect)
+                                        .layout(Layout::left_to_right(Align::Center)),
+                                );
+                                c.spacing_mut().item_spacing = vec2(0.0, 0.0);
+                                c.spacing_mut().interact_size.y = 20.0;
+                                // ink-65 on the selected row of the light theme is 4.45:1, so its secondary text goes to full ink
+                                let sec = if is_sel { p.i100() } else { p.i65() };
+                                let dim = if is_delay { sec } else { p.i100() };
+                                cell(&mut c, cols[0], row_h, |ui| {
+                                    ui.add_space(S3);
+                                    ui.label(
+                                        RichText::new(format!("{:02}", i + 1))
+                                            .font(mono(T_DATA))
+                                            .color(sec),
+                                    );
+                                });
+                                cell(&mut c, cols[1], row_h, |ui| {
+                                    if bad {
+                                        ui.label(
+                                            RichText::new("×")
+                                                .font(mono_bold(T_DATA + 2.0))
+                                                .color(p.bad),
+                                        );
                                     }
-                                }
-                                Ev::Button(k, _) => {
-                                    let items: Vec<String> = BUTTON_CODES.iter().map(|b| format!("{b:?}")).collect();
-                                    let cur = BUTTON_CODES.iter().position(|b| b == k).unwrap_or(0);
-                                    if let Some(j) = combo(ui, &p, ("evb", sel, i), 150.0, &items, cur) { *k = BUTTON_CODES[j]; }
-                                }
-                                Ev::Wheel(n) | Ev::HWheel(n) => {
-                                    ui.add(DragValue::new(n).range(-(macros::MAX_WHEEL as i32)..=macros::MAX_WHEEL as i32));
-                                    let word = match (kind == "HWHEEL", *n < 0) {
-                                        (false, true) => "ticks, down",
-                                        (false, false) => "ticks, up",
-                                        (true, true) => "ticks, left",
-                                        (true, false) => "ticks, right",
-                                    };
-                                    ui.label(RichText::new(word).font(sans(T_SMALL)).color(p.i65()));
-                                }
-                                Ev::Move(x, y) => {
-                                    let m = macros::MAX_MOVE as i32;
-                                    ui.add(DragValue::new(x).prefix("dx ").range(-m..=m));
-                                    ui.add(DragValue::new(y).prefix("dy ").range(-m..=m));
-                                    ui.label(RichText::new("pixels, relative").font(sans(T_SMALL)).color(p.i65()));
-                                }
-                                Ev::Delay(n) => {
-                                    ui.add(DragValue::new(n).suffix(" ms").range(1..=macros::MAX_DELAY_MS));
+                                });
+                                cell(&mut c, cols[2], row_h, |ui| {
+                                    ui.label(tracked(e.kind(), mono_med(T_LABEL), dim, 0.10));
+                                });
+                                let kind = e.kind();
+                                cell(&mut c, cols[3], row_h, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    ui.style_mut().override_font_id = Some(mono(T_DATA + 1.0));
+                                    match e {
+                                        Ev::Key(t, _) => {
+                                            let r = mono_field(ui, &p, t, 190.0);
+                                            if r.lost_focus() {
+                                                // spell it the way the file will (`ctrl` -> KEY_LEFTCTRL)
+                                                if let Ok(k) = remap::parse_key(t) {
+                                                    *t = format!("{k:?}");
+                                                }
+                                            }
+                                        }
+                                        Ev::Button(k, _) => {
+                                            let items: Vec<String> = BUTTON_CODES
+                                                .iter()
+                                                .map(|b| format!("{b:?}"))
+                                                .collect();
+                                            let cur = BUTTON_CODES
+                                                .iter()
+                                                .position(|b| b == k)
+                                                .unwrap_or(0);
+                                            if let Some(j) =
+                                                combo(ui, &p, ("evb", sel, i), 150.0, &items, cur)
+                                            {
+                                                *k = BUTTON_CODES[j];
+                                            }
+                                        }
+                                        Ev::Wheel(n) | Ev::HWheel(n) => {
+                                            ui.add(DragValue::new(n).range(
+                                                -(macros::MAX_WHEEL as i32)
+                                                    ..=macros::MAX_WHEEL as i32,
+                                            ));
+                                            let word = match (kind == "HWHEEL", *n < 0) {
+                                                (false, true) => "ticks, down",
+                                                (false, false) => "ticks, up",
+                                                (true, true) => "ticks, left",
+                                                (true, false) => "ticks, right",
+                                            };
+                                            ui.label(
+                                                RichText::new(word)
+                                                    .font(sans(T_SMALL))
+                                                    .color(p.i65()),
+                                            );
+                                        }
+                                        Ev::Move(x, y) => {
+                                            let m = macros::MAX_MOVE as i32;
+                                            ui.add(DragValue::new(x).prefix("dx ").range(-m..=m));
+                                            ui.add(DragValue::new(y).prefix("dy ").range(-m..=m));
+                                            ui.label(
+                                                RichText::new("pixels, relative")
+                                                    .font(sans(T_SMALL))
+                                                    .color(p.i65()),
+                                            );
+                                        }
+                                        Ev::Delay(n) => {
+                                            ui.add(
+                                                DragValue::new(n)
+                                                    .suffix(" ms")
+                                                    .range(1..=macros::MAX_DELAY_MS),
+                                            );
+                                        }
+                                    }
+                                });
+                                cell(&mut c, cols[4], row_h, |ui| {
+                                    ui.label(
+                                        RichText::new(format!("{:.3} s", at as f32 / 1000.0))
+                                            .font(mono(T_MICRO + 1.0))
+                                            .color(sec),
+                                    );
+                                });
+                                cell(&mut c, cols[5], row_h, |ui| {
+                                    ui.spacing_mut().item_spacing.x = 4.0;
+                                    if small_btn(ui, &p, "↑", i > 0) {
+                                        act = Act::Up(i);
+                                    }
+                                    if small_btn(ui, &p, "↓", i + 1 < n_events) {
+                                        act = Act::Down(i);
+                                    }
+                                    if small_btn(ui, &p, "×", true) {
+                                        act = Act::Remove(i);
+                                    }
+                                });
+                                if let Ev::Delay(n) = e {
+                                    at += *n;
                                 }
                             }
-                        });
-                        cell(&mut c, cols[4], row_h, |ui| { ui.label(RichText::new(format!("{:.3} s", at as f32 / 1000.0)).font(mono(T_MICRO + 1.0)).color(sec)); });
-                        cell(&mut c, cols[5], row_h, |ui| {
-                            ui.spacing_mut().item_spacing.x = 4.0;
-                            if small_btn(ui, &p, "↑", i > 0) { act = Act::Up(i); }
-                            if small_btn(ui, &p, "↓", i + 1 < n_events) { act = Act::Down(i); }
-                            if small_btn(ui, &p, "×", true) { act = Act::Remove(i); }
-                        });
-                        if let Ev::Delay(n) = e { at += *n; }
-                    }
+                        },
+                    );
                 });
-            });
             ui.add_space(S2);
             // --- add bar (left) + validity and run time (right; under the buttons when the panel is narrow)
             let stack_bar = w < 800.0;
@@ -1402,17 +1902,31 @@ impl App {
                 // the problem count lives in the problem box below, next to the messages it counts (DAN-1452 note f)
                 if issues.is_empty() {
                     chip(ui, &p, Some("●"), "Valid", ChipStyle::Plain, p.ok);
-                    ui.label(RichText::new(format!("{} events · about {} per run", n_events, fmt_s(run_ms))).font(mono(T_DATA)).color(p.i100()));
+                    ui.label(
+                        RichText::new(format!(
+                            "{} events · about {} per run",
+                            n_events,
+                            fmt_s(run_ms)
+                        ))
+                        .font(mono(T_DATA))
+                        .color(p.i100()),
+                    );
                 }
             };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S2;
                 ui.label(caps(&p, "Add"));
                 if btn(ui, &p, "+ Tap key", Kind::Secondary, true).clicked() {
-                    act = Act::Add(vec![Ev::Key("KEY_A".into(), true), Ev::Key("KEY_A".into(), false)]);
+                    act = Act::Add(vec![
+                        Ev::Key("KEY_A".into(), true),
+                        Ev::Key("KEY_A".into(), false),
+                    ]);
                 }
                 if btn(ui, &p, "+ Click", Kind::Secondary, true).clicked() {
-                    act = Act::Add(vec![Ev::Button(KeyCode::BTN_LEFT, true), Ev::Button(KeyCode::BTN_LEFT, false)]);
+                    act = Act::Add(vec![
+                        Ev::Button(KeyCode::BTN_LEFT, true),
+                        Ev::Button(KeyCode::BTN_LEFT, false),
+                    ]);
                 }
                 if btn(ui, &p, "+ Delay", Kind::Secondary, true).clicked() {
                     act = Act::Add(vec![Ev::Delay(50)]);
@@ -1429,7 +1943,9 @@ impl App {
                         ("Move cursor", Ev::Move(10, 0)),
                     ];
                     for (l, ev) in items {
-                        if ui.button(l).clicked() { act = Act::Add(vec![ev]); }
+                        if ui.button(l).clicked() {
+                            act = Act::Add(vec![ev]);
+                        }
                     }
                 });
                 if !stack_bar && issues.is_empty() {
@@ -1444,29 +1960,77 @@ impl App {
             // --- problems
             if !issues.is_empty() {
                 ui.add_space(S3);
-                Frame::new().fill(p.i06()).stroke(Stroke::new(1.0, p.i45())).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.spacing_mut().item_spacing.y = 4.0;
-                    ui.label(tracked(&format!("× {} PROBLEM{}", issues.len(), if issues.len() == 1 { "" } else { "S" }), mono_med(T_LABEL), p.bad, 0.12));
-                    for is in &issues {
-                        ui.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = 8.0;
-                            ui.label(RichText::new("×").font(mono_bold(T_DATA + 2.0)).color(p.bad));
-                            ui.add(egui::Label::new(RichText::new(&is.msg).font(sans(T_BODY - 1.0)).color(p.i100())).wrap());
-                        });
-                    }
-                });
+                Frame::new()
+                    .fill(p.i06())
+                    .stroke(Stroke::new(1.0, p.i45()))
+                    .inner_margin(Margin::symmetric(12, 8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.spacing_mut().item_spacing.y = 4.0;
+                        ui.label(tracked(
+                            &format!(
+                                "× {} PROBLEM{}",
+                                issues.len(),
+                                if issues.len() == 1 { "" } else { "S" }
+                            ),
+                            mono_med(T_LABEL),
+                            p.bad,
+                            0.12,
+                        ));
+                        for is in &issues {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 8.0;
+                                ui.label(
+                                    RichText::new("×")
+                                        .font(mono_bold(T_DATA + 2.0))
+                                        .color(p.bad),
+                                );
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&is.msg)
+                                            .font(sans(T_BODY - 1.0))
+                                            .color(p.i100()),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        }
+                    });
             }
             ui.add_space(S2);
             // --- action bar
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S2;
-                if btn(ui, &p, "💾  Save macros", Kind::Primary, can_save).clicked() { act = Act::Save { restart: false }; }
-                if btn(ui, &p, "Save and restart service", Kind::Secondary, can_save).clicked() { act = Act::Save { restart: true }; }
-                if btn(ui, &p, "Revert", Kind::Secondary, dirty).clicked() { act = Act::Revert; }
+                if btn(ui, &p, "💾  Save macros", Kind::Primary, can_save).clicked() {
+                    act = Act::Save { restart: false };
+                }
+                if btn(
+                    ui,
+                    &p,
+                    "Save and restart service",
+                    Kind::Secondary,
+                    can_save,
+                )
+                .clicked()
+                {
+                    act = Act::Save { restart: true };
+                }
+                if btn(ui, &p, "Revert", Kind::Secondary, dirty).clicked() {
+                    act = Act::Revert;
+                }
                 ui.add_space(S3);
                 if bad_total > 0 {
-                    chip(ui, &p, Some("×"), &format!("{bad_total} macro{} invalid", if bad_total == 1 { "" } else { "s" }), ChipStyle::Outline, p.bad);
+                    chip(
+                        ui,
+                        &p,
+                        Some("×"),
+                        &format!(
+                            "{bad_total} macro{} invalid",
+                            if bad_total == 1 { "" } else { "s" }
+                        ),
+                        ChipStyle::Outline,
+                        p.bad,
+                    );
                 } else if dirty {
                     chip(ui, &p, Some("◐"), "Unsaved", ChipStyle::Outline, p.warn);
                 } else {
@@ -1483,7 +2047,9 @@ impl App {
     /// The Delete button: a macro no rule uses goes at once (nothing is final until Save; Revert brings it back),
     /// one a rule uses asks first, so the rule is not left pointing at nothing by accident.
     pub fn request_delete(&mut self) {
-        let Some(d) = self.mac.drafts.get(self.mac.sel) else { return };
+        let Some(d) = self.mac.drafts.get(self.mac.sel) else {
+            return;
+        };
         if used_by(d, &rule_refs(&self.conf_text)).is_empty() {
             self.mac.delete(false);
         } else {
@@ -1530,7 +2096,12 @@ impl App {
                 }
             }
             Act::Down(i) => {
-                if let Some(d) = self.mac.drafts.get_mut(sel).filter(|d| i + 1 < d.events.len()) {
+                if let Some(d) = self
+                    .mac
+                    .drafts
+                    .get_mut(sel)
+                    .filter(|d| i + 1 < d.events.len())
+                {
                     d.events.swap(i, i + 1);
                     self.mac.sel_ev = i + 1;
                 }
@@ -1547,7 +2118,11 @@ impl App {
 
 fn how_macros_run(ui: &mut Ui, p: &Pal) {
     panel(ui, p, 20, |ui| {
-        ui.label(RichText::new("Played by this computer, not by the mouse.").font(serif(T_TITLE)).color(p.i100()));
+        ui.label(
+            RichText::new("Played by this computer, not by the mouse.")
+                .font(serif(T_TITLE))
+                .color(p.i100()),
+        );
         ui.add_space(S3);
         for (k, t) in [
             ("Needs the service", "A macro plays only while razerctl-remap.service is running and holds the mouse. Stop the service, unplug the mouse or reload the rules, and any running macro stops."),
@@ -1584,39 +2159,102 @@ mod tests {
 
     #[test]
     fn a_tap_pair_is_valid_and_a_lone_down_names_the_row() {
-        let ok = mac("a", vec![key("KEY_A", true), Ev::Delay(20), key("a", false)]);
-        assert_eq!(issues(&ok, std::slice::from_ref(&ok)), vec![], "aliases and delays are fine");
-        let held = mac("a", vec![key("KEY_LEFTSHIFT", true), key("KEY_END", true), Ev::Delay(20), key("KEY_END", false)]);
+        let ok = mac(
+            "a",
+            vec![key("KEY_A", true), Ev::Delay(20), key("a", false)],
+        );
+        assert_eq!(
+            issues(&ok, std::slice::from_ref(&ok)),
+            vec![],
+            "aliases and delays are fine"
+        );
+        let held = mac(
+            "a",
+            vec![
+                key("KEY_LEFTSHIFT", true),
+                key("KEY_END", true),
+                Ev::Delay(20),
+                key("KEY_END", false),
+            ],
+        );
         let i = issues(&held, std::slice::from_ref(&held));
         assert_eq!(i.len(), 1);
-        assert_eq!(i[0].ev, Some(0), "the earliest press is the row that gets the ×");
+        assert_eq!(
+            i[0].ev,
+            Some(0),
+            "the earliest press is the row that gets the ×"
+        );
         assert_eq!(i[0].msg, "KEY_LEFTSHIFT is pressed at #01 and never released, so it would stay held after the macro ends.");
         let up = mac("a", vec![Ev::Button(KeyCode::BTN_LEFT, false)]);
-        assert_eq!(msgs(&up, std::slice::from_ref(&up)), ["BTN_LEFT is released at #01 but was never pressed."]);
-        let twice = mac("a", vec![key("KEY_A", true), key("KEY_A", true), key("KEY_A", false)]);
+        assert_eq!(
+            msgs(&up, std::slice::from_ref(&up)),
+            ["BTN_LEFT is released at #01 but was never pressed."]
+        );
+        let twice = mac(
+            "a",
+            vec![key("KEY_A", true), key("KEY_A", true), key("KEY_A", false)],
+        );
         assert_eq!(issues(&twice, std::slice::from_ref(&twice))[0].ev, Some(1));
     }
 
     #[test]
     fn empty_macro_bad_names_duplicates_and_bad_values_are_reported() {
         let e = mac("untitled-1", vec![]);
-        assert_eq!(msgs(&e, std::slice::from_ref(&e)), ["No events. A macro needs at least one event."]);
+        assert_eq!(
+            msgs(&e, std::slice::from_ref(&e)),
+            ["No events. A macro needs at least one event."]
+        );
         let bad = mac("has space", vec![Ev::Delay(1)]);
-        assert!(msgs(&bad, std::slice::from_ref(&bad))[0].starts_with("The name must be 1 to 64 letters, digits, - or _."));
+        assert!(msgs(&bad, std::slice::from_ref(&bad))[0]
+            .starts_with("The name must be 1 to 64 letters, digits, - or _."));
         let (a, b) = (mac("x", vec![Ev::Delay(1)]), mac("x", vec![Ev::Delay(2)]));
-        assert_eq!(msgs(&a, &[a.clone(), b]), ["Another macro is already called 'x'."]);
-        let key_text = mac("a", vec![key("nonsense_key", true), key("", false), key("left", true)]);
+        assert_eq!(
+            msgs(&a, &[a.clone(), b]),
+            ["Another macro is already called 'x'."]
+        );
+        let key_text = mac(
+            "a",
+            vec![key("nonsense_key", true), key("", false), key("left", true)],
+        );
         let m = msgs(&key_text, std::slice::from_ref(&key_text));
-        assert!(m[0].starts_with("#01: unknown key/button 'nonsense_key'"), "{m:?}");
+        assert!(
+            m[0].starts_with("#01: unknown key/button 'nonsense_key'"),
+            "{m:?}"
+        );
         assert!(m[1].starts_with("#02: Type a key name"), "{m:?}");
         assert!(m[2].contains("is a mouse button"), "{m:?}");
-        let range = mac("a", vec![Ev::Wheel(0), Ev::Move(0, 0), Ev::Delay(60_001), Ev::HWheel(101)]);
-        assert_eq!(issues(&range, std::slice::from_ref(&range)).iter().map(|i| i.ev).collect::<Vec<_>>(), [Some(0), Some(1), Some(2), Some(3)]);
+        let range = mac(
+            "a",
+            vec![
+                Ev::Wheel(0),
+                Ev::Move(0, 0),
+                Ev::Delay(60_001),
+                Ev::HWheel(101),
+            ],
+        );
+        assert_eq!(
+            issues(&range, std::slice::from_ref(&range))
+                .iter()
+                .map(|i| i.ev)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1), Some(2), Some(3)]
+        );
     }
 
     #[test]
     fn whatever_has_no_issues_is_accepted_by_the_file_writer() {
-        let d = mac("tap-ctrl-c", vec![key("ctrl", true), key("c", true), key("c", false), key("ctrl", false), Ev::Wheel(-3), Ev::HWheel(2), Ev::Move(-5, 5)]);
+        let d = mac(
+            "tap-ctrl-c",
+            vec![
+                key("ctrl", true),
+                key("c", true),
+                key("c", false),
+                key("ctrl", false),
+                Ev::Wheel(-3),
+                Ev::HWheel(2),
+                Ev::Move(-5, 5),
+            ],
+        );
         assert_eq!(issues(&d, std::slice::from_ref(&d)), vec![]);
         let m = d.to_macro().unwrap();
         assert_eq!(m.events[0], MacroEvent::Key(KeyCode::KEY_LEFTCTRL, true));
@@ -1628,7 +2266,16 @@ mod tests {
     #[test]
     fn run_time_is_the_engines_own_number() {
         // 5 events and 30 ms of delay: no 3 ms pad inside, a 20 ms tail
-        let d = mac("a", vec![key("KEY_A", true), Ev::Delay(30), key("KEY_A", false), Ev::Wheel(1), Ev::Wheel(1)]);
+        let d = mac(
+            "a",
+            vec![
+                key("KEY_A", true),
+                Ev::Delay(30),
+                key("KEY_A", false),
+                Ev::Wheel(1),
+                Ev::Wheel(1),
+            ],
+        );
         assert_eq!(d.run_ms(), 50);
         let six = mac("a", vec![Ev::Wheel(1); 6]);
         assert_eq!(six.run_ms(), 23);
@@ -1639,9 +2286,17 @@ mod tests {
     #[test]
     fn rule_scan_finds_the_macro_rules_and_labels_them() {
         let r = rule_refs(CONF);
-        assert_eq!(r.iter().map(|r| (r.line, r.name.as_str())).collect::<Vec<_>>(), [(2, "wiggle"), (3, "rapid-click"), (5, "wiggle")]);
+        assert_eq!(
+            r.iter()
+                .map(|r| (r.line, r.name.as_str()))
+                .collect::<Vec<_>>(),
+            [(2, "wiggle"), (3, "rapid-click"), (5, "wiggle")]
+        );
         assert_eq!(r[0].mode, Playback::Toggle);
-        let d = Draft { orig: Some("wiggle".into()), ..mac("wiggle", vec![]) };
+        let d = Draft {
+            orig: Some("wiggle".into()),
+            ..mac("wiggle", vec![])
+        };
         assert_eq!(used_by(&d, &r), ["BACK · TOGGLE", "RIGHT · ONCE"]);
         assert_eq!(button_label("forward"), "FORWARD");
         assert_eq!(button_label("BTN_SIDE"), "BACK");
@@ -1651,29 +2306,62 @@ mod tests {
 
     #[test]
     fn rename_and_remove_rewrite_only_the_macro_name() {
-        let renamed = fix_text(CONF, &[RuleFix::Rename { from: "wiggle".into(), to: "shake".into() }]);
+        let renamed = fix_text(
+            CONF,
+            &[RuleFix::Rename {
+                from: "wiggle".into(),
+                to: "shake".into(),
+            }],
+        );
         assert_eq!(
             renamed,
             "# rules\nback = macro:shake,toggle   # side\nforward = Macro: rapid-click ,held\nmiddle = ctrl+c\nright = macro:shake\n"
         );
         let removed = fix_text(CONF, &[RuleFix::Remove("wiggle".into())]);
-        assert_eq!(removed, "# rules\nforward = Macro: rapid-click ,held\nmiddle = ctrl+c\n");
+        assert_eq!(
+            removed,
+            "# rules\nforward = Macro: rapid-click ,held\nmiddle = ctrl+c\n"
+        );
         // two macros swapping names must not cascade
-        let swap = fix_text("a = macro:x\nb = macro:y", &[
-            RuleFix::Rename { from: "x".into(), to: "y".into() },
-            RuleFix::Rename { from: "y".into(), to: "x".into() },
-        ]);
+        let swap = fix_text(
+            "a = macro:x\nb = macro:y",
+            &[
+                RuleFix::Rename {
+                    from: "x".into(),
+                    to: "y".into(),
+                },
+                RuleFix::Rename {
+                    from: "y".into(),
+                    to: "x".into(),
+                },
+            ],
+        );
         assert_eq!(swap, "a = macro:y\nb = macro:x");
         // a comment that mentions a macro is left alone
-        assert_eq!(fix_text("# back = macro:wiggle\n", &[RuleFix::Remove("wiggle".into())]), "# back = macro:wiggle\n");
+        assert_eq!(
+            fix_text(
+                "# back = macro:wiggle\n",
+                &[RuleFix::Remove("wiggle".into())]
+            ),
+            "# back = macro:wiggle\n"
+        );
         assert_eq!(remove_line(CONF, 2).lines().count(), 4);
-        assert_eq!(retarget_line("a = macro:x,held\nb = macro:x\n", 1, "z"), "a = macro:z,held\nb = macro:x\n");
+        assert_eq!(
+            retarget_line("a = macro:x,held\nb = macro:x\n", 1, "z"),
+            "a = macro:z,held\nb = macro:x\n"
+        );
     }
 
     fn ui_with(names: &[&str]) -> MacroUi {
         let mut m = MacroUi::empty();
         for n in names {
-            let mut d = mac(n, vec![Ev::Button(KeyCode::BTN_LEFT, true), Ev::Button(KeyCode::BTN_LEFT, false)]);
+            let mut d = mac(
+                n,
+                vec![
+                    Ev::Button(KeyCode::BTN_LEFT, true),
+                    Ev::Button(KeyCode::BTN_LEFT, false),
+                ],
+            );
             d.orig = Some(n.to_string());
             m.drafts.push(d);
         }
@@ -1687,9 +2375,17 @@ mod tests {
         let mut m = ui_with(&["wiggle"]);
         assert_eq!(m.dangling(conf), [(2, "gone".to_string())]);
         m.drafts[0].name = "shake".into();
-        assert_eq!(m.dangling(conf), [(2, "gone".to_string())], "rule for the old name follows the rename");
+        assert_eq!(
+            m.dangling(conf),
+            [(2, "gone".to_string())],
+            "rule for the old name follows the rename"
+        );
         m.drafts.clear();
-        assert_eq!(m.dangling(conf).len(), 2, "deleted without removing the rule: both dangle");
+        assert_eq!(
+            m.dangling(conf).len(),
+            2,
+            "deleted without removing the rule: both dangle"
+        );
         m.remove_rules.insert("wiggle".into());
         assert_eq!(m.dangling(conf), [(2, "gone".to_string())]);
     }
@@ -1710,7 +2406,13 @@ mod tests {
         assert!(!m.dirty());
         m.sel = 0;
         m.duplicate();
-        assert_eq!((m.drafts.last().unwrap().name.as_str(), m.drafts.last().unwrap().orig.clone()), ("a-copy", None));
+        assert_eq!(
+            (
+                m.drafts.last().unwrap().name.as_str(),
+                m.drafts.last().unwrap().orig.clone()
+            ),
+            ("a-copy", None)
+        );
         m.delete(true);
         assert_eq!(m.drafts.len(), 2);
         assert!(m.remove_rules.is_empty() || m.remove_rules.contains("a-copy"));
@@ -1736,7 +2438,10 @@ mod tests {
     #[test]
     fn add_a_rule_builds_the_line_and_refuses_what_it_cannot_say() {
         let macros = vec![mac("copy", vec![Ev::Delay(1)])];
-        let mut b = Bind { macro_name: "copy".into(), ..Bind::default() };
+        let mut b = Bind {
+            macro_name: "copy".into(),
+            ..Bind::default()
+        };
         assert_eq!(b.line(&macros).unwrap(), "forward = macro:copy,once");
         b.mode = 2;
         assert_eq!(b.line(&macros).unwrap(), "forward = macro:copy,held");
@@ -1744,12 +2449,18 @@ mod tests {
         b.times = 7;
         assert_eq!(b.line(&macros).unwrap(), "forward = macro:copy,x7");
         b.mode = MODE_SEQUENCE;
-        assert_eq!(b.line(&macros).unwrap_err(), "Sequence is not available yet.");
+        assert_eq!(
+            b.line(&macros).unwrap_err(),
+            "Sequence is not available yet."
+        );
         // design flag 12: no looping left click
         b.button = 0;
         for mode in [2, 3] {
             b.mode = mode;
-            assert!(b.line(&macros).unwrap_err().starts_with("Left can't repeat while held or toggled"));
+            assert!(b
+                .line(&macros)
+                .unwrap_err()
+                .starts_with("Left can't repeat while held or toggled"));
         }
         b.mode = 0;
         assert_eq!(b.line(&macros).unwrap(), "left = macro:copy,once");
@@ -1768,9 +2479,21 @@ mod tests {
         b.key = "nonsense_key".into();
         assert!(b.line(&[]).is_err());
         // every line it can build parses back to the action it names
-        let ok = Bind { macro_name: "copy".into(), mode: 3, ..Bind::default() }.line(&macros).unwrap();
+        let ok = Bind {
+            macro_name: "copy".into(),
+            mode: 3,
+            ..Bind::default()
+        }
+        .line(&macros)
+        .unwrap();
         let m = remap::parse_config(&ok).unwrap();
-        assert_eq!(m[&KeyCode::BTN_EXTRA], Action::Macro { name: "copy".into(), mode: Playback::Toggle });
+        assert_eq!(
+            m[&KeyCode::BTN_EXTRA],
+            Action::Macro {
+                name: "copy".into(),
+                mode: Playback::Toggle
+            }
+        );
     }
 
     #[test]
@@ -1829,9 +2552,22 @@ mod tests {
         app.apply(Act::Revert);
         assert_eq!(app.mac.drafts.len(), 2);
         app.apply(Act::Duplicate);
-        assert_eq!((app.mac.drafts.len(), app.mac.drafts[app.mac.sel].name.as_str()), (3, "copy-copy"));
+        assert_eq!(
+            (
+                app.mac.drafts.len(),
+                app.mac.drafts[app.mac.sel].name.as_str()
+            ),
+            (3, "copy-copy")
+        );
         app.mac.sel = 0;
         app.apply(Act::BindTo);
-        assert_eq!((app.mac.sub, app.mac.bind.does, app.mac.bind.macro_name.as_str()), (Sub::Rules, DOES_MACRO, "copy"));
+        assert_eq!(
+            (
+                app.mac.sub,
+                app.mac.bind.does,
+                app.mac.bind.macro_name.as_str()
+            ),
+            (Sub::Rules, DOES_MACRO, "copy")
+        );
     }
 }

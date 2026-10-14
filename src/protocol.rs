@@ -76,7 +76,11 @@ impl std::fmt::Debug for Report {
         write!(
             f,
             "Report{{status:{:#04x} tid:{:#04x} cmd:{:02x}:{:02x} size:{} args:{:02x?}}}",
-            self.status, self.transaction_id, self.command_class, self.command_id, self.data_size,
+            self.status,
+            self.transaction_id,
+            self.command_class,
+            self.command_id,
+            self.data_size,
             &self.args[..n]
         )
     }

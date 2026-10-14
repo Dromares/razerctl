@@ -48,39 +48,84 @@ impl Pal {
     pub fn new(mode: Mode) -> Self {
         let (bg, raised, sunken, ink, a, stamp_fg, sig) = match mode {
             Mode::Dark => (
-                rgb(0x0d0d0d), rgb(0x141414), rgb(0x090909), [0xcd, 0xc4, 0xba],
-                [0.65, 0.45, 0.28, 0.18, 0.10, 0.06, 0.05], rgb(0x0d0d0d),
+                rgb(0x0d0d0d),
+                rgb(0x141414),
+                rgb(0x090909),
+                [0xcd, 0xc4, 0xba],
+                [0.65, 0.45, 0.28, 0.18, 0.10, 0.06, 0.05],
+                rgb(0x0d0d0d),
                 [rgb(0x8fc79a), rgb(0xe0b252), rgb(0xf08a78)],
             ),
             Mode::Light => (
-                rgb(0xe8e1d2), rgb(0xf2ede1), rgb(0xddd2bd), [0x21, 0x1d, 0x17],
-                [0.70, 0.50, 0.45, 0.32, 0.12, 0.07, 0.08], rgb(0xf6f1e6),
+                rgb(0xe8e1d2),
+                rgb(0xf2ede1),
+                rgb(0xddd2bd),
+                [0x21, 0x1d, 0x17],
+                [0.70, 0.50, 0.45, 0.32, 0.12, 0.07, 0.08],
+                rgb(0xf6f1e6),
                 [rgb(0x1f6b3a), rgb(0x7a4f00), rgb(0xa32a1a)],
             ),
         };
         let inkc = Color32::from_rgb(ink[0], ink[1], ink[2]);
         Pal {
-            mode, bg, raised, sunken, ink: inkc, ink_rgb: ink,
-            a65: a[0], a45: a[1], a28: a[2], a18: a[3], a10: a[4], a06: a[5], a05: a[6],
-            stamp_bg: inkc, stamp_fg, ok: sig[0], warn: sig[1], bad: sig[2],
+            mode,
+            bg,
+            raised,
+            sunken,
+            ink: inkc,
+            ink_rgb: ink,
+            a65: a[0],
+            a45: a[1],
+            a28: a[2],
+            a18: a[3],
+            a10: a[4],
+            a06: a[5],
+            a05: a[6],
+            stamp_bg: inkc,
+            stamp_fg,
+            ok: sig[0],
+            warn: sig[1],
+            bad: sig[2],
         }
     }
-    pub fn i100(&self) -> Color32 { self.ink }
-    pub fn i65(&self) -> Color32 { ink_a(self.ink_rgb, self.a65) }
-    pub fn i45(&self) -> Color32 { ink_a(self.ink_rgb, self.a45) }
-    pub fn i28(&self) -> Color32 { ink_a(self.ink_rgb, self.a28) }
-    pub fn i18(&self) -> Color32 { ink_a(self.ink_rgb, self.a18) }
-    pub fn i10(&self) -> Color32 { ink_a(self.ink_rgb, self.a10) }
-    pub fn i06(&self) -> Color32 { ink_a(self.ink_rgb, self.a06) }
-    pub fn i05(&self) -> Color32 { ink_a(self.ink_rgb, self.a05) }
+    pub fn i100(&self) -> Color32 {
+        self.ink
+    }
+    pub fn i65(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a65)
+    }
+    pub fn i45(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a45)
+    }
+    pub fn i28(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a28)
+    }
+    pub fn i18(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a18)
+    }
+    pub fn i10(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a10)
+    }
+    pub fn i06(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a06)
+    }
+    pub fn i05(&self) -> Color32 {
+        ink_a(self.ink_rgb, self.a05)
+    }
 
     /// The ink-65 token composited over an opaque surface (the macro list's scrollbar handle: 5.30:1 dark / 5.09:1 light).
-    pub fn i65_on(&self, surface: Color32) -> Color32 { self.over(self.a65, surface) }
+    pub fn i65_on(&self, surface: Color32) -> Color32 {
+        self.over(self.a65, surface)
+    }
 
     /// Alpha token composited over an opaque surface (contrast measurement in the tests, the scrollbar handle).
     pub fn over(&self, a: f32, surface: Color32) -> Color32 {
         let m = |f: u8, s: u8| (f as f32 * a + s as f32 * (1.0 - a)).round() as u8;
-        Color32::from_rgb(m(self.ink_rgb[0], surface.r()), m(self.ink_rgb[1], surface.g()), m(self.ink_rgb[2], surface.b()))
+        Color32::from_rgb(
+            m(self.ink_rgb[0], surface.r()),
+            m(self.ink_rgb[1], surface.g()),
+            m(self.ink_rgb[2], surface.b()),
+        )
     }
 }
 
@@ -103,18 +148,33 @@ pub const S4: f32 = 16.0;
 pub const S5: f32 = 24.0;
 pub const S6: f32 = 32.0;
 
-pub fn serif(sz: f32) -> FontId { FontId::new(sz, FontFamily::Name("serif".into())) }
-pub fn sans(sz: f32) -> FontId { FontId::new(sz, FontFamily::Proportional) }
-pub fn mono(sz: f32) -> FontId { FontId::new(sz, FontFamily::Monospace) }
-pub fn mono_med(sz: f32) -> FontId { FontId::new(sz, FontFamily::Name("mono-medium".into())) }
-pub fn mono_bold(sz: f32) -> FontId { FontId::new(sz, FontFamily::Name("mono-bold".into())) }
-pub fn kanji(sz: f32) -> FontId { FontId::new(sz, FontFamily::Name("kanji".into())) }
+pub fn serif(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Name("serif".into()))
+}
+pub fn sans(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Proportional)
+}
+pub fn mono(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Monospace)
+}
+pub fn mono_med(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Name("mono-medium".into()))
+}
+pub fn mono_bold(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Name("mono-bold".into()))
+}
+pub fn kanji(sz: f32) -> FontId {
+    FontId::new(sz, FontFamily::Name("kanji".into()))
+}
 
 macro_rules! font {
     ($defs:expr, $name:expr, $file:expr) => {
         $defs.font_data.insert(
             $name.to_string(),
-            Arc::new(FontData::from_static(include_bytes!(concat!("../../../assets/fonts/", $file)))),
+            Arc::new(FontData::from_static(include_bytes!(concat!(
+                "../../../assets/fonts/",
+                $file
+            )))),
         );
     };
 }
@@ -130,26 +190,58 @@ pub fn install_fonts(ctx: &egui::Context) {
     font!(d, "kanji", "RyokuKanji.ttf");
     font!(d, "status", "RyokuStatus.ttf");
 
-    let defaults_prop = d.families.get(&FontFamily::Proportional).cloned().unwrap_or_default();
-    let defaults_mono = d.families.get(&FontFamily::Monospace).cloned().unwrap_or_default();
+    let defaults_prop = d
+        .families
+        .get(&FontFamily::Proportional)
+        .cloned()
+        .unwrap_or_default();
+    let defaults_mono = d
+        .families
+        .get(&FontFamily::Monospace)
+        .cloned()
+        .unwrap_or_default();
     let with_fallback = |first: &[&str], fb: &[String]| -> Vec<String> {
-        first.iter().map(|s| s.to_string()).chain(fb.iter().cloned()).collect()
+        first
+            .iter()
+            .map(|s| s.to_string())
+            .chain(fb.iter().cloned())
+            .collect()
     };
     // Status glyphs (● ○ ◐ × · ▲) are not all in JetBrains Mono: the Ryoku Status subset goes right behind it.
     // egui's default fonts stay as the tail of every family, so emoji (🐍 💾 🔋) and anything else still resolve.
-    d.families.insert(FontFamily::Proportional, with_fallback(&["grotesk", "status"], &defaults_prop));
-    d.families.insert(FontFamily::Monospace, with_fallback(&["jb", "status"], &defaults_mono));
-    d.families.insert(FontFamily::Name("mono-medium".into()), with_fallback(&["jb-med", "status"], &defaults_mono));
-    d.families.insert(FontFamily::Name("mono-bold".into()), with_fallback(&["jb-bold", "status"], &defaults_mono));
-    d.families.insert(FontFamily::Name("serif".into()), with_fallback(&["serif", "status"], &defaults_prop));
-    d.families.insert(FontFamily::Name("kanji".into()), vec!["kanji".into()]);
+    d.families.insert(
+        FontFamily::Proportional,
+        with_fallback(&["grotesk", "status"], &defaults_prop),
+    );
+    d.families.insert(
+        FontFamily::Monospace,
+        with_fallback(&["jb", "status"], &defaults_mono),
+    );
+    d.families.insert(
+        FontFamily::Name("mono-medium".into()),
+        with_fallback(&["jb-med", "status"], &defaults_mono),
+    );
+    d.families.insert(
+        FontFamily::Name("mono-bold".into()),
+        with_fallback(&["jb-bold", "status"], &defaults_mono),
+    );
+    d.families.insert(
+        FontFamily::Name("serif".into()),
+        with_fallback(&["serif", "status"], &defaults_prop),
+    );
+    d.families
+        .insert(FontFamily::Name("kanji".into()), vec!["kanji".into()]);
     ctx.set_fonts(d);
 }
 
 /// Global egui style: every stock widget (ComboBox, TextEdit, DragValue, Slider, popups) inherits this.
 pub fn apply_style(ctx: &egui::Context, p: &Pal) {
     use egui::{CornerRadius, Stroke};
-    ctx.set_visuals(if p.mode == Mode::Dark { egui::Visuals::dark() } else { egui::Visuals::light() });
+    ctx.set_visuals(if p.mode == Mode::Dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    });
     ctx.all_styles_mut(|s| {
         let v = &mut s.visuals;
         v.panel_fill = p.bg;
@@ -214,9 +306,15 @@ pub fn apply_style(ctx: &egui::Context, p: &Pal) {
 pub fn contrast(a: Color32, b: Color32) -> f64 {
     fn lin(c: u8) -> f64 {
         let c = c as f64 / 255.0;
-        if c <= 0.03928 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        if c <= 0.03928 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
     }
-    fn lum(c: Color32) -> f64 { 0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b()) }
+    fn lum(c: Color32) -> f64 {
+        0.2126 * lin(c.r()) + 0.7152 * lin(c.g()) + 0.0722 * lin(c.b())
+    }
     let (x, y) = (lum(a), lum(b));
     let (hi, lo) = if x > y { (x, y) } else { (y, x) };
     (hi + 0.05) / (lo + 0.05)
@@ -256,7 +354,11 @@ mod tests {
             let p = Pal::new(m);
             for s in [p.raised, p.bg] {
                 for (n, c) in [("ok", p.ok), ("warn", p.warn), ("bad", p.bad)] {
-                    assert!(contrast(c, s) >= 4.5, "{m:?} {n} on {s:?}: {:.2}", contrast(c, s));
+                    assert!(
+                        contrast(c, s) >= 4.5,
+                        "{m:?} {n} on {s:?}: {:.2}",
+                        contrast(c, s)
+                    );
                 }
             }
         }
