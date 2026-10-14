@@ -923,7 +923,7 @@ impl App {
                         stop_macros = btn(ui, &p, "Stop all macros", Kind::Secondary, true).clicked();
                         ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
                             ui.add(egui::Label::new(
-                                RichText::new("Macros play on this computer while the service runs. The mouse itself is never changed.")
+                                RichText::new("Macros play on this computer while the service runs.")
                                     .font(sans(T_SMALL)).color(p.i65()),
                             ).truncate());
                         });
@@ -1175,10 +1175,11 @@ impl App {
                         ui.painter().add(Shape::Rect(RectShape::filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), R0, p.stamp_bg)));
                     }
                     ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.i18()));
-                    if is_sel && scroll_sel { ui.scroll_to_rect(rect, None); }
+                    if is_sel && scroll_sel { ui.scroll_to_rect(rect, Some(Align::Center)); }
                     let inner = Rect::from_min_max(pos2(rect.left() + S4, rect.top()), pos2(rect.right() - S3, rect.bottom()));
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
                     c.spacing_mut().item_spacing.y = 2.0;
+                    if narrow { c.spacing_mut().interact_size.y = 18.0; }
                     c.add_space(if narrow { 8.0 } else { 10.0 });
                     c.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
@@ -1197,12 +1198,9 @@ impl App {
                     let used_txt = if used.is_empty() { "UNUSED".to_string() } else { used.join("  /  ") };
                     let used_col = if used.is_empty() { p.i45() } else { p.i65() };
                     if narrow {
-                        // one meta line: what it is, then where it is used
-                        c.horizontal(|ui| {
-                            ui.spacing_mut().item_spacing.x = S3;
-                            ui.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
-                            ui.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
-                        });
+                        // one meta line: what it is, then where it is used (one label: a `horizontal` row would be as
+                        // tall as a button and push the line out of its 54 px)
+                        c.add(egui::Label::new(tracked(&format!("{detail}   → {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
                     } else {
                         c.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
                         c.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());

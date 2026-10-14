@@ -1772,10 +1772,16 @@ mod tests {
             let mut app = macro_app(Sub::Macros);
             let t = software(&mut app, size);
             let l = lines(&t);
-            for want in ["01 // MACROS", "02 // EDIT", "copy", "scroll", "NAME", "USED BY", "BACK · TOGGLE", "5 EVENTS · 0.05 S", "→ BACK · TOGGLE",
+            for want in ["01 // MACROS", "02 // EDIT", "copy", "scroll", "NAME", "USED BY", "BACK · TOGGLE",
                          "KEY ↓", "KEY ↑", "DELAY", "VALID", "5 events · about 0.05 s per run", "+ TAP KEY", "+ CLICK", "+ DELAY", "+ OTHER  ▾",
                          "SAVED"] {
                 assert!(l.iter().any(|s| s.ends_with(want)), "{size:?}: {want:?} not drawn: {l:?}");
+            }
+            // list row: two meta lines at full width, one combined line when the layout stacks (DAN-1452 note g)
+            if size.0 < 900.0 {
+                assert!(l.contains(&"5 EVENTS · 0.05 S   → BACK · TOGGLE"), "{size:?}: {l:?}");
+            } else {
+                assert!(l.contains(&"5 EVENTS · 0.05 S") && l.contains(&"→ BACK · TOGGLE"), "{size:?}: {l:?}");
             }
             assert!(l.contains(&"01") && l.contains(&"05") && !l.contains(&"06"), "{size:?}: one row per event");
             assert_eq!(save_macros_colour(&t), Some(app.pal.i45()), "{size:?}: Save is off while nothing changed");
@@ -1868,8 +1874,7 @@ mod tests {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         apply_style(&ctx, &app.pal);
-        let mut input = egui::RawInput::default();
-        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, TALL)));
+        let input = egui::RawInput { screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, TALL))), ..Default::default() };
         let mut drawn = Vec::new();
         for _ in 0..6 { // the scroll animates over a few frames
             let mut out = ctx.run_ui(input.clone(), |ui| { app.ui_software(ui); });
