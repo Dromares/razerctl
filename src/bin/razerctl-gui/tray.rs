@@ -491,7 +491,8 @@ pub struct Host {
 }
 
 impl Host {
-    /// Start the poller and try to put the icon up. A missing host is not an error: `probe` tries again at close time.
+    /// Start the poller and try to put the icon up (in the background). A missing host is not an error: `probe` tries
+    /// again at close time.
     pub fn start() -> Host {
         let (tx, rx) = mpsc::channel();
         let (poke_tx, poke_rx) = mpsc::channel();
@@ -509,7 +510,9 @@ impl Host {
             online: Arc::new(AtomicBool::new(true)),
             forced: None,
         };
-        host.try_spawn();
+        // off the main thread: registering with a slow or hung StatusNotifierWatcher must not hold up the window
+        let bg = host.clone();
+        std::thread::Builder::new().name("tray register".into()).spawn(move || { bg.try_spawn(); }).ok();
         let (shared, handle) = (host.shared.clone(), host.handle.clone());
         std::thread::Builder::new()
             .name("tray poller".into())
