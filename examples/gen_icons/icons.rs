@@ -6,15 +6,15 @@
 //!
 //! This file is shared by `examples/gen_icons/main.rs` (writes the files) and `tests/icons.rs` (asserts the committed
 //! files are byte-identical to what this produces). It is dev-time only: nothing under `src/` includes it.
-//! The numeric formatting reproduces the Python this was ported from (DAN-1480): `{:g}` is `%g` (6 significant
-//! digits, trailing zeros stripped) and `{:.2f}` is `%.2f`.
+//! The SVGs were originally written by a script using `%g` (6 significant digits, trailing zeros stripped) and
+//! `%.2f`; `g()` and the `{:.2}` calls below reproduce both exactly so the committed files stay byte-identical.
 
 use std::fmt::Write;
 
 const STYLE: &str =
     r#"<style type="text/css" id="current-color-scheme">.ColorScheme-Text{color:#232629}</style>"#;
 
-/// Python's `format(x, "g")`: 6 significant digits, fixed notation for exponents -4..=5, trailing zeros stripped.
+/// C `%g`: 6 significant digits, fixed notation for exponents -4..=5, trailing zeros stripped.
 pub fn g(x: f64) -> String {
     if x == 0.0 {
         return if x.is_sign_negative() { "-0" } else { "0" }.into();

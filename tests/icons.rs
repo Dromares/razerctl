@@ -23,8 +23,8 @@ fn committed_svgs_match_the_generator() {
 }
 
 #[test]
-fn g_matches_python_format_g() {
-    // Expected strings are Python's `format(x, "g")`.
+fn g_matches_printf_g() {
+    // Expected strings are what `%g` prints (checked against the interpreter that wrote the committed SVGs).
     let cases: &[(f64, &str)] = &[
         (0.0, "0"),
         (-0.0, "-0"),
@@ -51,8 +51,8 @@ fn g_matches_python_format_g() {
 }
 
 #[test]
-fn fixed_two_decimals_round_like_python() {
-    // Python's `f"{x:.2f}"` rounds the exact binary value half-to-even; 0.125 and 0.375 are exact ties.
+fn fixed_two_decimals_round_like_printf() {
+    // `%.2f` rounds the exact binary value half-to-even; 0.125 and 0.375 are exact ties.
     let cases: &[(f64, &str)] = &[
         (0.125, "0.12"),
         (0.375, "0.38"),
