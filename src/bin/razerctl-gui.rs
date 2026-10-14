@@ -1261,7 +1261,7 @@ mod tests {
     use eframe::egui::epaint::Shape as EShape;
     use razerctl::macros;
 
-    fn test_app() -> App {
+    pub(super) fn test_app() -> App {
         App {
             tab: Tab::Buttons,
             status: String::new(),
@@ -1343,7 +1343,7 @@ mod tests {
     const RULES: &str = "# rules\nback = macro:copy,toggle\nforward = macro:scroll,held\nmiddle = ctrl+c\n";
 
     /// A device present, the service running, `MACROS` loaded and `RULES` in the rules editor.
-    fn macro_app(sub: Sub) -> App {
+    pub(super) fn macro_app(sub: Sub) -> App {
         let mut app = test_app();
         with_device(&mut app);
         app.service_state = "active".into();

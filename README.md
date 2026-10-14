@@ -103,6 +103,11 @@ up ctrl
 Events: `down`/`up`/`tap KEY`, `click BUTTON`, `delay MS`, `wheel N`, `hwheel N`, `move DX DY`.
 Like Synapse, playback adds a 3 ms pause after every 5th event and 20 ms at the end.
 
+`razerctl-gui` edits the same two files on its Software remap tab: **Macros** is a list plus an event table
+(saved to `macros.conf`; saving rewrites the file, so comments in it are not kept, and renaming a macro rewrites
+its `macro:` rules in `remap.conf` in the same save), and **Rules** has an *Add a rule* strip that appends one
+line to the rules text. A rule that names a macro that does not exist blocks *Save config*.
+
 ```
 razerctl macros                          # list: events and run time
 razerctl macros show copy                # one macro, canonical form

@@ -1221,6 +1221,7 @@ impl App {
                     });
                 });
                 ui.add_space(S1);
+                let roomy = ui.available_width() > 760.0;
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = S2;
                     ui.label(caps(&p, "Used by"));
@@ -1230,7 +1231,8 @@ impl App {
                     for u in &used {
                         chip(ui, &p, None, u, ChipStyle::Outline, p.i100());
                     }
-                    if !used.is_empty() {
+                    // the caption goes first when the panel is narrow, or the Bind button would be pushed out of it
+                    if !used.is_empty() && roomy {
                         ui.label(RichText::new("Renaming updates these rules in the config.").font(sans(T_SMALL)).color(p.i65()));
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -1335,7 +1337,16 @@ impl App {
                 });
             });
             ui.add_space(S2);
-            // --- add bar (left) + validity and run time (right)
+            // --- add bar (left) + validity and run time (right; under the buttons when the panel is narrow)
+            let stack_bar = w < 800.0;
+            let validity = |ui: &mut Ui| {
+                if issues.is_empty() {
+                    chip(ui, &p, Some("●"), "Valid", ChipStyle::Plain, p.ok);
+                    ui.label(RichText::new(format!("{} events · about {} per run", n_events, fmt_s(run_ms))).font(mono(T_DATA)).color(p.i100()));
+                } else {
+                    chip(ui, &p, Some("×"), &format!("{} problem{}", issues.len(), if issues.len() == 1 { "" } else { "s" }), ChipStyle::Plain, p.bad);
+                }
+            };
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = S2;
                 ui.label(caps(&p, "Add"));
@@ -1363,14 +1374,15 @@ impl App {
                         if ui.button(l).clicked() { act = Act::Add(vec![ev]); }
                     }
                 });
-                ui.add_space(S3);
-                if issues.is_empty() {
-                    chip(ui, &p, Some("●"), "Valid", ChipStyle::Plain, p.ok);
-                    ui.label(RichText::new(format!("{} events · about {} per run", d.events.len(), fmt_s(run_ms))).font(mono(T_DATA)).color(p.i100()));
-                } else {
-                    chip(ui, &p, Some("×"), &format!("{} problem{}", issues.len(), if issues.len() == 1 { "" } else { "s" }), ChipStyle::Plain, p.bad);
+                if !stack_bar {
+                    ui.add_space(S3);
+                    validity(ui);
                 }
             });
+            if stack_bar {
+                ui.add_space(S1);
+                ui.horizontal(validity);
+            }
             // --- problems
             if !issues.is_empty() {
                 ui.add_space(S3);
@@ -1718,5 +1730,51 @@ mod tests {
         let m = ui_with(&["a", "a-2"]);
         assert_eq!(m.free_name("a"), "a-3");
         assert_eq!(m.free_name("b"), "b");
+    }
+
+    // ---- the editor's clicks, applied to a whole App
+
+    #[test]
+    fn row_controls_reorder_remove_and_insert_after_the_selection() {
+        let mut app = crate::tests::macro_app(Sub::Macros);
+        let first = app.mac.drafts[0].events.clone(); // copy: down ctrl, delay, down c, up c, up ctrl
+        app.apply(Act::Down(0));
+        assert_eq!(app.mac.drafts[0].events[1], first[0]);
+        assert_eq!(app.mac.sel_ev, 1, "the selection follows the row");
+        app.apply(Act::Up(1));
+        assert_eq!(app.mac.drafts[0].events, first);
+        app.apply(Act::Up(0)); // already first: nothing
+        app.apply(Act::Down(4)); // already last: nothing
+        assert_eq!(app.mac.drafts[0].events, first);
+        app.apply(Act::Remove(1));
+        assert_eq!(app.mac.drafts[0].events.len(), 4);
+        app.mac.sel_ev = 0;
+        app.apply(Act::Add(vec![Ev::Delay(50)]));
+        assert_eq!(app.mac.drafts[0].events[1], Ev::Delay(50));
+        assert!(app.mac.dirty());
+        app.apply(Act::Revert);
+        assert_eq!(app.mac.drafts[0].events, first);
+        assert!(!app.mac.dirty() && !app.status_is_error);
+    }
+
+    #[test]
+    fn delete_buttons_and_bind_to_a_button() {
+        let mut app = crate::tests::macro_app(Sub::Macros);
+        app.request_delete();
+        assert!(app.mac.confirm_delete);
+        app.apply(Act::CancelDelete);
+        assert!(!app.mac.confirm_delete && app.mac.drafts.len() == 2);
+        app.mac.confirm_delete = true;
+        app.apply(Act::DeleteMacro { with_rules: false });
+        assert_eq!(app.mac.drafts.len(), 1);
+        assert!(app.status_is_error, "the orphaned rule is called out");
+        assert_eq!(app.mac.dangling(&app.conf_text), [(2, "copy".to_string())]);
+        app.apply(Act::Revert);
+        assert_eq!(app.mac.drafts.len(), 2);
+        app.apply(Act::Duplicate);
+        assert_eq!((app.mac.drafts.len(), app.mac.drafts[app.mac.sel].name.as_str()), (3, "copy-copy"));
+        app.mac.sel = 0;
+        app.apply(Act::BindTo);
+        assert_eq!((app.mac.sub, app.mac.bind.does, app.mac.bind.macro_name.as_str()), (Sub::Rules, DOES_MACRO, "copy"));
     }
 }
