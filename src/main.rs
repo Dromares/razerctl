@@ -63,11 +63,17 @@ fn parse_u8(s: &str) -> Result<u8, String> {
 /// The macros `remap` needs: None if the mapping has no macro:NAME (the file isn't read),
 /// else the loaded file with every referenced name present. Runs before any grab.
 fn remap_macros(map: &remap::Mapping, file: &Path) -> Result<Option<macros::Macros>, String> {
-    if !map.values().any(|a| matches!(a, remap::Action::Macro { .. })) {
+    if !map
+        .values()
+        .any(|a| matches!(a, remap::Action::Macro { .. }))
+    {
         return Ok(None);
     }
     if !file.exists() {
-        return Err(format!("{}: not found (the mapping uses macro:NAME; create it or pass --macros FILE)", file.display()));
+        return Err(format!(
+            "{}: not found (the mapping uses macro:NAME; create it or pass --macros FILE)",
+            file.display()
+        ));
     }
     let m = macros::load_macros(file)?;
     remap::check_macros(map, &m).map_err(|e| format!("{}: {e}", file.display()))?;
@@ -77,7 +83,8 @@ fn remap_macros(map: &remap::Mapping, file: &Path) -> Result<Option<macros::Macr
 /// `macros [list|show NAME|check|play NAME --dry-run]`. Reads text files only, never a device.
 /// A missing default file means "no macros"/"no remap rules"; a missing explicit one is an error.
 fn macros_cmd(args: &[String]) -> Result<(), String> {
-    let (mut file, mut cfg, mut dry, mut pos) = (None::<PathBuf>, None::<PathBuf>, false, Vec::new());
+    let (mut file, mut cfg, mut dry, mut pos) =
+        (None::<PathBuf>, None::<PathBuf>, false, Vec::new());
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -107,7 +114,10 @@ fn macros_cmd(args: &[String]) -> Result<(), String> {
         return Err(format!("{}: not found", file.display()));
     }
     let m = macros::load_macros(&file)?;
-    let get = |name: &str| m.get(name).ok_or_else(|| format!("no macro '{name}' in {}", file.display()));
+    let get = |name: &str| {
+        m.get(name)
+            .ok_or_else(|| format!("no macro '{name}' in {}", file.display()))
+    };
     match pos.as_slice() {
         [] | ["list"] => {
             if m.is_empty() { eprintln!("no macros in {}", file.display()); }
@@ -156,14 +166,20 @@ struct Fail {
 
 impl Fail {
     fn config(msg: impl Into<String>) -> Fail {
-        Fail { msg: msg.into(), code: EXIT_CONFIG }
+        Fail {
+            msg: msg.into(),
+            code: EXIT_CONFIG,
+        }
     }
 }
 
 /// Any other error text is a plain exit-1 failure, so `?` on a `String` / `&str` error keeps working.
 impl<S: Into<String>> From<S> for Fail {
     fn from(msg: S) -> Fail {
-        Fail { msg: msg.into(), code: 1 }
+        Fail {
+            msg: msg.into(),
+            code: 1,
+        }
     }
 }
 
@@ -189,7 +205,11 @@ fn run() -> Result<(), Fail> {
                 args.drain(i..i + 2);
             }
             "-d" => {
-                idx = args.get(i + 1).ok_or("-d needs a value")?.parse().map_err(|e| format!("{e}"))?;
+                idx = args
+                    .get(i + 1)
+                    .ok_or("-d needs a value")?
+                    .parse()
+                    .map_err(|e| format!("{e}"))?;
                 args.drain(i..i + 2);
             }
             "-h" | "--help" => {
@@ -216,7 +236,9 @@ fn run() -> Result<(), Fail> {
                 "--map" => inline.push(it.next().ok_or("--map needs FROM=TO")?.clone()),
                 "--config" => cfg = it.next().ok_or("--config needs a path")?.into(),
                 "--device" => filter = Some(it.next().ok_or("--device needs a name")?.clone()),
-                "--macros" if command == "remap" => mfile = it.next().ok_or("--macros needs a path")?.into(),
+                "--macros" if command == "remap" => {
+                    mfile = it.next().ok_or("--macros needs a path")?.into()
+                }
                 o => return Err(format!("unexpected argument '{o}'").into()),
             }
         }
@@ -229,7 +251,9 @@ fn run() -> Result<(), Fail> {
         };
         if command == "buttons" {
             let sources = sources()?;
-            for s in &sources { eprintln!("watching {} ({})", s.path.display(), s.name); }
+            for s in &sources {
+                eprintln!("watching {} ({})", s.path.display(), s.name);
+            }
             eprintln!("press buttons; Ctrl+C to stop");
             return remap::watch(&sources).map_err(|e| e.to_string().into());
         }
@@ -243,7 +267,9 @@ fn run() -> Result<(), Fail> {
             return Err(Fail::config("no remap rules"));
         }
         let macros = remap_macros(&map, &mfile).map_err(Fail::config)?;
-        for (k, v) in &map { eprintln!("  {k:?} -> {v:?}"); }
+        for (k, v) in &map {
+            eprintln!("  {k:?} -> {v:?}");
+        }
         let sources = sources()?;
         return match macros {
             Some(m) => remap::run_with_macros(sources, map, m),
@@ -261,24 +287,49 @@ fn run() -> Result<(), Fail> {
     }
     if command == "battery-notify-test" {
         let (name, pct, _) = battery::read_battery().unwrap_or(("Razer mouse".into(), 0, false));
-        return battery::notify(&format!("{name}: test notification"), &format!("Battery is at {pct}%. Low-battery alerts will look like this."), false)
-            .map_err(|e| Fail::from(format!("couldn't send notification: {e}")));
+        return battery::notify(
+            &format!("{name}: test notification"),
+            &format!("Battery is at {pct}%. Low-battery alerts will look like this."),
+            false,
+        )
+        .map_err(|e| Fail::from(format!("couldn't send notification: {e}")));
     }
 
     if command == "list" {
-        for (i, n) in hidraw::enumerate().map_err(|e| e.to_string())?.iter().enumerate() {
+        for (i, n) in hidraw::enumerate()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .enumerate()
+        {
             println!(
                 "  iface  {} {:04x}:{:04x} if={} feature={} {}",
-                n.dev.display(), n.vid, n.pid,
+                n.dev.display(),
+                n.vid,
+                n.pid,
                 n.interface.map(|v| v.to_string()).unwrap_or("?".into()),
-                n.has_feature_reports, n.name
+                n.has_feature_reports,
+                n.name
             );
             let _ = i;
         }
-        for (i, (node, b)) in device::open_all(prefer, tid).map_err(|e| e.to_string())?.iter().enumerate() {
+        for (i, (node, b)) in device::open_all(prefer, tid)
+            .map_err(|e| e.to_string())?
+            .iter()
+            .enumerate()
+        {
             match b {
-                Ok(b) => println!("[{i}] {} via {} ({})", b.name(), b.kind(), b.path().display()),
-                Err(e) => println!("[{i}] {:04x}:{:04x} {} — unavailable: {e}", node.vid, node.pid, node.dev.display()),
+                Ok(b) => println!(
+                    "[{i}] {} via {} ({})",
+                    b.name(),
+                    b.kind(),
+                    b.path().display()
+                ),
+                Err(e) => println!(
+                    "[{i}] {:04x}:{:04x} {} — unavailable: {e}",
+                    node.vid,
+                    node.pid,
+                    node.dev.display()
+                ),
             }
         }
         return Ok(());
@@ -295,7 +346,9 @@ fn run() -> Result<(), Fail> {
     let dev: Box<dyn Backend> = dev.map_err(|e| {
         let hint = if e.kind() == std::io::ErrorKind::PermissionDenied {
             " — install udev/70-razerctl.rules or use --backend openrazer"
-        } else { "" };
+        } else {
+            ""
+        };
         format!("{}: {e}{hint}", node.dev.display())
     })?;
     let e = |e: std::io::Error| e.to_string();
@@ -303,28 +356,64 @@ fn run() -> Result<(), Fail> {
     match command.as_str() {
         "info" => {
             let i = dev.info();
-            println!("Device:      {}  [{} {}]", i.name, dev.kind(), dev.path().display());
-            let show = |k: &str, v: Option<String>| println!("{k:<12} {}", v.unwrap_or_else(|| "n/a".into()));
+            println!(
+                "Device:      {}  [{} {}]",
+                i.name,
+                dev.kind(),
+                dev.path().display()
+            );
+            let show = |k: &str, v: Option<String>| {
+                println!("{k:<12} {}", v.unwrap_or_else(|| "n/a".into()))
+            };
             show("Firmware:", i.firmware);
             show("Serial:", i.serial);
             show("DPI:", i.dpi.map(|(x, y)| format!("{x} x {y}")));
-            show("DPI stages:", i.dpi_stages.map(|s| {
-                s.stages.iter().enumerate()
-                    .map(|(n, (x, y))| {
-                        let mark = if n + 1 == s.active as usize { "*" } else { "" };
-                        if x == y { format!("{mark}{x}") } else { format!("{mark}{x}x{y}") }
-                    })
-                    .collect::<Vec<_>>().join(" ")
-            }));
+            show(
+                "DPI stages:",
+                i.dpi_stages.map(|s| {
+                    s.stages
+                        .iter()
+                        .enumerate()
+                        .map(|(n, (x, y))| {
+                            let mark = if n + 1 == s.active as usize { "*" } else { "" };
+                            if x == y {
+                                format!("{mark}{x}")
+                            } else {
+                                format!("{mark}{x}x{y}")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                }),
+            );
             show("Poll rate:", i.poll_rate.map(|p| format!("{p} Hz")));
-            show("Battery:", i.battery_pct.map(|p| format!(
-                "{p}%{}", match i.charging { Some(true) => " (charging)", Some(false) => "", None => "" })));
+            show(
+                "Battery:",
+                i.battery_pct.map(|p| {
+                    format!(
+                        "{p}%{}",
+                        match i.charging {
+                            Some(true) => " (charging)",
+                            Some(false) => "",
+                            None => "",
+                        }
+                    )
+                }),
+            );
         }
         "dpi" => match rest {
-            [] => { let (x, y) = dev.dpi().map_err(e)?; println!("{x} {y}"); }
+            [] => {
+                let (x, y) = dev.dpi().map_err(e)?;
+                println!("{x} {y}");
+            }
             [x] | [x, _] => {
                 let x: u16 = x.parse().map_err(|_| "DPI must be a number")?;
-                let y: u16 = rest.get(1).map(|y| y.parse()).transpose().map_err(|_| "DPI must be a number")?.unwrap_or(x);
+                let y: u16 = rest
+                    .get(1)
+                    .map(|y| y.parse())
+                    .transpose()
+                    .map_err(|_| "DPI must be a number")?
+                    .unwrap_or(x);
                 dev.set_dpi(x, y).map_err(e)?;
                 let (rx, ry) = dev.dpi().map_err(e)?;
                 println!("DPI set: {rx} {ry}");
@@ -334,14 +423,18 @@ fn run() -> Result<(), Fail> {
         "poll" => match rest {
             [] => println!("{}", dev.poll_rate().map_err(e)?),
             [hz] => {
-                dev.set_poll_rate(hz.parse().map_err(|_| "poll rate must be a number")?).map_err(e)?;
+                dev.set_poll_rate(hz.parse().map_err(|_| "poll rate must be a number")?)
+                    .map_err(e)?;
                 println!("Poll rate set: {} Hz", dev.poll_rate().map_err(e)?);
             }
             _ => return Err("usage: poll [HZ]".into()),
         },
         "battery" => {
             let pct = device::raw_to_pct(dev.battery_raw().map_err(e)?);
-            let ch = dev.charging().map(|c| if c { " (charging)" } else { "" }).unwrap_or("");
+            let ch = dev
+                .charging()
+                .map(|c| if c { " (charging)" } else { "" })
+                .unwrap_or("");
             println!("{pct}%{ch}");
         }
         "onboard" => {
@@ -350,15 +443,30 @@ fn run() -> Result<(), Fail> {
             if rest.first().map(|s| s.as_str()) == Some("set") {
                 let hyper = rest.iter().any(|s| s == "--hypershift");
                 let pos: Vec<&String> = rest[1..].iter().filter(|s| !s.starts_with("--")).collect();
-                if pos.len() != 2 { return Err("usage: onboard set BUTTON ACTION [--hypershift]".into()); }
+                if pos.len() != 2 {
+                    return Err("usage: onboard set BUTTON ACTION [--hypershift]".into());
+                }
                 let button = onboard::parse_button(pos[0])?;
-                if button == 1 { return Err("refusing to remap the left button (you could lose your only way to click)".into()); }
+                if button == 1 {
+                    return Err(
+                        "refusing to remap the left button (you could lose your only way to click)"
+                            .into(),
+                    );
+                }
                 let want = onboard::parse_action(button, pos[1])?;
-                let mode = if hyper { onboard::MODE_HYPERSHIFT } else { onboard::MODE_NORMAL };
+                let mode = if hyper {
+                    onboard::MODE_HYPERSHIFT
+                } else {
+                    onboard::MODE_NORMAL
+                };
                 let profiles = ob.profile_ids().map_err(e)?;
                 let profile = *profiles.first().ok_or("mouse reports no onboard profile")?;
                 let before = ob.assignment(profile, button, mode).map_err(e)?;
-                println!("{} (profile {profile}, {}): {before}  ->  {want}", onboard::button_name(button), if hyper { "hypershift" } else { "normal" });
+                println!(
+                    "{} (profile {profile}, {}): {before}  ->  {want}",
+                    onboard::button_name(button),
+                    if hyper { "hypershift" } else { "normal" }
+                );
                 let got = ob.set_assignment(profile, mode, &want).map_err(e)?;
                 println!("saved to mouse; read back: {got}");
                 return Ok(());
@@ -366,9 +474,19 @@ fn run() -> Result<(), Fail> {
             let profiles = ob.profile_ids().map_err(e)?;
             let buttons = ob.button_ids().map_err(e)?;
             println!("Onboard profiles: {profiles:?}");
-            println!("Buttons:          {}", buttons.iter().map(|&b| onboard::button_name(b)).collect::<Vec<_>>().join(", "));
+            println!(
+                "Buttons:          {}",
+                buttons
+                    .iter()
+                    .map(|&b| onboard::button_name(b))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
             for &p in &profiles {
-                for (mode, label) in [(onboard::MODE_NORMAL, "normal"), (onboard::MODE_HYPERSHIFT, "hypershift")] {
+                for (mode, label) in [
+                    (onboard::MODE_NORMAL, "normal"),
+                    (onboard::MODE_HYPERSHIFT, "hypershift"),
+                ] {
                     println!("\nProfile {p}, {label} layer:");
                     for a in ob.assignments(p, &buttons, mode).map_err(e)? {
                         let tag = if a.is_default() { "" } else { "   <- changed" };
@@ -381,7 +499,9 @@ fn run() -> Result<(), Fail> {
             if dev.kind() != "hidraw" {
                 return Err("raw needs --backend hidraw".into());
             }
-            if rest.len() < 3 { return Err("usage: raw CLASS ID SIZE [ARGS..]".into()); }
+            if rest.len() < 3 {
+                return Err("usage: raw CLASS ID SIZE [ARGS..]".into());
+            }
             let b: Vec<u8> = rest.iter().map(|s| parse_u8(s)).collect::<Result<_, _>>()?;
             let h = hidraw::Hidraw::open(&node.dev).map_err(e)?;
             let req = protocol::Report::new((b[0], b[1]), b[2], tid).with_args(&b[3..]);
@@ -416,11 +536,17 @@ mod tests {
         let uses = remap::parse_config("back = macro:copy,held").unwrap();
         // no macro actions: the file is never needed
         assert_eq!(remap_macros(&plain, &file), Ok(None));
-        assert!(remap_macros(&uses, &file).unwrap_err().contains("not found"));
+        assert!(remap_macros(&uses, &file)
+            .unwrap_err()
+            .contains("not found"));
         std::fs::write(&file, "[other]\ntap a\n").unwrap();
-        assert!(remap_macros(&uses, &file).unwrap_err().ends_with("undefined macro 'copy'"));
+        assert!(remap_macros(&uses, &file)
+            .unwrap_err()
+            .ends_with("undefined macro 'copy'"));
         std::fs::write(&file, "[copy]\ndown a\n").unwrap();
-        assert!(remap_macros(&uses, &file).unwrap_err().contains("leaves KEY_A pressed"));
+        assert!(remap_macros(&uses, &file)
+            .unwrap_err()
+            .contains("leaves KEY_A pressed"));
         std::fs::write(&file, "[copy]\ntap ctrl\n").unwrap();
         assert_eq!(remap_macros(&uses, &file).unwrap().unwrap().len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

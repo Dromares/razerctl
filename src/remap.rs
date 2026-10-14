@@ -111,18 +111,30 @@ fn parse_macro_action(s: &str) -> Result<Action, String> {
     let name = name.trim();
     let ok = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == '-';
     if name.is_empty() || name.len() > macros::MAX_NAME || !name.chars().all(ok) {
-        return Err(format!("bad macro name '{name}' (macro:NAME[,once|xN|held|toggle])"));
+        return Err(format!(
+            "bad macro name '{name}' (macro:NAME[,once|xN|held|toggle])"
+        ));
     }
     let m = mode.trim().to_ascii_lowercase();
-    let times = m.strip_prefix('x').filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
+    let times = m
+        .strip_prefix('x')
+        .filter(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()));
     let mode = match (m.as_str(), times.and_then(|n| n.parse::<u32>().ok())) {
         ("once", _) => Playback::Once,
         ("held", _) => Playback::Held,
         ("toggle", _) => Playback::Toggle,
         (_, Some(n @ 1..=MAX_TIMES)) => Playback::Times(n),
-        _ => return Err(format!("bad macro mode '{}' (once, x1 to x{MAX_TIMES}, held, toggle)", mode.trim())),
+        _ => {
+            return Err(format!(
+                "bad macro mode '{}' (once, x1 to x{MAX_TIMES}, held, toggle)",
+                mode.trim()
+            ))
+        }
     };
-    Ok(Action::Macro { name: name.into(), mode })
+    Ok(Action::Macro {
+        name: name.into(),
+        mode,
+    })
 }
 
 /// Config format, one rule per line:   SOURCE = ACTION     (# comments allowed)
@@ -150,7 +162,9 @@ pub fn parse_config(text: &str) -> Result<Mapping, String> {
 pub fn config_path() -> PathBuf {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config"));
+        .unwrap_or_else(|| {
+            PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".config")
+        });
     base.join("razerctl/remap.conf")
 }
 
@@ -172,12 +186,28 @@ pub fn translate(map: &Mapping, ev: &InputEvent) -> Vec<InputEvent> {
             }
             let mut out = Vec::new();
             if *y != 0 {
-                out.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL.0, *y));
-                out.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_WHEEL_HI_RES.0, *y * 120));
+                out.push(InputEvent::new(
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_WHEEL.0,
+                    *y,
+                ));
+                out.push(InputEvent::new(
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_WHEEL_HI_RES.0,
+                    *y * 120,
+                ));
             }
             if *x != 0 {
-                out.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_HWHEEL.0, *x));
-                out.push(InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_HWHEEL_HI_RES.0, *x * 120));
+                out.push(InputEvent::new(
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_HWHEEL.0,
+                    *x,
+                ));
+                out.push(InputEvent::new(
+                    EventType::RELATIVE.0,
+                    RelativeAxisCode::REL_HWHEEL_HI_RES.0,
+                    *x * 120,
+                ));
             }
             out
         }
@@ -218,7 +248,9 @@ impl Sink for Recorder {
 }
 
 fn emit(sink: &Mutex<dyn Sink>, frame: &[InputEvent]) -> io::Result<()> {
-    sink.lock().unwrap_or_else(PoisonError::into_inner).emit(frame)
+    sink.lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .emit(frame)
 }
 
 /// `runs` passes of `steps` (None = until stopped). Keys/buttons go into `held` before
@@ -264,7 +296,12 @@ fn play_runs(
 
 /// Worker body: play, then release whatever is still down (stopped early or sink error),
 /// one frame per code, in reverse press order. A redundant up is dropped by the kernel.
-fn play(sink: &Mutex<dyn Sink>, steps: &[Step], runs: Option<u32>, stop: &mpsc::Receiver<()>) -> io::Result<()> {
+fn play(
+    sink: &Mutex<dyn Sink>,
+    steps: &[Step],
+    runs: Option<u32>,
+    stop: &mpsc::Receiver<()>,
+) -> io::Result<()> {
     let mut held = Vec::new();
     let r = play_runs(sink, steps, runs, stop, &mut held);
     let mut rel = Ok(());
@@ -294,7 +331,11 @@ impl Player {
             .into_iter()
             .map(|(name, m)| (name, Arc::new(macros::to_steps(&macros::pad(&m.events)))))
             .collect();
-        Player { sink, steps, running: HashMap::new() }
+        Player {
+            sink,
+            steps,
+            running: HashMap::new(),
+        }
     }
 
     /// Physical press of `button` bound to macro `name` with `mode`.
@@ -328,14 +369,25 @@ impl Player {
         });
         match worker {
             Ok(handle) => {
-                self.running.insert(button, Worker { mode, stop: tx, handle });
+                self.running.insert(
+                    button,
+                    Worker {
+                        mode,
+                        stop: tx,
+                        handle,
+                    },
+                );
             }
             Err(e) => eprintln!("{tag}: {e}"),
         }
     }
 
     pub fn release(&mut self, button: KeyCode) {
-        if self.running.get(&button).is_some_and(|w| w.mode == Playback::Held) {
+        if self
+            .running
+            .get(&button)
+            .is_some_and(|w| w.mode == Playback::Held)
+        {
             self.stop(button);
         }
     }
@@ -360,7 +412,9 @@ impl Player {
     }
 
     pub fn is_running(&self, button: KeyCode) -> bool {
-        self.running.get(&button).is_some_and(|w| !w.handle.is_finished())
+        self.running
+            .get(&button)
+            .is_some_and(|w| !w.handle.is_finished())
     }
 }
 
@@ -417,13 +471,18 @@ pub fn install_stop_all_handler() -> io::Result<()> {
 /// released, and remapping carries on. A request already pending from the startup window is served immediately.
 fn watch_stop_all(player: Arc<Mutex<Player>>) -> io::Result<()> {
     install_stop_all_handler()?;
-    thread::Builder::new().name("stop-all".into()).spawn(move || loop {
-        if STOP_ALL_REQUESTED.swap(false, Ordering::SeqCst) {
-            player.lock().unwrap_or_else(PoisonError::into_inner).stop_all();
-            eprintln!("stopped all macros (SIGUSR1)");
-        }
-        thread::sleep(std::time::Duration::from_millis(20));
-    })?;
+    thread::Builder::new()
+        .name("stop-all".into())
+        .spawn(move || loop {
+            if STOP_ALL_REQUESTED.swap(false, Ordering::SeqCst) {
+                player
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .stop_all();
+                eprintln!("stopped all macros (SIGUSR1)");
+            }
+            thread::sleep(std::time::Duration::from_millis(20));
+        })?;
     Ok(())
 }
 
@@ -440,7 +499,11 @@ pub fn check_macros(map: &Mapping, macros: &macros::Macros) -> Result<(), String
         return Ok(());
     }
     let list: Vec<String> = missing.iter().map(|n| format!("'{n}'")).collect();
-    Err(format!("undefined macro{} {}", if list.len() == 1 { "" } else { "s" }, list.join(", ")))
+    Err(format!(
+        "undefined macro{} {}",
+        if list.len() == 1 { "" } else { "s" },
+        list.join(", ")
+    ))
 }
 
 pub struct Source {
@@ -454,7 +517,10 @@ pub fn find_sources(filter: Option<&str>) -> io::Result<Vec<Source>> {
     let mut out = Vec::new();
     for e in fs::read_dir("/dev/input")?.flatten() {
         let p = e.path();
-        if !p.file_name().map_or(false, |n| n.to_string_lossy().starts_with("event")) {
+        if !p
+            .file_name()
+            .map_or(false, |n| n.to_string_lossy().starts_with("event"))
+        {
             continue;
         }
         let Ok(d) = RawDevice::open(&p) else { continue };
@@ -468,7 +534,10 @@ pub fn find_sources(filter: Option<&str>) -> io::Result<Vec<Source>> {
             None => is_razer,
         };
         // only nodes that can produce buttons/keys are interesting
-        if ok && d.supported_keys().map_or(false, |k| k.iter().next().is_some()) {
+        if ok
+            && d.supported_keys()
+                .map_or(false, |k| k.iter().next().is_some())
+        {
             out.push(Source { path: p, name });
         }
     }
@@ -506,7 +575,11 @@ pub fn run(sources: Vec<Source>, map: Mapping) -> io::Result<()> {
 
 /// `run`, but with macros: check_macros first, then grab and forward, playing macro
 /// buttons through the same uinput device.
-pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macros) -> io::Result<()> {
+pub fn run_with_macros(
+    sources: Vec<Source>,
+    map: Mapping,
+    macros: macros::Macros,
+) -> io::Result<()> {
     if let Err(e) = install_stop_all_handler() {
         eprintln!("SIGUSR1 (stop all macros) unavailable: {e}");
     }
@@ -523,7 +596,8 @@ pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macro
         if let Some(r) = d.supported_relative_axes() {
             r.iter().for_each(|c| rels.insert(c));
         }
-        d.grab().map_err(|e| io::Error::new(e.kind(), format!("grab {}: {e}", s.path.display())))?;
+        d.grab()
+            .map_err(|e| io::Error::new(e.kind(), format!("grab {}: {e}", s.path.display())))?;
         eprintln!("grabbed {} ({})", s.path.display(), s.name);
         devs.push(d);
     }
@@ -531,8 +605,12 @@ pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macro
         match a {
             Action::Keys(ks) => ks.iter().for_each(|k| keys.insert(*k)),
             Action::Scroll(..) => {
-                for r in [RelativeAxisCode::REL_WHEEL, RelativeAxisCode::REL_WHEEL_HI_RES,
-                          RelativeAxisCode::REL_HWHEEL, RelativeAxisCode::REL_HWHEEL_HI_RES] {
+                for r in [
+                    RelativeAxisCode::REL_WHEEL,
+                    RelativeAxisCode::REL_WHEEL_HI_RES,
+                    RelativeAxisCode::REL_HWHEEL,
+                    RelativeAxisCode::REL_HWHEEL_HI_RES,
+                ] {
                     rels.insert(r);
                 }
             }
@@ -586,7 +664,10 @@ pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macro
                     }
                 })();
                 // unplug / sleep: release whatever the macros hold before the error ends the daemon
-                player.lock().unwrap_or_else(PoisonError::into_inner).stop_all();
+                player
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .stop_all();
                 r
             })
         })
@@ -603,7 +684,12 @@ pub fn load_mapping(path: &Path, inline: &[String]) -> Result<Mapping, String> {
         match fs::read_to_string(path) {
             Ok(t) => parse_config(&t).map_err(|e| format!("{}: {e}", path.display()))?,
             Err(_) if !inline.is_empty() => Mapping::new(),
-            Err(e) => return Err(format!("{}: {e} (create it or pass --map FROM=TO)", path.display())),
+            Err(e) => {
+                return Err(format!(
+                    "{}: {e} (create it or pass --map FROM=TO)",
+                    path.display()
+                ))
+            }
         }
     } else {
         Mapping::new()
@@ -624,8 +710,14 @@ mod tests {
 
     #[test]
     fn parses_config_with_aliases() {
-        let m = parse_config("# c\nback = ctrl+c\nforward=KEY_F13\n middle = disable \nBTN_RIGHT = scroll_up\n").unwrap();
-        assert_eq!(m[&KeyCode::BTN_SIDE], Action::Keys(vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_C]));
+        let m = parse_config(
+            "# c\nback = ctrl+c\nforward=KEY_F13\n middle = disable \nBTN_RIGHT = scroll_up\n",
+        )
+        .unwrap();
+        assert_eq!(
+            m[&KeyCode::BTN_SIDE],
+            Action::Keys(vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_C])
+        );
         assert_eq!(m[&KeyCode::BTN_EXTRA], Action::Keys(vec![KeyCode::KEY_F13]));
         assert_eq!(m[&KeyCode::BTN_MIDDLE], Action::Disable);
         assert_eq!(m[&KeyCode::BTN_RIGHT], Action::Scroll(1, 0));
@@ -638,9 +730,26 @@ mod tests {
         let m = parse_config("back = ctrl+shift+t").unwrap();
         let down = translate(&m, &key(KeyCode::BTN_SIDE, 1));
         let codes: Vec<_> = down.iter().map(|e| (e.code(), e.value())).collect();
-        assert_eq!(codes, vec![(KeyCode::KEY_LEFTCTRL.0, 1), (KeyCode::KEY_LEFTSHIFT.0, 1), (KeyCode::KEY_T.0, 1)]);
-        let up: Vec<_> = translate(&m, &key(KeyCode::BTN_SIDE, 0)).iter().map(|e| (e.code(), e.value())).collect();
-        assert_eq!(up, vec![(KeyCode::KEY_T.0, 0), (KeyCode::KEY_LEFTSHIFT.0, 0), (KeyCode::KEY_LEFTCTRL.0, 0)]);
+        assert_eq!(
+            codes,
+            vec![
+                (KeyCode::KEY_LEFTCTRL.0, 1),
+                (KeyCode::KEY_LEFTSHIFT.0, 1),
+                (KeyCode::KEY_T.0, 1)
+            ]
+        );
+        let up: Vec<_> = translate(&m, &key(KeyCode::BTN_SIDE, 0))
+            .iter()
+            .map(|e| (e.code(), e.value()))
+            .collect();
+        assert_eq!(
+            up,
+            vec![
+                (KeyCode::KEY_T.0, 0),
+                (KeyCode::KEY_LEFTSHIFT.0, 0),
+                (KeyCode::KEY_LEFTCTRL.0, 0)
+            ]
+        );
     }
 
     #[test]
@@ -654,7 +763,10 @@ mod tests {
     }
 
     fn mac(name: &str, mode: Playback) -> Action {
-        Action::Macro { name: name.into(), mode }
+        Action::Macro {
+            name: name.into(),
+            mode,
+        }
     }
 
     #[test]
@@ -672,15 +784,32 @@ mod tests {
         assert_eq!(m[&KeyCode::BTN_TASK], mac("a", Playback::Times(100)));
         assert_eq!(m[&KeyCode::BTN_0], mac("a", Playback::Times(1)));
         for bad in [
-            "macro:", "macro:a,x0", "macro:a,x101", "macro:a,sequence", "macro:bad name", "macro:a,",
-            "macro:a,x", "macro:a,x+5", "macro:a,held,x2", "macro:a.b", "macro:,held", "macro:a,x99999999999",
+            "macro:",
+            "macro:a,x0",
+            "macro:a,x101",
+            "macro:a,sequence",
+            "macro:bad name",
+            "macro:a,",
+            "macro:a,x",
+            "macro:a,x+5",
+            "macro:a,held,x2",
+            "macro:a.b",
+            "macro:,held",
+            "macro:a,x99999999999",
         ] {
             assert!(parse_action(bad).is_err(), "{bad}");
         }
-        assert!(parse_config("back = macro:a,x0").unwrap_err().starts_with("line 1: bad macro mode 'x0'"));
-        assert!(parse_config("back = macro:").unwrap_err().starts_with("line 1: bad macro name"));
+        assert!(parse_config("back = macro:a,x0")
+            .unwrap_err()
+            .starts_with("line 1: bad macro mode 'x0'"));
+        assert!(parse_config("back = macro:")
+            .unwrap_err()
+            .starts_with("line 1: bad macro name"));
         // existing actions are unaffected
-        assert_eq!(parse_action("ctrl+c").unwrap(), Action::Keys(vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_C]));
+        assert_eq!(
+            parse_action("ctrl+c").unwrap(),
+            Action::Keys(vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_C])
+        );
         assert_eq!(parse_action("disable").unwrap(), Action::Disable);
     }
 
@@ -688,7 +817,9 @@ mod tests {
     type Frame = Vec<(u16, u16, i32)>;
 
     fn dump(f: &[InputEvent]) -> Frame {
-        f.iter().map(|e| (e.event_type().0, e.code(), e.value())).collect()
+        f.iter()
+            .map(|e| (e.event_type().0, e.code(), e.value()))
+            .collect()
     }
 
     fn k(code: KeyCode, v: i32) -> Frame {
@@ -710,7 +841,16 @@ mod tests {
     /// The frames one run of `name` emits, as the Player plays it.
     fn emits(name: &str) -> Vec<Frame> {
         let steps = macros::to_steps(&macros::pad(&defs()[name].events));
-        steps.iter().filter_map(|s| if let Step::Emit(f) = s { Some(dump(f)) } else { None }).collect()
+        steps
+            .iter()
+            .filter_map(|s| {
+                if let Step::Emit(f) = s {
+                    Some(dump(f))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     fn player() -> (Arc<Mutex<Recorder>>, Player) {
@@ -726,7 +866,10 @@ mod tests {
     fn wait(what: &str, cond: impl Fn() -> bool) {
         let t = std::time::Instant::now();
         while !cond() {
-            assert!(t.elapsed() < std::time::Duration::from_secs(2), "timed out waiting for {what}");
+            assert!(
+                t.elapsed() < std::time::Duration::from_secs(2),
+                "timed out waiting for {what}"
+            );
             thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -752,32 +895,53 @@ mod tests {
         thread::sleep(std::time::Duration::from_millis(60));
         assert_eq!(frames(rec), got, "still playing after stop");
         let one = emits(name);
-        let same = got.iter().zip(one.iter().cycle()).take_while(|(a, b)| a == b).count();
+        let same = got
+            .iter()
+            .zip(one.iter().cycle())
+            .take_while(|(a, b)| a == b)
+            .count();
         assert!(same > one.len(), "less than one full run: {got:?}");
-        assert!(got[same..].iter().flatten().all(|e| e.0 == KEY && e.2 == 0), "{got:?}");
+        assert!(
+            got[same..].iter().flatten().all(|e| e.0 == KEY && e.2 == 0),
+            "{got:?}"
+        );
         assert_no_stuck(&got);
     }
 
     #[test]
     fn check_macros_names_missing() {
-        let m = parse_config("back = macro:tap\nforward = macro:nope,held\nmiddle = macro:zzz\nright = ctrl+c").unwrap();
-        assert_eq!(check_macros(&m, &defs()).unwrap_err(), "undefined macros 'nope', 'zzz'");
+        let m = parse_config(
+            "back = macro:tap\nforward = macro:nope,held\nmiddle = macro:zzz\nright = ctrl+c",
+        )
+        .unwrap();
+        assert_eq!(
+            check_macros(&m, &defs()).unwrap_err(),
+            "undefined macros 'nope', 'zzz'"
+        );
         let one = parse_config("back = macro:tap\nforward = macro:nope").unwrap();
-        assert_eq!(check_macros(&one, &defs()).unwrap_err(), "undefined macro 'nope'");
-        let ok = parse_config("back = macro:tap\nforward = macro:shift,toggle\nmiddle = disable").unwrap();
+        assert_eq!(
+            check_macros(&one, &defs()).unwrap_err(),
+            "undefined macro 'nope'"
+        );
+        let ok = parse_config("back = macro:tap\nforward = macro:shift,toggle\nmiddle = disable")
+            .unwrap();
         assert!(check_macros(&ok, &defs()).is_ok());
         assert!(check_macros(&Mapping::new(), &macros::Macros::new()).is_ok());
     }
 
     #[test]
     fn translate_swallows_macro_buttons() {
-        let m = parse_config("back = macro:tap\nforward = macro:shift,held\nmiddle = ctrl+c").unwrap();
+        let m =
+            parse_config("back = macro:tap\nforward = macro:shift,held\nmiddle = ctrl+c").unwrap();
         for v in [1, 0, 2] {
             assert!(translate(&m, &key(KeyCode::BTN_SIDE, v)).is_empty());
             assert!(translate(&m, &key(KeyCode::BTN_EXTRA, v)).is_empty());
         }
         assert_eq!(translate(&m, &key(KeyCode::BTN_MIDDLE, 1)).len(), 2);
-        assert_eq!(dump(&translate(&m, &key(KeyCode::BTN_LEFT, 1))), k(KeyCode::BTN_LEFT, 1));
+        assert_eq!(
+            dump(&translate(&m, &key(KeyCode::BTN_LEFT, 1))),
+            k(KeyCode::BTN_LEFT, 1)
+        );
     }
 
     #[test]
@@ -787,7 +951,11 @@ mod tests {
         let m = parse_config("forward = macro:shift,held\nesc = macro:tap").unwrap();
         let fwd = KeyCode::BTN_EXTRA;
         // a non-key event whose code collides with a mapped key (REL_Y == KEY_ESC) is not a press
-        drive(&p, &m, &InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, 1));
+        drive(
+            &p,
+            &m,
+            &InputEvent::new(EventType::RELATIVE.0, RelativeAxisCode::REL_Y.0, 1),
+        );
         assert!(!p.lock().unwrap().is_running(KeyCode::KEY_ESC));
         drive(&p, &m, &key(fwd, 1));
         assert!(p.lock().unwrap().is_running(fwd));
@@ -807,7 +975,15 @@ mod tests {
         let (rec, mut p) = player();
         let b = KeyCode::BTN_SIDE;
         let one = emits("slow");
-        assert_eq!(one, vec![k(KeyCode::KEY_A, 1), k(KeyCode::KEY_A, 0), k(KeyCode::KEY_B, 1), k(KeyCode::KEY_B, 0)]);
+        assert_eq!(
+            one,
+            vec![
+                k(KeyCode::KEY_A, 1),
+                k(KeyCode::KEY_A, 0),
+                k(KeyCode::KEY_B, 1),
+                k(KeyCode::KEY_B, 0)
+            ]
+        );
         p.press(b, "slow", Playback::Once);
         assert!(p.is_running(b));
         p.press(b, "slow", Playback::Once); // ignored, no queueing
@@ -864,17 +1040,31 @@ mod tests {
         wait("ctrl down", || !frames(&rec).is_empty());
         let t = std::time::Instant::now();
         p.stop_all();
-        assert!(t.elapsed() < std::time::Duration::from_millis(500), "stop_all took {:?}", t.elapsed());
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "stop_all took {:?}",
+            t.elapsed()
+        );
         assert!(!p.is_running(KeyCode::BTN_SIDE));
-        assert_eq!(frames(&rec), vec![k(KeyCode::KEY_LEFTCTRL, 1), k(KeyCode::KEY_LEFTCTRL, 0)]);
+        assert_eq!(
+            frames(&rec),
+            vec![k(KeyCode::KEY_LEFTCTRL, 1), k(KeyCode::KEY_LEFTCTRL, 0)]
+        );
 
         let (rec, mut p) = player();
         p.press(KeyCode::BTN_SIDE, "alt", Playback::Toggle);
         wait("alt down", || !frames(&rec).is_empty());
         let t = std::time::Instant::now();
         drop(p);
-        assert!(t.elapsed() < std::time::Duration::from_millis(500), "drop took {:?}", t.elapsed());
-        assert_eq!(frames(&rec), vec![k(KeyCode::KEY_LEFTALT, 1), k(KeyCode::KEY_LEFTALT, 0)]);
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(500),
+            "drop took {:?}",
+            t.elapsed()
+        );
+        assert_eq!(
+            frames(&rec),
+            vec![k(KeyCode::KEY_LEFTALT, 1), k(KeyCode::KEY_LEFTALT, 0)]
+        );
     }
 
     #[test]
@@ -894,8 +1084,15 @@ mod tests {
         let t = std::time::Instant::now();
         // SAFETY: the handler is installed above; raise only sets the flag the watcher thread reads.
         assert_eq!(unsafe { libc::raise(libc::SIGUSR1) }, 0);
-        wait("macros stopped", || !player.lock().unwrap().is_running(KeyCode::BTN_SIDE) && !player.lock().unwrap().is_running(KeyCode::BTN_EXTRA));
-        assert!(t.elapsed() < std::time::Duration::from_millis(250), "AC-M1: stop took {:?}", t.elapsed());
+        wait("macros stopped", || {
+            !player.lock().unwrap().is_running(KeyCode::BTN_SIDE)
+                && !player.lock().unwrap().is_running(KeyCode::BTN_EXTRA)
+        });
+        assert!(
+            t.elapsed() < std::time::Duration::from_millis(250),
+            "AC-M1: stop took {:?}",
+            t.elapsed()
+        );
         let got = frames(&rec);
         thread::sleep(std::time::Duration::from_millis(60));
         assert_eq!(frames(&rec), got, "still playing after SIGUSR1");
@@ -911,23 +1108,36 @@ mod tests {
     impl Sink for Flaky {
         fn emit(&mut self, frame: &[InputEvent]) -> io::Result<()> {
             self.tried.push(dump(frame));
-            if self.tried.len() > self.ok { Err(io::Error::other("unplugged")) } else { Ok(()) }
+            if self.tried.len() > self.ok {
+                Err(io::Error::other("unplugged"))
+            } else {
+                Ok(())
+            }
         }
     }
 
     #[test]
     fn sink_error_ends_worker_and_still_tries_to_release() {
-        let sink = Arc::new(Mutex::new(Flaky { ok: 1, tried: vec![] }));
+        let sink = Arc::new(Mutex::new(Flaky {
+            ok: 1,
+            tried: vec![],
+        }));
         let mut p = Player::new(sink.clone(), defs());
         let b = KeyCode::BTN_SIDE;
         p.press(b, "combo", Playback::Held);
         wait("worker to exit", || !p.is_running(b));
         // ctrl down ok, a down fails -> ups for a and ctrl are still attempted, newest first
         let (ctrl, a) = (KeyCode::KEY_LEFTCTRL, KeyCode::KEY_A);
-        assert_eq!(sink.lock().unwrap().tried, vec![k(ctrl, 1), k(a, 1), k(a, 0), k(ctrl, 0)]);
+        assert_eq!(
+            sink.lock().unwrap().tried,
+            vec![k(ctrl, 1), k(a, 1), k(a, 0), k(ctrl, 0)]
+        );
         p.release(b);
 
-        let dead = Arc::new(Mutex::new(Flaky { ok: 0, tried: vec![] }));
+        let dead = Arc::new(Mutex::new(Flaky {
+            ok: 0,
+            tried: vec![],
+        }));
         let mut p = Player::new(dead.clone(), defs());
         p.press(b, "tap", Playback::Times(5));
         wait("worker to exit", || !p.is_running(b));
