@@ -5,7 +5,8 @@
 //!   RAZERCTL_GUI_TABS=a,b         limit the snapshot to some tabs
 //!   RAZERCTL_GUI_THEME=dark|light force the palette (otherwise it follows the system theme)
 //!   RAZERCTL_GUI_SIZE=WxH         initial window size
-//!   RAZERCTL_GUI_DEMO=<scenario>  start from synthetic device state instead of reading hardware (see `apply`)
+//!   RAZERCTL_GUI_DEMO=<scenario>  start from synthetic device state instead of reading hardware (see `apply`);
+//!                                  `macro-*` scenarios also point the config paths into a temp dir
 //!   RAZERCTL_GUI_POINTER=hover:<w>|press:<w>|click:<w>   synthetic pointer on a noted widget (hover / pressed /
 //!                                  opened dropdown); <w> is save, refresh, combo<button id>
 //!
@@ -13,9 +14,11 @@
 //! real UI code, and Save / Apply / systemctl keep calling the real device and systemd paths.
 
 use super::theme::Mode;
+use super::macro_ui::{Draft, MacroUi, Sub};
 use super::{App, ButtonRow, Tab, CHOICES, SERVICE};
 use eframe::egui;
 use razerctl::device::{DpiStages, Info};
+use razerctl::macros;
 use razerctl::onboard;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -97,7 +100,7 @@ fn choice(label: &str) -> usize {
 /// no mouse looks. `save-error-real`, `config-error` and `service-error` then drive the app's own code paths.
 pub fn apply(app: &mut App) {
     let Some(name) = app.demo.scenario.clone() else { return };
-    let with_device = !name.starts_with("nodevice");
+    let with_device = !name.starts_with("nodevice") && name != "macro-nodevice";
     if with_device {
         app.info = Some(info(82, false));
         app.backend_kind = "hidraw".into();
@@ -153,7 +156,9 @@ pub fn apply(app: &mut App) {
         }
         "software" => {
             app.conf_text = "# One rule per line:  BUTTON = ACTION\nback = ctrl+c\nforward = KEY_F13\nmiddle = disable\n".into();
-            app.macros_text = "# Bind in Config:  forward = macro:copy\n[copy]\ndown ctrl\ndelay 20\ntap c\nup ctrl\n\n[scroll-3]\nwheel 1\ndelay 15\nwheel 1\ndelay 15\nwheel 1\n".into();
+            app.mac = MacroUi::from_macros(&macros::parse_macros(
+                "[copy]\ndown ctrl\ndelay 20\ntap c\nup ctrl\n\n[scroll-3]\nwheel 1\ndelay 15\nwheel 1\ndelay 15\nwheel 1\n",
+            ).expect("demo macros"));
             app.service_state = "active".into();
             app.ok("Config saved. Restart the service to apply.");
         }
@@ -163,6 +168,112 @@ pub fn apply(app: &mut App) {
         "service-error" => {
             app.conf_text = "# One rule per line:  BUTTON = ACTION\nback = ctrl+c\n".into();
             app.systemctl(&["restart", SERVICE]); // real systemctl --user call
+        }
+        n if n.starts_with("macro-") => macro_scenario(app, n),
+        _ => {}
+    }
+}
+
+const MACRO_RULES: &str = "# One rule per line:  BUTTON = ACTION\nback = macro:wiggle,toggle\nforward = macro:rapid-click,held\nmiddle = macro:paste-enter,once\n";
+
+const MACRO_FILE: &str = "\
+[rapid-click]
+down BTN_LEFT
+delay 12
+up BTN_LEFT
+delay 38
+
+[paste-enter]
+down KEY_LEFTCTRL
+down KEY_V
+delay 30
+up KEY_V
+up KEY_LEFTCTRL
+delay 120
+down KEY_ENTER
+delay 20
+up KEY_ENTER
+
+[wiggle]
+move 12 0
+delay 60
+move -12 0
+delay 60
+
+[wheel-flick]
+wheel -3
+delay 25
+wheel -3
+delay 25
+wheel -3
+";
+
+/// The macro screens of the DAN-1426 design, filled with the same synthetic macros and rules. The editor and the
+/// rules text are the real ones; only what they were loaded from is made up, and the two config files are pointed
+/// into a temp dir so nothing the screens do can touch the real config. The `playing` screen is not here: nothing
+/// reports a running macro to the GUI.
+fn macro_scenario(app: &mut App, name: &str) {
+    let dir = std::env::temp_dir().join("razerctl-gui-demo/.config/razerctl");
+    app.conf_path = dir.join("remap.conf");
+    app.macros_path = dir.join("macros.conf");
+    app.conf_text = MACRO_RULES.into();
+    app.service_state = "active".into();
+    app.tab = Tab::Software;
+    // the tester would open the real input nodes: show a made-up trail instead
+    app.watching = true;
+    app.presses.lock().unwrap().extend(["BTN_SIDE", "BTN_LEFT", "BTN_LEFT", "BTN_EXTRA", "BTN_RIGHT", "BTN_MIDDLE"].map(String::from));
+    app.mac = MacroUi::from_macros(&macros::parse_macros(MACRO_FILE).expect("demo macros"));
+    let pos = |app: &App, n: &str| app.mac.drafts.iter().position(|d| d.name == n).expect("demo macro");
+    app.mac.sub = Sub::Macros;
+    app.mac.bind.macro_name = "rapid-click".into();
+    app.mac.bind.mode = 2;
+    let saved = "Macros saved to ~/.config/razerctl/macros.conf. Restart the service to apply.";
+    match name {
+        "macro-rules" => {
+            app.mac.sub = Sub::Rules;
+            app.ok("Config saved. Restart the service to apply.");
+        }
+        "macro-editor" => {
+            app.mac.sel = pos(app, "paste-enter");
+            app.mac.sel_ev = 2;
+            app.ok(saved);
+        }
+        "macro-empty" => {
+            app.mac = MacroUi::empty();
+            app.mac.sub = Sub::Macros;
+            app.conf_text = "# One rule per line:  BUTTON = ACTION\nback = ctrl+c\n".into();
+            app.ok("Read 0 macros from ~/.config/razerctl/macros.conf.");
+        }
+        "macro-invalid" => {
+            use super::macro_ui::Ev::*;
+            app.mac.push(Draft::new("shift-select", vec![Key("KEY_LEFTSHIFT".into(), true), Key("KEY_END".into(), true), Delay(20), Key("KEY_END".into(), false)]));
+            app.mac.push(Draft::new("untitled-1", vec![]));
+            app.mac.sel = pos(app, "shift-select");
+            app.mac.sel_ev = 0;
+            app.err("2 macros have problems. Fix them to enable saving.");
+        }
+        "macro-dangling" => {
+            app.mac.sub = Sub::Rules;
+            app.mac.sel = pos(app, "wiggle");
+            app.mac.delete(false);
+            app.err("Macro 'wiggle' was deleted but the rule for BACK still uses it.");
+        }
+        "macro-delete" => {
+            app.mac.sel = pos(app, "wiggle");
+            app.mac.confirm_delete = true;
+            app.ok("Nothing is deleted until you press Save macros.");
+        }
+        "macro-stopped" => {
+            app.mac.sel = pos(app, "paste-enter");
+            app.mac.sel_ev = 2;
+            app.service_state = "inactive".into();
+            app.ok("Macros saved to ~/.config/razerctl/macros.conf. The remap service is not running.");
+        }
+        "macro-nodevice" => {
+            app.mac.sel = pos(app, "paste-enter");
+            app.mac.sel_ev = 2;
+            app.presses.lock().unwrap().clear();
+            app.err("No Razer mouse found. Is the receiver plugged in?");
         }
         _ => {}
     }
