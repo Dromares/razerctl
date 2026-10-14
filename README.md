@@ -153,7 +153,8 @@ says so.
   (`razerctl-remap.service`, `razerctl-battery.service`) that never depend on the GUI process and keep running.
 * Icon: no mouse (dashed) > low battery (`!`) > charging (bolt) > remap running (dot) > normal. The symbolic SVGs in
   `packaging/icons/` are installed by `./install.sh` and the package so the shell can recolour them; without them
-  a pixmap drawn by the app is used.
+  a pixmap drawn by the app is used. The SVGs are generated: edit `examples/gen_icons/icons.rs`, run
+  `cargo run --example gen_icons` and commit the result (`cargo test` fails if they drift).
 * **Caveat: a StatusNotifier host is required to hide.** KDE Plasma, XFCE and most panels have one; GNOME needs the
   *AppIndicator and KStatusNotifierItem Support* extension. With no host, closing the window quits (the App tab says
   so and keeps your choice; the host is looked for again each time you close the window). A second `razerctl-gui`
