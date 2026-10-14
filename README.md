@@ -31,6 +31,16 @@ Protocol details: [docs/onboard-button-protocol.md](docs/onboard-button-protocol
 A Linux rewrite, in Rust, of the device-control core of **Razer Synapse 4 for macOS**
 (`RazerSynapseInstaller.pkg`, RazerAppEngine 4.4.25).
 
+## Verifying a change (local CI)
+
+Hosted Actions are not available, so a non-author verifies a PR by running one command at the PR head SHA in a clean worktree:
+
+```sh
+scripts/local-ci.sh /path/to/verify.log
+```
+
+It prints the toolchain (`rustc -V`, `cargo -V`, pinned by `rust-toolchain.toml`), checks the GUI system libraries with `pkg-config`, then runs `cargo build --release --locked`, `cargo test --release --locked`, `cargo clippy --all-targets`, `cargo fmt --check`, and an `xvfb-run` smoke test that launches `razerctl-gui` for 5 s with an isolated `HOME` (no device writes). Clippy and fmt are compared with baselines recorded in the script (`CLIPPY_BASELINE`, `FMT_BASELINE`): a new warning or newly unformatted file fails; existing debt is reported, not reformatted. Exit status is 0 only on `RESULT: PASS`; attach the log to the PR.
+
 ## What was in the .pkg
 
 | Component | What it is | Rewritten? |
