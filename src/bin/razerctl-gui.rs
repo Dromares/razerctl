@@ -1233,7 +1233,7 @@ mod tests {
         input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(size.0, size.1)));
         let mut text = String::new();
         for _ in 0..2 {
-            let out = ctx.run_ui(input.clone(), |ui| {
+            let mut out = ctx.run_ui(input.clone(), |ui| {
                 app.header(ui);
                 app.device_strip(ui);
                 app.tester(ui);
@@ -1248,6 +1248,8 @@ mod tests {
             for cs in &out.shapes {
                 if let EShape::Text(t) = &cs.shape { text.push_str(t.galley.text()); text.push('\n'); }
             }
+            // No renderer consumes the font-atlas upload here; epaint 0.36 panics on drop if it is left unapplied.
+            out.textures_delta.clear();
         }
         text
     }
