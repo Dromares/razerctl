@@ -369,6 +369,42 @@ pub fn to_steps(events: &[MacroEvent]) -> Vec<Step> {
     out
 }
 
+/// Run time of one playback, Synapse padding included (sum of the delays of `pad`).
+pub fn play_ms(events: &[MacroEvent]) -> u64 {
+    pad(events).iter().map(|e| if let MacroEvent::Delay(ms) = e { u64::from(*ms) } else { 0 }).sum()
+}
+
+/// `macros list`: one line per macro, name, events as written, padded run time.
+pub fn describe_macros(m: &Macros) -> Vec<String> {
+    let w = m.keys().map(String::len).max().unwrap_or(0);
+    m.values()
+        .map(|mac| {
+            let n = mac.events.len();
+            format!("{:<w$}  {n} event{}, {} ms", mac.name, if n == 1 { "" } else { "s" }, play_ms(&mac.events))
+        })
+        .collect()
+}
+
+/// `macros play --dry-run`: one line per step, `+N ms` for a sleep, else the frame's
+/// events by evdev name (`KEY_A down`, `BTN_LEFT up`, `REL_WHEEL 1, REL_WHEEL_HI_RES 120`).
+pub fn describe_steps(steps: &[Step]) -> Vec<String> {
+    let ev = |e: &InputEvent| match e.event_type() {
+        EventType::KEY => {
+            let v = match e.value() { 0 => "up".to_string(), 1 => "down".to_string(), v => v.to_string() };
+            format!("{:?} {v}", KeyCode::new(e.code()))
+        }
+        EventType::RELATIVE => format!("{:?} {}", RelativeAxisCode(e.code()), e.value()),
+        t => format!("{t:?} {} {}", e.code(), e.value()),
+    };
+    steps
+        .iter()
+        .map(|s| match s {
+            Step::Sleep(d) => format!("+{}ms", d.as_millis()),
+            Step::Emit(f) => f.iter().map(ev).collect::<Vec<_>>().join(", "),
+        })
+        .collect()
+}
+
 /// What a uinput device must advertise to play `m`: sorted, deduplicated.
 pub fn capabilities(m: &Macro) -> (Vec<KeyCode>, Vec<RelativeAxisCode>) {
     use RelativeAxisCode as R;
@@ -672,6 +708,55 @@ TAP a
         let p = to_steps(&pad(&[Key(KeyCode::KEY_A, true), Key(KeyCode::KEY_A, false), Delay(10)]));
         assert_eq!(dump(&p), vec![S::E(vec![(KEY, a, 1)]), S::E(vec![(KEY, a, 0)]), S::W(30)]);
         assert!(to_steps(&[]).is_empty());
+    }
+
+    #[test]
+    fn describe_steps_shows_padded_frames_and_sleeps() {
+        let m = parse_macros("[m]\ntap a\ndelay 20\nclick left\nwheel 1\n").unwrap();
+        // 6 events: 3 ms pad after the 5th, 20 ms tail
+        assert_eq!(
+            describe_steps(&to_steps(&pad(&m["m"].events))),
+            [
+                "KEY_A down",
+                "KEY_A up",
+                "+20ms",
+                "BTN_LEFT down",
+                "BTN_LEFT up",
+                "+3ms",
+                "REL_WHEEL 1, REL_WHEEL_HI_RES 120",
+                "+20ms",
+            ]
+        );
+        // the pad merges with a user delay at the 5th event; move drops a zero axis
+        let m = parse_macros("[m]\ntap a\ntap b\ndelay 10\nmove 0 -4\nhwheel -1").unwrap();
+        assert_eq!(
+            describe_steps(&to_steps(&pad(&m["m"].events))),
+            [
+                "KEY_A down",
+                "KEY_A up",
+                "KEY_B down",
+                "KEY_B up",
+                "+13ms",
+                "REL_Y -4",
+                "REL_HWHEEL -1, REL_HWHEEL_HI_RES -120",
+                "+20ms",
+            ]
+        );
+        assert!(describe_steps(&[]).is_empty());
+    }
+
+    #[test]
+    fn list_shows_event_count_and_padded_duration() {
+        assert_eq!(play_ms(&[]), 20);
+        assert_eq!(play_ms(&numbered(5)), 20);
+        assert_eq!(play_ms(&numbered(11)), 3 + 3 + 20);
+        let m = parse_macros("[w]\nwheel 1\n[long-name]\ndelay 100\ndelay 50\ntap x\n[a]\ntap a\n").unwrap();
+        assert_eq!(play_ms(&m["long-name"].events), 170);
+        assert_eq!(
+            describe_macros(&m),
+            ["a          2 events, 20 ms", "long-name  4 events, 170 ms", "w          1 event, 20 ms"]
+        );
+        assert!(describe_macros(&Macros::new()).is_empty());
     }
 
     #[test]

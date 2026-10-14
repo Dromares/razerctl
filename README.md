@@ -86,3 +86,27 @@ cp systemd/razerctl-remap.service ~/.config/systemd/user/ && systemctl --user en
 ```
 Requirements: read access to the Razer `/dev/input/event*` nodes (openrazer group) and rw on
 `/dev/uinput` (your user already has both).
+
+### Macros
+
+Synapse plays this mouse's macros on the computer, not from the mouse (`docs/macro-protocol.md`),
+and razerctl does the same: nothing is written to the device. Define macros in
+`~/.config/razerctl/macros.conf` and bind them in `remap.conf` with `macro:NAME[,once|xN|held|toggle]`:
+
+```
+# macros.conf                            # remap.conf
+[copy]                                   back = macro:copy
+down ctrl                                forward = macro:copy,x3
+tap c
+up ctrl
+```
+Events: `down`/`up`/`tap KEY`, `click BUTTON`, `delay MS`, `wheel N`, `hwheel N`, `move DX DY`.
+Like Synapse, playback adds a 3 ms pause after every 5th event and 20 ms at the end.
+
+```
+razerctl macros                          # list: events and run time
+razerctl macros show copy                # one macro, canonical form
+razerctl macros check                    # validate macros.conf and the macro: refs in remap.conf
+razerctl macros play copy --dry-run      # the exact evdev frames and sleeps, nothing is sent
+razerctl remap --macros FILE             # use another macros file (default above)
+```
