@@ -204,6 +204,20 @@ impl App {
         app
     }
 
+    /// Write the rules editor to `remap.conf` through `write_atomic`: the service reads that file on every
+    /// start, and a half-written one stops the unit (exit 78).
+    fn save_rules_from_ui(&mut self) -> bool {
+        match write_atomic(&self.conf_path, &self.conf_text) {
+            Ok(()) => {
+                self.ok("Config saved. Restart the service to apply.");
+                true
+            }
+            Err(e) => {
+                self.err(e.to_string());
+                false
+            }
+        }
+    }
     fn ok(&mut self, s: impl Into<String>) { self.status = s.into(); self.status_is_error = false; }
     fn err(&mut self, s: impl Into<String>) { self.status = s.into(); self.status_is_error = true; }
 
@@ -1015,12 +1029,7 @@ impl App {
                 let save = btn(ui, &p, "💾  Save config", Kind::Primary, self.conf_error.is_none());
                 demo::note("save-config", &save);
                 if save.clicked() {
-                    let r = self.conf_path.parent().map(std::fs::create_dir_all).transpose()
-                        .and_then(|_| std::fs::write(&self.conf_path, &self.conf_text));
-                    match r {
-                        Ok(_) => self.ok("Config saved. Restart the service to apply."),
-                        Err(e) => self.err(e.to_string()),
-                    }
+                    self.save_rules_from_ui();
                 }
                 match (&self.conf_error, dangling.first()) {
                     (None, _) => {
@@ -1775,6 +1784,36 @@ mod tests {
         app.mac.sel = 0;
         app.mac.delete(false);
         assert_eq!(app.mac.dangling(&app.conf_text), [(2, "copy".to_string())]);
+    }
+
+    #[test]
+    fn save_config_goes_through_a_temp_file_and_rename() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = TempDir::new("rules-atomic");
+        let mut app = saved_app(&dir);
+        let inode = |p: &Path| std::fs::metadata(p).unwrap().ino();
+        let before = inode(&app.conf_path);
+        app.conf_text = format!("{RULES}# edited\n");
+        assert!(app.save_rules_from_ui(), "{}", app.status);
+        assert!(!app.status_is_error && app.status == "Config saved. Restart the service to apply.", "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), app.conf_text);
+        // a plain fs::write truncates the existing file in place and keeps its inode; temp file + rename replaces it
+        assert_ne!(inode(&app.conf_path), before, "remap.conf was rewritten in place instead of renamed over");
+        assert_eq!(dir.names("razerctl"), ["macros.conf", "remap.conf"], "no temp file left behind");
+
+        // a missing config dir is created, as before
+        app.conf_path = dir.0.join("fresh/razerctl/remap.conf");
+        assert!(app.save_rules_from_ui(), "{}", app.status);
+        assert_eq!(dir.names("fresh/razerctl"), ["remap.conf"]);
+
+        // a failed save leaves the old file whole: squat on the temp name so creating it fails
+        app.conf_path = dir.0.join("razerctl/remap.conf");
+        let old = std::fs::read_to_string(&app.conf_path).unwrap();
+        std::fs::create_dir(dir.0.join(format!("razerctl/remap.conf.tmp{}", std::process::id()))).unwrap();
+        app.conf_text = "back = ctrl+c\n".into();
+        assert!(!app.save_rules_from_ui());
+        assert!(app.status_is_error, "{}", app.status);
+        assert_eq!(std::fs::read_to_string(&app.conf_path).unwrap(), old, "a failed save must not touch the old file");
     }
 
     #[test]
