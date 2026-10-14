@@ -21,7 +21,7 @@ use razerctl::remap::{self, Action, Playback};
 
 use super::theme::*;
 use super::widgets::*;
-use super::{write_atomic, App, SERVICE};
+use super::{write_atomic, App};
 
 // ---------------------------------------------------------------------------------------------- model
 
@@ -32,12 +32,14 @@ pub enum Sub {
 }
 
 /// Whether macros can play right now, from the two things the GUI can see: `systemctl is-active` and whether the
-/// mouse answered. (The service does not report back, so there is no "playing" state; see the design's flag 6.)
+/// mouse answered, plus what `service.rs` read back after the last start. (The service does not report back, so there is no "playing" state; see the design's flag 6.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Remap {
     Running,
     Stopped,
     NoDevice,
+    /// The unit was started (or is configured to) but is crash-looping or exited; `svc_failure` says how.
+    Failed,
 }
 
 /// One event row. 1:1 with `MacroEvent`, except a key row keeps the text as typed until it is checked, so a
@@ -706,7 +708,9 @@ impl App {
     }
 
     pub fn remap_state(&self) -> Remap {
-        if self.service_state != "active" {
+        if self.svc_failure.is_some() {
+            Remap::Failed
+        } else if self.service_state != "active" {
             Remap::Stopped
         } else if self.info.is_none() {
             Remap::NoDevice
@@ -827,7 +831,7 @@ fn scroll_if(ui: &mut Ui, scroll: bool, id: &str, h: f32, add: impl FnOnce(&mut 
 }
 
 /// What a click in the editor asks for; applied once the frame's borrows are done.
-enum Act {
+pub(super) enum Act {
     None,
     Delete,
     DeleteMacro { with_rules: bool },
@@ -877,6 +881,16 @@ impl App {
                     ui.label(RichText::new("Macros won't play until the service is started.").font(sans(T_SMALL)).color(p.i100()));
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         start = btn(ui, &p, "Start service", Kind::Primary, true).clicked();
+                    });
+                }),
+                Remap::Failed => framed(ui, &mut |ui| {
+                    chip(ui, &p, Some("×"), "Remap failed", ChipStyle::Outline, p.bad);
+                    let why = self.svc_failure.as_ref().map(|f| f.full()).unwrap_or_default();
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        start = btn(ui, &p, "Try again", Kind::Primary, true).clicked();
+                        ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                            ui.add(egui::Label::new(RichText::new(&why).font(mono(T_DATA)).color(p.bad)).truncate()).on_hover_text(&why);
+                        });
                     });
                 }),
                 Remap::NoDevice => framed(ui, &mut |ui| {
@@ -1433,7 +1447,7 @@ impl App {
         self.ok("Nothing is deleted until you press Save macros.");
     }
 
-    fn apply(&mut self, act: Act) {
+    pub(super) fn apply(&mut self, act: Act) {
         let sel = self.mac.sel;
         match act {
             Act::None => {}
@@ -1455,10 +1469,8 @@ impl App {
             }
             Act::Save { restart } => {
                 if self.save_macros_from_ui() && restart {
-                    self.systemctl(&["restart", SERVICE]);
-                    if !self.status_is_error {
-                        self.ok("Macros saved and the service restarted.");
-                    }
+                    // the verdict (running, or why not) arrives once the unit has been read back; see service.rs
+                    self.restart_after_save();
                 }
             }
             Act::Revert => {

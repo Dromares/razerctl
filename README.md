@@ -87,6 +87,12 @@ cp systemd/razerctl-remap.service ~/.config/systemd/user/ && systemctl --user en
 Requirements: read access to the Razer `/dev/input/event*` nodes (openrazer group) and rw on
 `/dev/uinput` (your user already has both).
 
+`razerctl remap` exits 78 when the config is the problem (no rules, a rule that does not parse, an undefined macro)
+and the unit does not restart on that: it stays `failed` with the reason in `journalctl --user -u razerctl-remap`.
+Any other failure (no mouse yet, a crash) is retried every 2 s. After you change the unit file, `systemctl --user
+daemon-reload` (`./install.sh` does it). The GUI's "Save and restart service" / "Start service" check the unit's
+`ExecStart` binary first when the rules play macros, then read the unit back and show why it is not running.
+
 ### Macros
 
 Synapse plays this mouse's macros on the computer, not from the mouse (`docs/macro-protocol.md`),

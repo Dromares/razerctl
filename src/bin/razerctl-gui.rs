@@ -15,6 +15,8 @@ mod demo;
 mod macro_ui;
 #[path = "razerctl-gui/mouse.rs"]
 mod mouse;
+#[path = "razerctl-gui/service.rs"]
+mod service;
 #[path = "razerctl-gui/theme.rs"]
 mod theme;
 #[path = "razerctl-gui/widgets.rs"]
@@ -31,6 +33,7 @@ use razerctl::hidraw::Hidraw;
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
 use razerctl::{battery, remap};
 use macro_ui::{MacroUi, Remap, Sub};
+use service::{Failure, Pending, RealSys, Sys};
 use theme::*;
 use widgets::*;
 
@@ -108,6 +111,13 @@ struct App {
     macros_path: PathBuf,
     mac: MacroUi,
     service_state: String,
+    /// How the remap unit is failing (crash loop, exited), if it is, and the start whose result is still to be read
+    /// back; `svc_conf` is the remap.conf the service reads. See `service.rs`.
+    svc_failure: Option<Failure>,
+    svc_pending: Option<Pending>,
+    svc_conf: Option<PathBuf>,
+    /// systemctl / journalctl / the service binary, behind a trait so tests never touch the real service.
+    sys: Box<dyn Sys>,
     presses: Arc<Mutex<VecDeque<String>>>,
     watching: bool,
     batt_cfg: battery::Config,
@@ -174,6 +184,10 @@ impl App {
             macros_path,
             mac,
             service_state: String::new(),
+            svc_failure: None,
+            svc_pending: None,
+            svc_conf: None,
+            sys: Box::new(RealSys),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
             batt_cfg: battery::load(),
@@ -264,15 +278,6 @@ impl App {
         self.save_buttons();
     }
 
-    fn refresh_service(&mut self) {
-        let state = |unit: &str| match Command::new("systemctl").args(["--user", "is-active", unit]).output() {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            Err(e) => format!("systemctl unavailable: {e}"),
-        };
-        self.service_state = state(SERVICE);
-        self.batt_service = state(battery::SERVICE);
-    }
-
     /// Save battery settings, and start/stop the background notifier to match the toggle.
     fn apply_battery_settings(&mut self) {
         if let Err(e) = battery::save(&self.batt_cfg) {
@@ -294,15 +299,6 @@ impl App {
                 "Settings saved, but the notifier service didn't {}: {} (run ./install.sh to install it)",
                 args[0], String::from_utf8_lossy(&o.stderr).trim()
             )),
-            Err(e) => self.err(e.to_string()),
-        }
-        self.refresh_service();
-    }
-
-    fn systemctl(&mut self, args: &[&str]) {
-        match Command::new("systemctl").arg("--user").args(args).output() {
-            Ok(o) if o.status.success() => self.ok(format!("systemctl {} ok", args.join(" "))),
-            Ok(o) => self.err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
             Err(e) => self.err(e.to_string()),
         }
         self.refresh_service();
@@ -403,6 +399,7 @@ impl App {
                     Remap::Running => val(ui, "Remap", "● running".into()),
                     Remap::Stopped => val(ui, "Remap", "○ stopped".into()),
                     Remap::NoDevice => val(ui, "Remap", "○ waiting".into()),
+                    Remap::Failed => val(ui, "Remap", "× failed".into()),
                 }
                 if wide { val(ui, "Profile", self.profile.to_string()); }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -972,6 +969,10 @@ impl App {
             });
         }
         if let Some(i) = sub { self.mac.sub = if i == 0 { Sub::Rules } else { Sub::Macros }; }
+        if let Some(w) = self.config_dir_warning() {
+            ui.add_space(S1);
+            ui.add(egui::Label::new(RichText::new(format!("▲ {w}")).font(sans(T_SMALL)).color(p.warn)).wrap());
+        }
         if start { self.systemctl(&["start", SERVICE]); }
         ui.add_space(S2);
         match self.mac.sub {
@@ -1075,6 +1076,10 @@ impl App {
                 ui.label(RichText::new(&self.service_state).font(serif(T_TITLE + 2.0)).color(if active { p.i100() } else { p.i65() }));
             });
             ui.label(RichText::new(SERVICE).font(mono(T_DATA)).color(p.i65()));
+            if let Some(f) = &self.svc_failure {
+                ui.add_space(S2);
+                ui.add(egui::Label::new(RichText::new(format!("× {}", f.full())).font(mono(T_DATA)).color(p.bad)).wrap());
+            }
             ui.add_space(S4);
             hair(ui, &p);
             ui.add_space(S3);
@@ -1184,6 +1189,7 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         demo::step(self, &ctx);
+        self.poll_service(&ctx);
         self.start_watch(&ctx);
         let mode = self.demo.theme.unwrap_or(if ctx.theme() == egui::Theme::Light { Mode::Light } else { Mode::Dark });
         if self.styled != Some(mode) {
@@ -1278,6 +1284,10 @@ mod tests {
             macros_path: PathBuf::from("/nonexistent/razerctl/macros.conf"),
             mac: MacroUi::empty(),
             service_state: "inactive".into(),
+            svc_failure: None,
+            svc_pending: None,
+            svc_conf: None,
+            sys: Box::new(service::tests::Fake::default()),
             presses: Arc::new(Mutex::new(VecDeque::new())),
             watching: false,
             batt_cfg: battery::Config { enabled: true, threshold: 20, interval_min: 5 },
@@ -1813,5 +1823,129 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "[a]\nbogus\n");
         // a missing file is just an empty list
         assert!(MacroUi::load(&dir.0.join("nope.conf")).load_error.is_none());
+    }
+    // ------------------------------------------------------------------------- DAN-1439: the service result
+
+    use service::tests::{Fake, CRASH_LOOP, HEALTHY};
+
+    const SHOW: &str = "systemctl --user show razerctl-remap.service -p LoadState -p ActiveState -p SubState -p NRestarts -p ExecMainStatus -p ExecStart";
+    const BIN: &str = "/home/u/.local/bin/razerctl";
+
+    /// `saved_app` with every systemctl / journalctl / service-binary call stubbed. The stub says the manager runs
+    /// with `XDG_CONFIG_HOME` = the temp dir, so the service reads the same files the window edits.
+    fn stubbed(dir: &TempDir, unit: &str) -> (App, Fake) {
+        let mut app = saved_app(dir);
+        let fake = Fake::default();
+        fake.on("systemctl --user show-environment", true, &format!("HOME=/home/u\nXDG_CONFIG_HOME={}\n", dir.0.display()), "");
+        fake.on(SHOW, true, unit, "");
+        fake.on("journalctl *", true, "grabbed nothing\nrazerctl: no remap rules\n", "");
+        app.sys = Box::new(fake.clone());
+        (app, fake)
+    }
+
+    fn check_cmd(dir: &TempDir) -> String {
+        format!("{BIN} macros check --config {} --file {}", dir.0.join("razerctl/remap.conf").display(), dir.0.join("razerctl/macros.conf").display())
+    }
+
+    #[test]
+    fn save_and_restart_says_when_the_service_crash_loops() {
+        let dir = TempDir::new("svc-crash");
+        let (mut app, fake) = stubbed(&dir, CRASH_LOOP);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.mac.drafts[0].events.push(macro_ui::Ev::Wheel(2));
+        app.apply(macro_ui::Act::Save { restart: true });
+        assert!(fake.calls().contains(&"systemctl --user restart razerctl-remap.service".to_string()), "{:?}", fake.calls());
+        assert!(!app.status_is_error && app.status.contains("Checking that the service stays up"), "{}", app.status);
+        assert!(app.svc_pending.is_some() && app.svc_failure.is_none(), "nothing is claimed before the unit is read back");
+        // the unit is read back: activating (auto-restart), not running
+        app.finish_service_check();
+        assert!(app.status_is_error && app.status.starts_with("Macros saved. The remap service failed: razerctl: no remap rules"), "{}", app.status);
+        assert!(app.status.contains("activating (auto-restart)"), "{}", app.status);
+        assert_eq!(app.remap_state(), Remap::Failed);
+        assert_eq!(app.service_state, "activating");
+        assert!(!app.mac.dirty(), "the macros were saved either way");
+        for mode in [Mode::Dark, Mode::Light] {
+            for size in SIZES {
+                app.pal = Pal::new(mode);
+                let l: Vec<String> = software(&mut app, size).into_iter().map(|(s, ..)| s).collect();
+                assert!(l.iter().any(|s| s == "REMAP FAILED") && l.iter().any(|s| s.contains("razerctl: no remap rules")), "{l:?}");
+                assert!(!l.iter().any(|s| s == "REMAP RUNNING"), "never looks healthy: {l:?}");
+                assert!(l.iter().any(|s| s.ends_with("TRY AGAIN")), "{l:?}");
+            }
+        }
+        assert!(render(&mut app, Tab::Device, Mode::Dark, SIZES[0]).contains("× failed"), "the strip on every tab");
+    }
+
+    #[test]
+    fn save_and_restart_confirms_only_when_the_unit_stays_up() {
+        let dir = TempDir::new("svc-ok");
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.apply(macro_ui::Act::Save { restart: true });
+        app.finish_service_check();
+        assert!(!app.status_is_error && app.status == "Macros saved and the service restarted. It is running.", "{}", app.status);
+        assert!(app.svc_failure.is_none() && app.svc_pending.is_none());
+        assert_eq!(app.remap_state(), Remap::Running);
+        // up when first read, but it has restarted itself since: also a failure
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        fake.on(&check_cmd(&dir), true, "ok", "");
+        app.restart_after_save();
+        fake.on(SHOW, true, "LoadState=loaded\nActiveState=active\nSubState=running\nNRestarts=3\nExecMainStatus=0\n", "");
+        app.finish_service_check();
+        assert!(app.status_is_error && app.status.contains("started, then exited and was restarted"), "{}", app.status);
+    }
+
+    #[test]
+    fn restart_is_blocked_when_the_installed_binary_is_too_old_for_macros() {
+        let dir = TempDir::new("svc-old");
+        let (mut app, fake) = stubbed(&dir, CRASH_LOOP);
+        fake.on(&check_cmd(&dir), false, "", "razerctl: unknown command 'macros'\n\nUSAGE");
+        app.apply(macro_ui::Act::Save { restart: true });
+        assert!(app.status_is_error && app.status.starts_with("Macros saved, but the service was not restarted."), "{}", app.status);
+        assert!(app.status.contains("too old for macros") && app.status.contains("reinstall"), "{}", app.status);
+        assert!(!fake.calls().iter().any(|c| c.contains(" restart ") || c.contains(" start ")), "systemctl restart was never issued: {:?}", fake.calls());
+        assert!(app.svc_pending.is_none());
+        // and the banner's Start service is held to the same check
+        assert!(!app.systemctl(&["start", SERVICE]));
+        assert!(!fake.calls().iter().any(|c| c.contains(" start ")), "{:?}", fake.calls());
+        // a plain rule set never asks the binary, and stopping is never blocked
+        std::fs::write(&app.conf_path, "back = ctrl+c\n").unwrap();
+        let before = fake.calls().iter().filter(|c| c.contains("macros check")).count();
+        assert!(app.systemctl(&["start", SERVICE]));
+        assert_eq!(fake.calls().iter().filter(|c| c.contains("macros check")).count(), before);
+        assert!(app.systemctl(&["stop", SERVICE]) && app.svc_pending.is_none());
+    }
+
+    #[test]
+    fn refresh_names_a_failed_unit_with_the_services_last_log_line() {
+        let dir = TempDir::new("svc-refresh");
+        let (mut app, _fake) = stubbed(&dir, "LoadState=loaded\nActiveState=failed\nSubState=failed\nNRestarts=0\nExecMainStatus=78\n");
+        app.refresh_service();
+        assert_eq!(app.service_state, "failed");
+        assert_eq!(app.svc_failure.as_ref().map(|f| f.full()).as_deref(), Some("razerctl: no remap rules (failed (failed), exit status 78)"));
+        assert_eq!(app.remap_state(), Remap::Failed);
+        let (mut app, _fake) = stubbed(&dir, "LoadState=loaded\nActiveState=inactive\nSubState=dead\nNRestarts=0\n");
+        app.refresh_service();
+        assert!(app.svc_failure.is_none() && app.remap_state() == Remap::Stopped, "stopped is not failed");
+    }
+
+    #[test]
+    fn a_window_on_another_config_dir_than_the_service_gets_one_warning_line() {
+        let dir = TempDir::new("svc-dir");
+        let (mut app, fake) = stubbed(&dir, HEALTHY);
+        app.refresh_service();
+        assert_eq!(app.config_dir_warning(), None, "same file: no warning");
+        let l: Vec<String> = software(&mut app, SIZES[0]).into_iter().map(|(s, ..)| s).collect();
+        assert!(!l.iter().any(|s| s.contains("This window edits")));
+        // the board's case: the window under an XDG_CONFIG_HOME override, the service on the default
+        fake.on("systemctl --user show-environment", true, "HOME=/home/u\n", "");
+        app.refresh_service();
+        let w = app.config_dir_warning().expect("warned");
+        assert!(w.contains("the service reads /home/u/.config/razerctl/remap.conf"), "{w}");
+        for size in SIZES {
+            let l: Vec<String> = software(&mut app, size).into_iter().map(|(s, ..)| s).collect();
+            assert_eq!(l.iter().filter(|s| s.contains("This window edits")).count(), 1, "{l:?}");
+        }
+        assert!(!app.status_is_error, "a warning, not an error: it does not block");
     }
 }

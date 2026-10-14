@@ -5,8 +5,12 @@ PartOf=graphical-session.target
 
 [Service]
 ExecStart=%h/.local/bin/razerctl remap
-Restart=always
+# Retry a crash or a missing mouse every 2 s, but not a config problem: `razerctl remap` exits 78 for no rules, a
+# rule that does not parse or an undefined macro, and restarting cannot fix those. The unit stays `failed` with the
+# reason in the journal (and in the GUI) instead of crash-looping.
+Restart=on-failure
 RestartSec=2
+RestartPreventExitStatus=78
 
 [Install]
 WantedBy=graphical-session.target

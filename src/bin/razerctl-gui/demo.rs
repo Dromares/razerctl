@@ -15,6 +15,7 @@
 
 use super::theme::Mode;
 use super::macro_ui::{Draft, MacroUi, Sub};
+use super::service::Failure;
 use super::{App, ButtonRow, Tab, CHOICES, SERVICE};
 use eframe::egui;
 use razerctl::device::{DpiStages, Info};
@@ -268,6 +269,22 @@ fn macro_scenario(app: &mut App, name: &str) {
             app.mac.sel_ev = 2;
             app.service_state = "inactive".into();
             app.ok("Macros saved to ~/.config/razerctl/macros.conf. The remap service is not running.");
+        }
+        "macro-svcfail" => {
+            // what the board saw on DAN-1433: rules saved, restart pressed, the unit crash-looping on an old binary,
+            // and this window on an XDG_CONFIG_HOME the service does not read
+            let f = Failure { state: "activating (auto-restart), exit status 1, 3 restarts".into(), line: Some("razerctl: no remap rules".into()) };
+            app.mac.sub = Sub::Rules;
+            app.service_state = "activating".into();
+            app.svc_conf = Some(PathBuf::from("/home/demo/.config/razerctl/remap.conf"));
+            app.err(format!("The remap service failed: {}", f.full()));
+            app.svc_failure = Some(f);
+        }
+        "macro-svcold" => {
+            app.mac.sub = Sub::Macros;
+            app.mac.sel = pos(app, "paste-enter");
+            app.service_state = "inactive".into();
+            app.err("Macros saved, but the service was not restarted. The installed razerctl at ~/.local/bin/razerctl is too old for macros (it has no `macros` command); reinstall it with ./install.sh.");
         }
         "macro-nodevice" => {
             app.mac.sel = pos(app, "paste-enter");

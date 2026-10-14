@@ -143,7 +143,31 @@ fn macros_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-fn run() -> Result<(), String> {
+/// Exit status of `remap` when the config is the problem (no rules, a rule that does not parse, an undefined macro).
+/// Retrying cannot fix those, so the unit lists it in `RestartPreventExitStatus=` (`systemd/razerctl-remap.service`)
+/// and stops instead of crash-looping; every other failure is exit 1 and is retried. 78 is sysexits' EX_CONFIG.
+const EXIT_CONFIG: u8 = 78;
+
+/// A command's failure: the message for stderr and the exit status.
+struct Fail {
+    msg: String,
+    code: u8,
+}
+
+impl Fail {
+    fn config(msg: impl Into<String>) -> Fail {
+        Fail { msg: msg.into(), code: EXIT_CONFIG }
+    }
+}
+
+/// Any other error text is a plain exit-1 failure, so `?` on a `String` / `&str` error keeps working.
+impl<S: Into<String>> From<S> for Fail {
+    fn from(msg: S) -> Fail {
+        Fail { msg: msg.into(), code: 1 }
+    }
+}
+
+fn run() -> Result<(), Fail> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let mut prefer = Prefer::Auto;
     let mut tid = 0x1f;
@@ -156,7 +180,7 @@ fn run() -> Result<(), String> {
                     Some("auto") => Prefer::Auto,
                     Some("hidraw") => Prefer::Hidraw,
                     Some("openrazer") => Prefer::OpenRazer,
-                    o => return Err(format!("bad --backend {o:?}")),
+                    o => return Err(format!("bad --backend {o:?}").into()),
                 };
                 args.drain(i..i + 2);
             }
@@ -193,7 +217,7 @@ fn run() -> Result<(), String> {
                 "--config" => cfg = it.next().ok_or("--config needs a path")?.into(),
                 "--device" => filter = Some(it.next().ok_or("--device needs a name")?.clone()),
                 "--macros" if command == "remap" => mfile = it.next().ok_or("--macros needs a path")?.into(),
-                o => return Err(format!("unexpected argument '{o}'")),
+                o => return Err(format!("unexpected argument '{o}'").into()),
             }
         }
         let sources = || -> Result<Vec<remap::Source>, String> {
@@ -207,25 +231,25 @@ fn run() -> Result<(), String> {
             let sources = sources()?;
             for s in &sources { eprintln!("watching {} ({})", s.path.display(), s.name); }
             eprintln!("press buttons; Ctrl+C to stop");
-            return remap::watch(&sources).map_err(|e| e.to_string());
+            return remap::watch(&sources).map_err(|e| e.to_string().into());
         }
         // every config error before anything is grabbed
-        let map = remap::load_mapping(&cfg, &inline)?;
+        let map = remap::load_mapping(&cfg, &inline).map_err(Fail::config)?;
         if map.is_empty() {
-            return Err("no remap rules".into());
+            return Err(Fail::config("no remap rules"));
         }
-        let macros = remap_macros(&map, &mfile)?;
+        let macros = remap_macros(&map, &mfile).map_err(Fail::config)?;
         for (k, v) in &map { eprintln!("  {k:?} -> {v:?}"); }
         let sources = sources()?;
         return match macros {
             Some(m) => remap::run_with_macros(sources, map, m),
             None => remap::run(sources, map),
         }
-        .map_err(|e| e.to_string());
+        .map_err(|e| Fail::from(e.to_string()));
     }
 
     if command == "macros" {
-        return macros_cmd(rest);
+        return macros_cmd(rest).map_err(Fail::from);
     }
 
     if command == "battery-watch" {
@@ -234,7 +258,7 @@ fn run() -> Result<(), String> {
     if command == "battery-notify-test" {
         let (name, pct, _) = battery::read_battery().unwrap_or(("Razer mouse".into(), 0, false));
         return battery::notify(&format!("{name}: test notification"), &format!("Battery is at {pct}%. Low-battery alerts will look like this."), false)
-            .map_err(|e| format!("couldn't send notification: {e}"));
+            .map_err(|e| Fail::from(format!("couldn't send notification: {e}")));
     }
 
     if command == "list" {
@@ -261,7 +285,7 @@ fn run() -> Result<(), String> {
         return Err("no Razer (VID 1532) HID devices found".into());
     }
     if idx >= devs.len() {
-        return Err(format!("device index {idx} out of range (found {})", devs.len()));
+        return Err(format!("device index {idx} out of range (found {})", devs.len()).into());
     }
     let (node, dev) = devs.swap_remove(idx);
     let dev: Box<dyn Backend> = dev.map_err(|e| {
@@ -360,7 +384,7 @@ fn run() -> Result<(), String> {
             println!("-> {req:?}");
             println!("<- {:?}", h.transact(&req).map_err(e)?);
         }
-        other => return Err(format!("unknown command '{other}'\n\n{USAGE}")),
+        other => return Err(format!("unknown command '{other}'\n\n{USAGE}").into()),
     }
     Ok(())
 }
@@ -368,9 +392,9 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(m) => {
-            eprintln!("razerctl: {m}");
-            ExitCode::FAILURE
+        Err(f) => {
+            eprintln!("razerctl: {}", f.msg);
+            ExitCode::from(f.code)
         }
     }
 }
