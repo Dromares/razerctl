@@ -456,6 +456,8 @@ pub struct MacroUi {
     /// macros.conf exists but does not parse: shown, and never overwritten from here.
     pub load_error: Option<String>,
     pub bind: Bind,
+    /// The selection the narrow list last scrolled into view (it scrolls again only when this changes).
+    pub list_seen: Option<usize>,
 }
 
 impl MacroUi {
@@ -470,6 +472,7 @@ impl MacroUi {
             confirm_delete: false,
             load_error: None,
             bind: Bind::default(),
+            list_seen: None,
         }
     }
 
@@ -828,10 +831,14 @@ fn cell(ui: &mut Ui, w: f32, h: f32, add: impl FnOnce(&mut Ui)) {
     });
 }
 
+/// Rows of the macro list shown at once below 900 px: three and a half, so the next row peeks out.
+const LIST_ROWS_NARROW: f32 = 3.5;
+
 /// `add`, inside a vertical scroll area of fixed height `h` when `scroll` (long lists), else as it is.
-fn scroll_if(ui: &mut Ui, scroll: bool, id: &str, h: f32, add: impl FnOnce(&mut Ui)) {
+fn scroll_if(ui: &mut Ui, scroll: bool, id: &str, h: f32, bar_visible: bool, add: impl FnOnce(&mut Ui)) {
     if scroll {
-        egui::ScrollArea::vertical().id_salt(id).max_height(h).min_scrolled_height(h).auto_shrink([false, false]).show(ui, add);
+        let vis = if bar_visible { egui::scroll_area::ScrollBarVisibility::AlwaysVisible } else { egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded };
+        egui::ScrollArea::vertical().id_salt(id).max_height(h).min_scrolled_height(h).auto_shrink([false, false]).scroll_bar_visibility(vis).show(ui, add);
     } else {
         add(ui);
     }
@@ -1081,7 +1088,7 @@ impl App {
             ui.allocate_ui_with_layout(vec2(list_w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(list_w);
                 section(ui, &p, "01", "Macros");
-                self.macro_list(ui);
+                self.macro_list(ui, narrow);
             });
             ui.allocate_ui_with_layout(vec2(right_w, 0.0), Layout::top_down(Align::Min), |ui| {
                 ui.set_width(right_w);
@@ -1131,18 +1138,33 @@ impl App {
         }
     }
 
-    fn macro_list(&mut self, ui: &mut Ui) {
+    fn macro_list(&mut self, ui: &mut Ui, narrow: bool) {
         let p = self.pal;
         let refs = rule_refs(&self.conf_text);
         let issues = self.mac.all_issues();
         let sel = self.mac.sel;
         let mut clicked = None;
         let mut new = false;
+        // below 900 px the panels stack, so the list must not push the editor off the screen: compact rows, capped at
+        // 3.5 rows (the half row says "more below") with a solid scrollbar, and the selected row scrolled into view
+        let scroll_sel = self.mac.list_seen != Some(sel);
+        self.mac.list_seen = Some(sel);
         Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.i18())).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
-            let row_h = 76.0;
-            scroll_if(ui, self.mac.drafts.len() > 8, "macro-list", row_h * 8.0, |ui| {
+            let row_h = if narrow { 54.0 } else { 76.0 };
+            let (capped, cap_h) = if narrow { (self.mac.drafts.len() > 3, row_h * LIST_ROWS_NARROW) } else { (self.mac.drafts.len() > 8, row_h * 8.0) };
+            if narrow {
+                // egui's handle is `bg_fill` of the inactive widget, which this theme sets to the track colour (invisible)
+                let st = ui.style_mut();
+                st.spacing.scroll = egui::style::ScrollStyle::solid();
+                st.spacing.scroll.bar_width = 8.0;
+                st.spacing.scroll.floating_allocated_width = 0.0;
+                st.visuals.widgets.inactive.bg_fill = p.i65_on(p.sunken);
+                st.visuals.widgets.hovered.bg_fill = p.i100();
+                st.visuals.widgets.active.bg_fill = p.i100();
+            }
+            scroll_if(ui, capped, "macro-list", cap_h, narrow, |ui| {
                 for (i, d) in self.mac.drafts.iter().enumerate() {
                     let w = ui.available_width();
                     let (rect, resp) = ui.allocate_exact_size(vec2(w, row_h), Sense::click());
@@ -1153,10 +1175,11 @@ impl App {
                         ui.painter().add(Shape::Rect(RectShape::filled(Rect::from_min_size(rect.min, vec2(3.0, rect.height())), R0, p.stamp_bg)));
                     }
                     ui.painter().hline(rect.x_range(), rect.bottom(), Stroke::new(1.0, p.i18()));
+                    if is_sel && scroll_sel { ui.scroll_to_rect(rect, None); }
                     let inner = Rect::from_min_max(pos2(rect.left() + S4, rect.top()), pos2(rect.right() - S3, rect.bottom()));
                     let mut c = ui.new_child(egui::UiBuilder::new().max_rect(inner).layout(Layout::top_down(Align::Min)));
                     c.spacing_mut().item_spacing.y = 2.0;
-                    c.add_space(10.0);
+                    c.add_space(if narrow { 8.0 } else { 10.0 });
                     c.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 8.0;
                         let name = if d.name.is_empty() { "(no name)" } else { d.name.as_str() };
@@ -1170,10 +1193,20 @@ impl App {
                     } else {
                         format!("{} EVENT{} · {}", d.events.len(), if d.events.len() == 1 { "" } else { "S" }, fmt_s(d.run_ms()).to_uppercase())
                     };
-                    c.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
                     let used = used_by(d, &refs);
                     let used_txt = if used.is_empty() { "UNUSED".to_string() } else { used.join("  /  ") };
-                    c.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), if used.is_empty() { p.i45() } else { p.i65() }, 0.10)).truncate());
+                    let used_col = if used.is_empty() { p.i45() } else { p.i65() };
+                    if narrow {
+                        // one meta line: what it is, then where it is used
+                        c.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = S3;
+                            ui.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
+                            ui.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
+                        });
+                    } else {
+                        c.label(tracked(&detail, mono(T_MICRO), p.i65(), 0.10));
+                        c.add(egui::Label::new(tracked(&format!("→ {used_txt}"), mono(T_MICRO), used_col, 0.10)).truncate());
+                    }
                     if resp.clicked() {
                         clicked = Some(i);
                     }
@@ -1289,7 +1322,7 @@ impl App {
                     c.label(RichText::new("No events yet.").font(serif(T_TITLE - 2.0)).color(p.i100()));
                     c.label(RichText::new("Add a key press, a click or a delay below.").font(sans(T_BODY - 1.0)).color(p.i65()));
                 }
-                scroll_if(ui, n_events > 14, "macro-events", 26.0 * 14.0, |ui| {
+                scroll_if(ui, n_events > 14, "macro-events", 26.0 * 14.0, false, |ui| {
                     ui.spacing_mut().item_spacing = vec2(0.0, 0.0);
                     let mut at: u32 = 0;
                     for (i, e) in d.events.iter_mut().enumerate() {
@@ -1368,11 +1401,10 @@ impl App {
             // --- add bar (left) + validity and run time (right; under the buttons when the panel is narrow)
             let stack_bar = w < 800.0;
             let validity = |ui: &mut Ui| {
+                // the problem count lives in the problem box below, next to the messages it counts (DAN-1452 note f)
                 if issues.is_empty() {
                     chip(ui, &p, Some("●"), "Valid", ChipStyle::Plain, p.ok);
                     ui.label(RichText::new(format!("{} events · about {} per run", n_events, fmt_s(run_ms))).font(mono(T_DATA)).color(p.i100()));
-                } else {
-                    chip(ui, &p, Some("×"), &format!("{} problem{}", issues.len(), if issues.len() == 1 { "" } else { "s" }), ChipStyle::Plain, p.bad);
                 }
             };
             ui.horizontal(|ui| {
@@ -1402,12 +1434,12 @@ impl App {
                         if ui.button(l).clicked() { act = Act::Add(vec![ev]); }
                     }
                 });
-                if !stack_bar {
+                if !stack_bar && issues.is_empty() {
                     ui.add_space(S3);
                     validity(ui);
                 }
             });
-            if stack_bar {
+            if stack_bar && issues.is_empty() {
                 ui.add_space(S1);
                 ui.horizontal(validity);
             }
@@ -1417,6 +1449,7 @@ impl App {
                 Frame::new().fill(p.i06()).stroke(Stroke::new(1.0, p.i45())).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.spacing_mut().item_spacing.y = 4.0;
+                    ui.label(tracked(&format!("× {} PROBLEM{}", issues.len(), if issues.len() == 1 { "" } else { "S" }), mono_med(T_LABEL), p.bad, 0.12));
                     for is in &issues {
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 8.0;

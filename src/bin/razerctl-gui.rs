@@ -1004,6 +1004,10 @@ impl App {
                     }
                 });
             });
+            ui.add_space(S1);
+            ui.add(egui::Label::new(RichText::new(
+                "A separate background service: it keeps sending alerts when the window is closed or razerctl is quit.",
+            ).font(sans(T_SMALL)).color(p.i65())).wrap());
         });
         if changed { self.apply_battery_settings(); }
     }
@@ -1812,7 +1816,15 @@ mod tests {
         assert!(l.contains(&"KEY_LEFTSHIFT is pressed at #01 and never released, so it would stay held after the macro ends."), "{l:?}");
         assert!(l.contains(&"×"), "the offending row carries a × of its own");
         assert!(l.iter().filter(|s| **s == "INVALID").count() == 2, "both list rows say INVALID: {l:?}");
-        assert!(l.contains(&"2 MACROS INVALID") && l.contains(&"1 PROBLEM"), "{l:?}");
+        assert!(l.contains(&"2 MACROS INVALID") && l.contains(&"× 1 PROBLEM"), "{l:?}");
+        assert!(!l.iter().any(|s| s.ends_with("Valid") || s.contains("per run")), "no validity in the add bar while invalid: {l:?}");
+        // (f): the count sits inside the problem box, directly above the message it counts, at every width
+        for size in SIZES {
+            let t = software(&mut app, (size.0, TALL));
+            let y = |needle: &str| t.iter().find(|(s, ..)| s.contains(needle)).map(|(_, p, _)| p.y).unwrap_or_else(|| panic!("{needle} missing at {size:?}"));
+            assert!(y("+ TAP KEY") < y("× 1 PROBLEM") && y("× 1 PROBLEM") < y("KEY_LEFTSHIFT is pressed"), "{size:?}");
+            assert!(y("× 1 PROBLEM") - y("KEY_LEFTSHIFT is pressed") > -40.0, "the count is next to its message: {size:?}");
+        }
         assert_eq!(save_macros_colour(&t), Some(app.pal.i45()), "Save macros is disabled");
         let restart = t.iter().find(|(s, ..)| s.ends_with("SAVE AND RESTART SERVICE")).and_then(|(_, _, c)| *c);
         assert_eq!(restart, Some(app.pal.i45()), "so is Save and restart");
@@ -1830,6 +1842,42 @@ mod tests {
         app.mac.drafts[2].events.pop();
         app.mac.drafts[2].events.push(Ev::Delay(1));
         assert!(app.mac.can_save());
+    }
+
+    #[test]
+    fn narrow_macro_list_is_capped_at_three_and_a_half_compact_rows_with_the_selection_in_view() {
+        let eight = "[a1]\ntap a\n[b2]\ntap b\n[c3]\ntap c\n[d4]\ntap d\n[e5]\ntap e\n[f6]\ntap f\n[g7]\ntap g\n[h8]\ntap h\n";
+        let mut app = macro_app(Sub::Macros);
+        app.mac = MacroUi::from_macros(&macros::parse_macros(eight).unwrap());
+        app.mac.sub = Sub::Macros;
+        let names = |app: &mut App, size: (f32, f32)| -> Vec<(String, f32)> {
+            render_texts(app, Tab::Software, Mode::Dark, size).into_iter()
+                .filter(|(s, ..)| s.len() == 2 && s.ends_with(|c: char| c.is_ascii_digit()) && s.starts_with(|c: char| c.is_ascii_lowercase()))
+                .map(|(s, p, _)| (s, p.y)).collect::<Vec<_>>()
+                .into_iter().fold(Vec::new(), |mut v, (s, y)| { if !v.iter().any(|(t, _)| *t == s) { v.push((s, y)); } v }) // the Name field repeats one
+        };
+        // wide: the existing 76 px rows, all eight (the cap is 8 rows)
+        assert_eq!(names(&mut app, (1280.0, TALL)).len(), 8);
+        // 800 px: only what fits in 3.5 compact rows is drawn, rows are 54 px apart, and the first one is selected
+        app.mac.list_seen = None;
+        let n = names(&mut app, (800.0, TALL));
+        assert!((3..=4).contains(&n.len()), "3.5 rows: {n:?}");
+        assert!((n[1].1 - n[0].1 - 54.0).abs() < 1.0, "compact rows: {n:?}");
+        // the selection is scrolled into view: pick the last macro and the list shows it
+        app.mac.sel = 7;
+        let ctx = egui::Context::default();
+        install_fonts(&ctx);
+        apply_style(&ctx, &app.pal);
+        let mut input = egui::RawInput::default();
+        input.screen_rect = Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, TALL)));
+        let mut drawn = Vec::new();
+        for _ in 0..6 { // the scroll animates over a few frames
+            let mut out = ctx.run_ui(input.clone(), |ui| { app.ui_software(ui); });
+            drawn = out.shapes.iter().filter_map(|cs| if let EShape::Text(t) = &cs.shape { Some(t.galley.text().to_string()) } else { None }).collect();
+            out.textures_delta.clear();
+        }
+        assert!(drawn.iter().any(|s| s == "h8"), "the selected row is in view after scrolling: {drawn:?}");
+        assert!(!drawn.iter().any(|s| s == "a1"), "and the top of the list scrolled away: {drawn:?}");
     }
 
     #[test]
