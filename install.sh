@@ -9,6 +9,7 @@ cd "$(dirname "$0")"
 BIN="$HOME/.local/bin"
 APPS="$HOME/.local/share/applications"
 ICONS="$HOME/.local/share/icons/hicolor/scalable/apps"
+SYMBOLIC="$HOME/.local/share/icons/hicolor/symbolic/apps"
 UNITS="$HOME/.config/systemd/user"
 RULE=/etc/udev/rules.d/70-razerctl.rules
 OLD_RULE=/etc/udev/rules.d/99-razerctl.rules   # earlier versions; sorted too late for uaccess
@@ -16,7 +17,7 @@ OLD_RULE=/etc/udev/rules.d/99-razerctl.rules   # earlier versions; sorted too la
 if [[ "${1:-}" == "--uninstall" ]]; then
     systemctl --user disable --now razerctl-remap.service razerctl-battery.service 2>/dev/null || true
     rm -f "$BIN/razerctl" "$BIN/razerctl-gui" "$APPS/razerctl.desktop" "$ICONS/razerctl.svg" \
-          "$UNITS/razerctl-remap.service" "$UNITS/razerctl-battery.service"
+          "$SYMBOLIC"/razerctl-*symbolic.svg "$UNITS/razerctl-remap.service" "$UNITS/razerctl-battery.service"
     systemctl --user daemon-reload || true
     echo "Removed. (Left $RULE and ~/.config/razerctl in place; delete them by hand if you want.)"
     exit 0
@@ -27,6 +28,7 @@ install -Dm755 target/release/razerctl     "$BIN/razerctl"
 install -Dm755 target/release/razerctl-gui "$BIN/razerctl-gui"
 install -Dm644 packaging/razerctl.desktop  "$APPS/razerctl.desktop"
 install -Dm644 packaging/razerctl.svg      "$ICONS/razerctl.svg"
+for f in packaging/icons/razerctl-*symbolic.svg; do install -Dm644 "$f" "$SYMBOLIC/$(basename "$f")"; done
 install -Dm644 systemd/razerctl-remap.service "$UNITS/razerctl-remap.service"
 install -Dm644 systemd/razerctl-battery.service "$UNITS/razerctl-battery.service"
 systemctl --user daemon-reload || true

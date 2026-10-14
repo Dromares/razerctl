@@ -653,6 +653,9 @@ pub fn linger(host: &Host) -> Cmd {
 /// Replace this process by a fresh GUI. Returns only if that failed.
 pub fn reopen_window() -> std::io::Error {
     use std::os::unix::process::CommandExt;
+    // the tray menu / SNI Activate call that asked for this is answered on a thread of this process: let the reply go
+    // out before exec closes the D-Bus connection under it
+    std::thread::sleep(Duration::from_millis(250));
     match std::env::current_exe() {
         Ok(exe) => std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec(),
         Err(e) => e,
@@ -780,6 +783,19 @@ mod tests {
         assert_eq!(snapshot_from(Err("no Razer device".into()), "active", 20).remap, RemapLine::Waiting);
         assert_eq!(snapshot_from(Err("x".into()), "failed", 20).remap, RemapLine::Failed);
         assert_eq!(snapshot_from(Ok(("M".into(), 5, false)), "inactive", 20).remap, RemapLine::Stopped);
+    }
+
+    #[test]
+    fn show_and_quit_only_message_the_window_and_start_no_systemctl() {
+        // The tray's Quit stops the GUI and nothing else (AC-T3): Show / Quit are plain messages, and only the three
+        // remap actions spawn systemctl, which are on SERVICE alone. The battery notifier unit is never named here.
+        let host = Host::fake(true);
+        run_act(&host.shared, Act::Quit);
+        run_act(&host.shared, Act::Show);
+        assert_eq!(host.drain(), [Cmd::Quit, Cmd::Show]);
+        let src = include_str!("tray.rs");
+        let code = src.split("#[cfg(test)]").next().unwrap();
+        assert!(!code.contains("battery::SERVICE") && !code.contains("razerctl-battery"), "the tray must not touch the notifier unit");
     }
 
     #[test]

@@ -1484,9 +1484,13 @@ fn main() -> eframe::Result {
     // The window is gone. Unless closing it meant "hide to the tray", that is the end; otherwise this process stays
     // as the tray until the user wants the window back or quits from the menu.
     if let Some(host) = host.filter(|h| h.outcome() == Some(CloseAction::Hide)) {
-        let path = tray::config_path();
-        let mut settings = tray::load_settings(&path);
-        tray::first_close_notice(&path, &mut settings);
+        // on its own thread: notify-send waits as long as the notification daemon takes, and the tray must answer meanwhile
+        std::thread::spawn(|| {
+            let path = tray::config_path();
+            let mut settings = tray::load_settings(&path);
+            tray::first_close_notice(&path, &mut settings);
+        });
+        eprintln!("razerctl-gui: window closed; staying in the tray (Show reopens it, Quit exits)");
         if tray::linger(&host) == Cmd::Show {
             eprintln!("razerctl-gui: reopening the window failed: {}", tray::reopen_window());
         }
