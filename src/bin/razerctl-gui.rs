@@ -1562,6 +1562,11 @@ mod tests {
     /// Like `render`, one entry per string drawn: text, position, and override colour (buttons paint their label
     /// with one, so it tells an enabled button from a disabled one).
     fn render_texts(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> Vec<(String, egui::Pos2, Option<Color32>)> {
+        render_galleys(app, tab, mode, size).into_iter().map(|(g, pos, c)| (g.text().to_string(), pos, c)).collect()
+    }
+
+    /// `render_texts` with the laid-out galley kept, so a test can see how many rows a string wrapped onto.
+    fn render_galleys(app: &mut App, tab: Tab, mode: Mode, size: (f32, f32)) -> Vec<(std::sync::Arc<egui::Galley>, egui::Pos2, Option<Color32>)> {
         let ctx = egui::Context::default();
         install_fonts(&ctx);
         app.pal = Pal::new(mode);
@@ -1585,7 +1590,7 @@ mod tests {
             });
             texts.clear();
             for cs in &out.shapes {
-                if let EShape::Text(t) = &cs.shape { texts.push((t.galley.text().to_string(), t.pos, t.override_text_color)); }
+                if let EShape::Text(t) = &cs.shape { texts.push((t.galley.clone(), t.pos, t.override_text_color)); }
             }
             // No renderer consumes the font-atlas upload here; epaint 0.36 panics on drop if it is left unapplied.
             out.textures_delta.clear();
@@ -1640,6 +1645,21 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn polling_readback_wraps_whole_at_the_minimum_width() {
+        // render() has no CentralPanel, so take its 24 px side margins off the window width: 732 is the content width of
+        // the 780 px minimum window, and it is tall because egui drops text that is entirely below the screen
+        for size in [(1232.0, 900.0), (732.0, 1800.0)] {
+            let mut app = test_app();
+            with_device(&mut app);
+            let rate = app.info.as_ref().and_then(|i| i.poll_rate).expect("demo device reports a polling rate");
+            let want = format!("current {rate} Hz");
+            let galleys = render_galleys(&mut app, Tab::Device, Mode::Dark, size);
+            let g = galleys.iter().find(|(g, ..)| g.text() == want).unwrap_or_else(|| panic!("{size:?}: {want:?} not drawn"));
+            assert_eq!(g.0.rows.len(), 1, "{size:?}: {want:?} was split across the wrap");
         }
     }
 
