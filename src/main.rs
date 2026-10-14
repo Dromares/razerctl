@@ -233,6 +233,10 @@ fn run() -> Result<(), Fail> {
             eprintln!("press buttons; Ctrl+C to stop");
             return remap::watch(&sources).map_err(|e| e.to_string().into());
         }
+        // a Stop all macros (SIGUSR1) during startup must not kill the service before it can handle it
+        if let Err(e) = remap::install_stop_all_handler() {
+            eprintln!("SIGUSR1 (stop all macros) unavailable: {e}");
+        }
         // every config error before anything is grabbed
         let map = remap::load_mapping(&cfg, &inline).map_err(Fail::config)?;
         if map.is_empty() {

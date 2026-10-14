@@ -395,9 +395,11 @@ extern "C" fn on_usr1(_: libc::c_int) {
     STOP_ALL_REQUESTED.store(true, Ordering::SeqCst);
 }
 
-/// Install the SIGUSR1 handler and the thread that turns it into `Player::stop_all`: running macros end, held keys
-/// and buttons are released, and remapping carries on. `SA_RESTART` keeps the evdev reads from seeing `EINTR`.
-fn watch_stop_all(player: Arc<Mutex<Player>>) -> io::Result<()> {
+/// Install the SIGUSR1 handler. Until it is installed the signal's default action kills the process, so this runs
+/// first thing in `razerctl remap` (and again, harmlessly, in `run_with_macros`): a *Stop all macros* that lands while
+/// the config is loading or the devices are being grabbed only sets the flag, and `watch_stop_all` acts on it once the
+/// player exists. `SA_RESTART` keeps the evdev reads from seeing `EINTR`.
+pub fn install_stop_all_handler() -> io::Result<()> {
     // SAFETY: the handler is async-signal-safe (one atomic store) and `sa` is fully initialised before the call.
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
@@ -408,6 +410,13 @@ fn watch_stop_all(player: Arc<Mutex<Player>>) -> io::Result<()> {
             return Err(io::Error::last_os_error());
         }
     }
+    Ok(())
+}
+
+/// Start the thread that turns SIGUSR1 into `Player::stop_all`: running macros end, held keys and buttons are
+/// released, and remapping carries on. A request already pending from the startup window is served immediately.
+fn watch_stop_all(player: Arc<Mutex<Player>>) -> io::Result<()> {
+    install_stop_all_handler()?;
     thread::Builder::new().name("stop-all".into()).spawn(move || loop {
         if STOP_ALL_REQUESTED.swap(false, Ordering::SeqCst) {
             player.lock().unwrap_or_else(PoisonError::into_inner).stop_all();
@@ -498,6 +507,9 @@ pub fn run(sources: Vec<Source>, map: Mapping) -> io::Result<()> {
 /// `run`, but with macros: check_macros first, then grab and forward, playing macro
 /// buttons through the same uinput device.
 pub fn run_with_macros(sources: Vec<Source>, map: Mapping, macros: macros::Macros) -> io::Result<()> {
+    if let Err(e) = install_stop_all_handler() {
+        eprintln!("SIGUSR1 (stop all macros) unavailable: {e}");
+    }
     check_macros(&map, &macros).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     // union of capabilities across all grabbed nodes + every key we may emit
     let mut keys = AttributeSet::<KeyCode>::new();
