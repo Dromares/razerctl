@@ -11,7 +11,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use crate::protocol::{Report, Status, REPORT_LEN};
+use crate::protocol::{Report, Status, ARGS_LEN, REPORT_LEN};
 
 pub const RAZER_VID: u16 = 0x1532;
 
@@ -199,7 +199,7 @@ fn trace(attempt: usize, poll: usize, sent: (u8, u8), resp: &Report) {
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() % 1_000_000);
-    let n = (resp.data_size as usize).min(16);
+    let n = (resp.data_size as usize).min(ARGS_LEN);
     eprintln!(
         "hid t={t}ms sent={:02x}:{:02x} attempt={attempt} poll={poll} status={:#04x} tid={:#04x} resp={:02x}:{:02x} size={} args={:02x?}",
         sent.0, sent.1, resp.status, resp.transaction_id, resp.command_class, resp.command_id,

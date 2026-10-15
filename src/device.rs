@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::hidraw::{self, Hidraw, HidrawNode};
+use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{byte_to_poll_rate, cmd, poll_rate_to_byte, Report};
 
 pub const VARSTORE: u8 = 0x01;
@@ -114,6 +114,19 @@ pub fn decode_dpi_stages_sysfs(b: &[u8]) -> io::Result<DpiStages> {
     })
 }
 
+/// Query the stage table on `io` (old behaviour, unchanged by this commit): one transaction, decoded as is.
+pub fn read_dpi_stages_on(
+    io: &impl FeatureIo,
+    tid: u8,
+    _backoff: std::time::Duration,
+) -> io::Result<DpiStages> {
+    let r = transact_on(
+        io,
+        &Report::new(cmd::GET_DPI_STAGES, 0x26, tid).with_args(&[VARSTORE]),
+    )?;
+    Ok(decode_dpi_stages_proto(&r.args))
+}
+
 // ---------------------------------------------------------------- hidraw
 
 pub struct HidrawBackend {
@@ -171,8 +184,7 @@ impl Backend for HidrawBackend {
             .map(|_| ())
     }
     fn dpi_stages(&self) -> io::Result<DpiStages> {
-        let r = self.q(cmd::GET_DPI_STAGES, 0x26, &[VARSTORE])?;
-        Ok(decode_dpi_stages_proto(&r.args))
+        read_dpi_stages_on(&self.dev, self.tid, std::time::Duration::from_millis(15))
     }
     fn poll_rate(&self) -> io::Result<u32> {
         let r = self.q(cmd::GET_POLL_RATE2, 0x01, &[])?;
@@ -376,6 +388,160 @@ mod tests {
         );
     }
 
+    // ---- DAN-1526: replayed from the raw HID log of the real Viper Mini SE (fw 1.4) ----
+
+    use crate::hidraw::FeatureIo;
+    use crate::protocol::{Report, REPORT_LEN};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// Payload of a complete 04:86 answer (status 0x02), captured live.
+    const FULL: [u8; 38] = [
+        0x01, 0x04, 0x05, 0x01, 0x01, 0x90, 0x01, 0x90, 0x00, 0x00, 0x02, 0x03, 0x20, 0x03, 0x20,
+        0x00, 0x00, 0x03, 0x06, 0x40, 0x06, 0x40, 0x00, 0x00, 0x04, 0x0c, 0x80, 0x0c, 0x80, 0x00,
+        0x00, 0x05, 0x19, 0x00, 0x19, 0x00, 0x00, 0x00,
+    ];
+    const WANT: [(u16, u16); 5] = [
+        (400, 400),
+        (800, 800),
+        (1600, 1600),
+        (3200, 3200),
+        (6400, 6400),
+    ];
+
+    fn answer(status: u8, payload: &[u8]) -> Report {
+        let mut r = Report::new(cmd::GET_DPI_STAGES, 0x26, 0x1f).with_args(payload);
+        r.status = status;
+        r
+    }
+    fn full() -> Report {
+        answer(2, &FULL)
+    }
+    fn busy() -> Report {
+        answer(1, &FULL[..1])
+    }
+    /// What the firmware really sends sometimes: status Success but only the first `n` stage
+    /// entries filled in (the rest still zero, count byte already 5). Re-reading never completes it.
+    fn truncated(n: usize) -> Report {
+        let mut p = FULL;
+        p[3 + n * 7..].fill(0);
+        answer(2, &p)
+    }
+
+    /// A device that answers each request with the next scripted sequence of reads; the last read
+    /// of a sequence repeats if polled further.
+    struct Mock {
+        rounds: RefCell<VecDeque<Vec<Report>>>,
+        cur: RefCell<VecDeque<Report>>,
+        last: RefCell<Option<Report>>,
+        sends: RefCell<usize>,
+    }
+    impl Mock {
+        fn new(rounds: Vec<Vec<Report>>) -> Mock {
+            Mock {
+                rounds: RefCell::new(rounds.into()),
+                cur: RefCell::default(),
+                last: RefCell::default(),
+                sends: RefCell::new(0),
+            }
+        }
+        fn sends(&self) -> usize {
+            *self.sends.borrow()
+        }
+    }
+    impl FeatureIo for Mock {
+        fn send_feature(&self, _p: &[u8; REPORT_LEN]) -> io::Result<()> {
+            *self.sends.borrow_mut() += 1;
+            *self.cur.borrow_mut() = self
+                .rounds
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default()
+                .into();
+            Ok(())
+        }
+        fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]> {
+            let next = self.cur.borrow_mut().pop_front();
+            let r = match next {
+                Some(r) => {
+                    *self.last.borrow_mut() = Some(r.clone());
+                    r
+                }
+                None => self.last.borrow().clone().expect("mock ran out of answers"),
+            };
+            let mut raw = [0u8; REPORT_LEN + 1];
+            raw[1..].copy_from_slice(&r.to_bytes());
+            Ok(raw)
+        }
+    }
+
+    const NO_WAIT: Duration = Duration::ZERO;
+
+    #[test]
+    fn complete_answer_loads_in_one_query() {
+        let m = Mock::new(vec![vec![busy(), busy(), full()]]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!((s.active, s.stages), (4, WANT.to_vec()));
+        assert_eq!(m.sends(), 1);
+    }
+
+    #[test]
+    fn truncated_success_is_requeried_until_complete() {
+        // log: before-A-2 round 0 (first stage only), before-A-4, before-A-5, then a good one
+        let m = Mock::new(vec![
+            vec![busy(), truncated(1)],
+            vec![busy(), busy(), truncated(2)],
+            vec![busy(), truncated(4)],
+            vec![busy(), full()],
+        ]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(
+            s.stages,
+            WANT.to_vec(),
+            "must never surface a partial stage set"
+        );
+        assert_eq!(m.sends(), 4);
+    }
+
+    #[test]
+    fn garbage_answer_is_requeried() {
+        // log: before-A-2 round 0: count=5 but the table is [32768, 0, 0, 0, 0]
+        let mut g = FULL;
+        g[3..].fill(0);
+        g[3] = 0x01;
+        g[4] = 0x80;
+        let m = Mock::new(vec![vec![answer(2, &g)], vec![full()]]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(s.stages, WANT.to_vec());
+    }
+
+    #[test]
+    fn stays_truncated_is_an_error_not_a_partial_set() {
+        let m = Mock::new(vec![vec![truncated(2)]; 20]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert!(e.to_string().contains("incomplete"), "{e}");
+        assert!(m.sends() > 1, "should have re-queried before giving up");
+    }
+
+    #[test]
+    fn slow_busy_wait_outlasts_the_old_20_poll_budget() {
+        // log: before-A-10 round 0: 04:86 answered Busy for >20 polls (~120 ms), then Success
+        let mut seq = vec![busy(); 40];
+        seq.push(full());
+        let m = Mock::new(vec![seq]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(s.stages, WANT.to_vec());
+        assert_eq!(m.sends(), 1, "waiting on Busy must not resend the request");
+    }
+
+    #[test]
+    fn asleep_is_reported_as_asleep() {
+        let m = Mock::new(vec![vec![answer(4, &FULL[..1])]]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("asleep"), "{e}");
+    }
     #[test]
     fn battery_percent() {
         assert_eq!(raw_to_pct(255), 100);
