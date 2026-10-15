@@ -4018,8 +4018,8 @@ mod tests {
         std::fs::write(&old.conf_path, RULES).unwrap();
         old.tab = Tab::Device;
         old.conf_text = RULES.into(); // the editor holds exactly what the file does: nothing unsaved
-        let _ = std::fs::remove_dir_all(&dir);
         let fresh = hide_and_show(&mut old);
+        let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(fresh.tab, Tab::Device);
         assert_eq!(
             fresh.conf_text, RULES,
