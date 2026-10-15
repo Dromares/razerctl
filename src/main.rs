@@ -386,6 +386,9 @@ fn run() -> Result<(), Fail> {
                         .join(" ")
                 }),
             );
+            if let Some(e) = &i.dpi_stages_error {
+                println!("{:<12} ({e})", "");
+            }
             show("Poll rate:", i.poll_rate.map(|p| format!("{p} Hz")));
             show(
                 "Battery:",

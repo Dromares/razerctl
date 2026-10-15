@@ -104,6 +104,7 @@ pub fn info(battery: u8, charging: bool) -> Info {
         firmware: Some("v1.04.00".into()),
         serial: Some("PM0000H00000".into()),
         dpi: Some((800, 800)),
+        dpi_stages_error: None,
         dpi_stages: Some(DpiStages {
             active: 2,
             stages: [400, 800, 1600, 3200, 6400]

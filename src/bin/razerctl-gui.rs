@@ -214,6 +214,17 @@ fn open_backend() -> Result<Box<dyn Backend>, String> {
     b.map_err(|e| e.to_string())
 }
 
+/// What the DPI-stages row says when the stage read gave no complete table. Never a partial list.
+fn dpi_stages_missing(err: Option<&str>) -> String {
+    match err {
+        Some(e) if e.contains("asleep") => {
+            "Mouse asleep — move it to wake, then press Refresh.".into()
+        }
+        Some(e) => format!("Couldn't read the stages ({e}). Press Refresh."),
+        None => "n/a".into(),
+    }
+}
+
 fn sleep_hint(e: impl ToString) -> String {
     let s = e.to_string();
     if s.contains("asleep") || s.contains("0x04") {
@@ -1412,7 +1423,7 @@ impl App {
                 }
                 None => {
                     ui.label(
-                        RichText::new("n/a")
+                        RichText::new(dpi_stages_missing(info.dpi_stages_error.as_deref()))
                             .font(mono(T_DATA + 1.0))
                             .color(p.i100()),
                     );
@@ -2361,6 +2372,19 @@ mod tests {
     use super::*;
     use eframe::egui::epaint::Shape as EShape;
     use razerctl::macros;
+
+    #[test]
+    fn missing_dpi_stages_say_asleep_or_why_never_a_partial_list() {
+        assert!(dpi_stages_missing(Some(
+            "the receiver can't reach the mouse (status 0x04) — it is probably asleep; move it"
+        ))
+        .starts_with("Mouse asleep"));
+        assert!(
+            dpi_stages_missing(Some("incomplete DPI stage table after 8 reads"))
+                .starts_with("Couldn't read the stages")
+        );
+        assert_eq!(dpi_stages_missing(None), "n/a");
+    }
 
     pub(super) fn test_app() -> App {
         App {

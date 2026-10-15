@@ -11,7 +11,7 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
-use crate::protocol::{Report, Status, REPORT_LEN};
+use crate::protocol::{Report, Status, ARGS_LEN, REPORT_LEN};
 
 pub const RAZER_VID: u16 = 0x1532;
 
@@ -163,43 +163,118 @@ impl Hidraw {
         Ok(buf)
     }
 
-    /// Send a request and poll for its response, retrying while the device
-    /// reports Busy (Synapse's mutex+retry loop around sendFeatureReport).
-    ///
-    /// If another program (e.g. openrazer-daemon polling battery) talks to the
-    /// mouse between our write and read, the response belongs to *its* command
-    /// (Mismatch). That is a collision, not a device error, so we resend.
+    /// Send a request and wait for its response; see [`transact_on`].
     pub fn transact(&self, req: &Report) -> io::Result<Report> {
-        let sent = (req.command_class, req.command_id);
-        let mut last = None;
-        for _attempt in 0..5 {
-            self.send_feature(&req.to_bytes())?;
-            let mut collided = false;
-            for _ in 0..20 {
-                std::thread::sleep(std::time::Duration::from_millis(2));
-                let raw = self.get_feature()?;
-                let resp = Report::parse(&raw).map_err(io::Error::other)?;
-                match resp.status_for(sent) {
-                    Status::Success => return Ok(resp),
-                    Status::Busy | Status::NewCommand => continue,
-                    Status::Mismatch => { collided = true; last = Some(resp); break; }
-                    Status::Timeout => return Err(io::Error::new(io::ErrorKind::TimedOut,
-                        "the receiver can't reach the mouse (status 0x04) — it is probably asleep; move it or click, then retry")),
-                    s => return Err(io::Error::other(format!("device returned {s:?}: {resp:?}"))),
-                }
-            }
-            if !collided {
-                return Err(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "device stayed busy",
-                ));
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        Err(io::Error::other(format!(
-            "response kept colliding with another program's command: {last:?}"
-        )))
+        transact_on(self, req)
     }
+}
+
+/// The two feature-report operations a Protocol25 exchange needs. `Hidraw` is the real
+/// implementation; tests script a mock so busy / partial / colliding answers can be replayed.
+pub trait FeatureIo {
+    fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()>;
+    fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]>;
+}
+
+impl FeatureIo for Hidraw {
+    fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {
+        Hidraw::send_feature(self, payload)
+    }
+    fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]> {
+        Hidraw::get_feature(self)
+    }
+}
+
+/// `RAZERCTL_HID_TRACE=1` logs every response read to stderr (command, status byte, size, args).
+/// Read-only diagnostics: it never changes what is sent.
+fn trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RAZERCTL_HID_TRACE").is_some_and(|v| !v.is_empty()))
+}
+
+fn trace(attempt: usize, poll: usize, sent: (u8, u8), resp: &Report) {
+    if !trace_enabled() {
+        return;
+    }
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() % 1_000_000);
+    let n = (resp.data_size as usize).min(ARGS_LEN);
+    eprintln!(
+        "hid t={t}ms sent={:02x}:{:02x} attempt={attempt} poll={poll} status={:#04x} tid={:#04x} resp={:02x}:{:02x} size={} args={:02x?}",
+        sent.0, sent.1, resp.status, resp.transaction_id, resp.command_class, resp.command_id,
+        resp.data_size, &resp.args[..n]
+    );
+}
+
+/// How long one request is awaited, in polls of ~5 ms, before a Busy answer is treated as lost.
+const BUSY_WINDOW_POLLS: usize = 30;
+/// Re-sends of a *read* that stays Busy (each after a window), ≈ 1.8 s in all.
+const READ_ATTEMPTS: usize = 12;
+
+/// Send a request and poll for its response.
+///
+/// * Busy is waited out for a window of [`BUSY_WINDOW_POLLS`]. An idle wireless mouse can keep
+///   the receiver Busy for seconds and sometimes never answers that request (DAN-1526: 6 s
+///   without a reply, while a re-send was answered within ~1.5 s), so a *read* (command id has
+///   the 0x80 "get" bit) is re-sent after each window, with a growing short backoff. A write is
+///   never re-sent for Busy; it just waits a longer window. Still Busy at the end is reported as
+///   the mouse being asleep.
+/// * If another program (e.g. openrazer-daemon polling battery) talks to the mouse between our
+///   write and read, the response belongs to *its* command (Mismatch). That is a collision, not
+///   a device error, so we resend.
+pub fn transact_on(io: &impl FeatureIo, req: &Report) -> io::Result<Report> {
+    let sent = (req.command_class, req.command_id);
+    let is_read = req.command_id & 0x80 != 0;
+    let (attempts, window) = if is_read {
+        (READ_ATTEMPTS, BUSY_WINDOW_POLLS)
+    } else {
+        (5, 100)
+    };
+    let mut last = None;
+    let mut busy = false;
+    for attempt in 0..attempts {
+        io.send_feature(&req.to_bytes())?;
+        let mut collided = false;
+        for poll in 0..window {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            let raw = io.get_feature()?;
+            let resp = Report::parse(&raw).map_err(io::Error::other)?;
+            trace(attempt, poll, sent, &resp);
+            match resp.status_for(sent) {
+                Status::Success => return Ok(resp),
+                Status::Busy | Status::NewCommand => continue,
+                Status::Mismatch => {
+                    collided = true;
+                    last = Some(resp);
+                    break;
+                }
+                Status::Timeout => return Err(asleep()),
+                s => return Err(io::Error::other(format!("device returned {s:?}: {resp:?}"))),
+            }
+        }
+        busy = !collided;
+        if collided {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        } else if is_read {
+            std::thread::sleep(std::time::Duration::from_millis(5 * attempt as u64));
+        } else {
+            break;
+        }
+    }
+    if busy {
+        return Err(asleep());
+    }
+    Err(io::Error::other(format!(
+        "response kept colliding with another program's command: {last:?}"
+    )))
+}
+
+fn asleep() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the receiver can't reach the mouse (it kept answering busy or 0x04) — it is probably asleep; move it or click, then retry",
+    )
 }
 
 #[cfg(test)]

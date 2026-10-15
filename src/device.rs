@@ -10,7 +10,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::hidraw::{self, Hidraw, HidrawNode};
+use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{byte_to_poll_rate, cmd, poll_rate_to_byte, Report};
 
 pub const VARSTORE: u8 = 0x01;
@@ -28,6 +28,8 @@ pub struct Info {
     pub serial: Option<String>,
     pub dpi: Option<(u16, u16)>,
     pub dpi_stages: Option<DpiStages>,
+    /// Why `dpi_stages` is `None` (asleep, never completed, ...). `None` when the read worked.
+    pub dpi_stages_error: Option<String>,
     pub poll_rate: Option<u32>,
     pub battery_pct: Option<u8>,
     pub charging: Option<bool>,
@@ -49,15 +51,48 @@ pub trait Backend {
     fn charging(&self) -> io::Result<bool>;
 
     fn info(&self) -> Info {
+        // The first read that gets no answer at all (TimedOut: asleep / out of range) ends the
+        // round: every further read would wait out its own busy window, freezing the GUI for
+        // seconds, and would fail the same way.
+        let mut gone: Option<String> = None;
+        let firmware = read_unless_gone(&mut gone, || self.firmware());
+        let serial = read_unless_gone(&mut gone, || self.serial());
+        let dpi = read_unless_gone(&mut gone, || self.dpi());
+        let mut dpi_stages_error = gone.clone();
+        let dpi_stages = read_unless_gone(&mut gone, || {
+            self.dpi_stages()
+                .inspect_err(|e| dpi_stages_error = Some(e.to_string()))
+        });
+        let poll_rate = read_unless_gone(&mut gone, || self.poll_rate());
+        let battery_pct = read_unless_gone(&mut gone, || self.battery_raw()).map(raw_to_pct);
+        let charging = read_unless_gone(&mut gone, || self.charging());
         Info {
             name: self.name(),
-            firmware: self.firmware().ok(),
-            serial: self.serial().ok(),
-            dpi: self.dpi().ok(),
-            dpi_stages: self.dpi_stages().ok(),
-            poll_rate: self.poll_rate().ok(),
-            battery_pct: self.battery_raw().ok().map(raw_to_pct),
-            charging: self.charging().ok(),
+            firmware,
+            serial,
+            dpi,
+            dpi_stages,
+            dpi_stages_error,
+            poll_rate,
+            battery_pct,
+            charging,
+        }
+    }
+}
+
+/// `f()`'s value, or `None` if it failed or the mouse was already found unreachable. A TimedOut
+/// error is remembered in `gone` so [`Backend::info`] can stop asking.
+fn read_unless_gone<T>(gone: &mut Option<String>, f: impl FnOnce() -> io::Result<T>) -> Option<T> {
+    if gone.is_some() {
+        return None;
+    }
+    match f() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::TimedOut {
+                *gone = Some(e.to_string());
+            }
+            None
         }
     }
 }
@@ -78,19 +113,40 @@ fn check_dpi(x: u16, y: u16) -> io::Result<()> {
 
 /// Shared decoder for the 04:86 dpi-stages payload (hidraw) — layout:
 /// [varstore, active, count, (idx, x_hi, x_lo, y_hi, y_lo, 0, 0) * count]
-pub fn decode_dpi_stages_proto(args: &[u8]) -> DpiStages {
+///
+/// Strict: the firmware can answer Success with the table half built (see
+/// [`read_dpi_stages_on`]), so every entry must be present, numbered 1..=count and carry a DPI
+/// in the supported range, or the whole table is rejected as `InvalidData`.
+pub fn decode_dpi_stages_proto(args: &[u8]) -> io::Result<DpiStages> {
+    let bad = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
+    if args.len() < 3 {
+        return Err(bad(format!("payload is {} bytes", args.len())));
+    }
     let active = args[1];
-    let count = (args[2] as usize).min(5);
-    let stages = (0..count)
-        .map(|i| {
-            let o = 3 + i * 7;
-            (
-                u16::from_be_bytes([args[o + 1], args[o + 2]]),
-                u16::from_be_bytes([args[o + 3], args[o + 4]]),
-            )
-        })
-        .collect();
-    DpiStages { active, stages }
+    let count = args[2] as usize;
+    if !(1..=5).contains(&count) {
+        return Err(bad(format!("stage count {count}")));
+    }
+    if args.len() < 3 + count * 7 {
+        return Err(bad(format!("{} bytes for {count} stages", args.len())));
+    }
+    let mut stages = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 3 + i * 7;
+        let (x, y) = (
+            u16::from_be_bytes([args[o + 1], args[o + 2]]),
+            u16::from_be_bytes([args[o + 3], args[o + 4]]),
+        );
+        if args[o] as usize != i + 1 || check_dpi(x, y).is_err() {
+            return Err(bad(format!(
+                "stage {} is {x}x{y} (index byte {})",
+                i + 1,
+                args[o]
+            )));
+        }
+        stages.push((x, y));
+    }
+    Ok(DpiStages { active, stages })
 }
 
 /// Decoder for OpenRazer's binary dpi_stages sysfs file:
@@ -112,6 +168,40 @@ pub fn decode_dpi_stages_sysfs(b: &[u8]) -> io::Result<DpiStages> {
         active: b[0],
         stages,
     })
+}
+
+/// Query the stage table, retrying while the answer is not a complete table.
+///
+/// The firmware flips the status to Success (0x02) as soon as it starts building this answer: on
+/// the Viper Mini SE the payload can still hold only the first k of the 5 stage entries (rest
+/// zero) or a garbage table, and re-reading that same answer never completes it (DAN-1526). A
+/// valid table is the only thing accepted; anything else is re-requested after a short, growing
+/// backoff, and if it never completes the caller gets an error, never a partial set.
+pub fn read_dpi_stages_on(
+    io: &impl FeatureIo,
+    tid: u8,
+    backoff: std::time::Duration,
+) -> io::Result<DpiStages> {
+    const ATTEMPTS: u32 = 8;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(backoff * attempt);
+        }
+        let r = transact_on(
+            io,
+            &Report::new(cmd::GET_DPI_STAGES, 0x26, tid).with_args(&[VARSTORE]),
+        )?;
+        let n = (r.data_size as usize).min(r.args.len());
+        match decode_dpi_stages_proto(&r.args[..n]) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("incomplete DPI stage table after {ATTEMPTS} reads ({last})"),
+    ))
 }
 
 // ---------------------------------------------------------------- hidraw
@@ -171,8 +261,7 @@ impl Backend for HidrawBackend {
             .map(|_| ())
     }
     fn dpi_stages(&self) -> io::Result<DpiStages> {
-        let r = self.q(cmd::GET_DPI_STAGES, 0x26, &[VARSTORE])?;
-        Ok(decode_dpi_stages_proto(&r.args))
+        read_dpi_stages_on(&self.dev, self.tid, std::time::Duration::from_millis(15))
     }
     fn poll_rate(&self) -> io::Result<u32> {
         let r = self.q(cmd::GET_POLL_RATE2, 0x01, &[])?;
@@ -366,7 +455,7 @@ mod tests {
     fn proto_stages_decoder() {
         let mut a = [0u8; 80];
         a[..10].copy_from_slice(&[1, 2, 1, 1, 0x03, 0x20, 0x03, 0x20, 0, 0]);
-        let s = decode_dpi_stages_proto(&a);
+        let s = decode_dpi_stages_proto(&a).unwrap();
         assert_eq!(
             s,
             DpiStages {
@@ -376,6 +465,236 @@ mod tests {
         );
     }
 
+    // ---- DAN-1526: replayed from the raw HID log of the real Viper Mini SE (fw 1.4) ----
+
+    use crate::hidraw::FeatureIo;
+    use crate::protocol::{Report, REPORT_LEN};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::time::Duration;
+
+    /// Payload of a complete 04:86 answer (status 0x02), captured live.
+    const FULL: [u8; 38] = [
+        0x01, 0x04, 0x05, 0x01, 0x01, 0x90, 0x01, 0x90, 0x00, 0x00, 0x02, 0x03, 0x20, 0x03, 0x20,
+        0x00, 0x00, 0x03, 0x06, 0x40, 0x06, 0x40, 0x00, 0x00, 0x04, 0x0c, 0x80, 0x0c, 0x80, 0x00,
+        0x00, 0x05, 0x19, 0x00, 0x19, 0x00, 0x00, 0x00,
+    ];
+    const WANT: [(u16, u16); 5] = [
+        (400, 400),
+        (800, 800),
+        (1600, 1600),
+        (3200, 3200),
+        (6400, 6400),
+    ];
+
+    fn answer(status: u8, payload: &[u8]) -> Report {
+        let mut r = Report::new(cmd::GET_DPI_STAGES, 0x26, 0x1f).with_args(payload);
+        r.status = status;
+        r
+    }
+    fn full() -> Report {
+        answer(2, &FULL)
+    }
+    fn busy() -> Report {
+        answer(1, &FULL[..1])
+    }
+    /// What the firmware really sends sometimes: status Success but only the first `n` stage
+    /// entries filled in (the rest still zero, count byte already 5). Re-reading never completes it.
+    fn truncated(n: usize) -> Report {
+        let mut p = FULL;
+        p[3 + n * 7..].fill(0);
+        answer(2, &p)
+    }
+
+    /// A device that answers each request with the next scripted sequence of reads; the last read
+    /// of a sequence repeats if polled further.
+    struct Mock {
+        rounds: RefCell<VecDeque<Vec<Report>>>,
+        cur: RefCell<VecDeque<Report>>,
+        last: RefCell<Option<Report>>,
+        sends: RefCell<usize>,
+    }
+    impl Mock {
+        fn new(rounds: Vec<Vec<Report>>) -> Mock {
+            Mock {
+                rounds: RefCell::new(rounds.into()),
+                cur: RefCell::default(),
+                last: RefCell::default(),
+                sends: RefCell::new(0),
+            }
+        }
+        fn sends(&self) -> usize {
+            *self.sends.borrow()
+        }
+    }
+    impl FeatureIo for Mock {
+        fn send_feature(&self, _p: &[u8; REPORT_LEN]) -> io::Result<()> {
+            *self.sends.borrow_mut() += 1;
+            *self.cur.borrow_mut() = self
+                .rounds
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or_default()
+                .into();
+            Ok(())
+        }
+        fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]> {
+            let next = self.cur.borrow_mut().pop_front();
+            let r = match next {
+                Some(r) => {
+                    *self.last.borrow_mut() = Some(r.clone());
+                    r
+                }
+                None => self.last.borrow().clone().expect("mock ran out of answers"),
+            };
+            let mut raw = [0u8; REPORT_LEN + 1];
+            raw[1..].copy_from_slice(&r.to_bytes());
+            Ok(raw)
+        }
+    }
+
+    const NO_WAIT: Duration = Duration::ZERO;
+
+    #[test]
+    fn complete_answer_loads_in_one_query() {
+        let m = Mock::new(vec![vec![busy(), busy(), full()]]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!((s.active, s.stages), (4, WANT.to_vec()));
+        assert_eq!(m.sends(), 1);
+    }
+
+    #[test]
+    fn truncated_success_is_requeried_until_complete() {
+        // log: before-A-2 round 0 (first stage only), before-A-4, before-A-5, then a good one
+        let m = Mock::new(vec![
+            vec![busy(), truncated(1)],
+            vec![busy(), busy(), truncated(2)],
+            vec![busy(), truncated(4)],
+            vec![busy(), full()],
+        ]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(
+            s.stages,
+            WANT.to_vec(),
+            "must never surface a partial stage set"
+        );
+        assert_eq!(m.sends(), 4);
+    }
+
+    #[test]
+    fn garbage_answer_is_requeried() {
+        // log: before-A-2 round 0: count=5 but the table is [32768, 0, 0, 0, 0]
+        let mut g = FULL;
+        g[3..].fill(0);
+        g[3] = 0x01;
+        g[4] = 0x80;
+        let m = Mock::new(vec![vec![answer(2, &g)], vec![full()]]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(s.stages, WANT.to_vec());
+    }
+
+    #[test]
+    fn stays_truncated_is_an_error_not_a_partial_set() {
+        let m = Mock::new(vec![vec![truncated(2)]; 20]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert!(e.to_string().contains("incomplete"), "{e}");
+        assert!(m.sends() > 1, "should have re-queried before giving up");
+    }
+
+    #[test]
+    fn busy_longer_than_one_window_is_requeried_not_given_up_on() {
+        // log: before-A-10 round 0: 04:86 Busy for >20 polls -> "device stayed busy" -> no stages.
+        // dpi_latency: an idle mouse can leave a request Busy for 6 s; a re-send gets answered.
+        let mut lost = vec![busy(); 35];
+        lost.push(full()); // never reached: the request is re-sent after one window
+        let m = Mock::new(vec![lost, vec![busy(), busy(), full()]]);
+        let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
+        assert_eq!(s.stages, WANT.to_vec());
+        assert_eq!(m.sends(), 2);
+    }
+
+    #[test]
+    fn always_busy_ends_as_asleep_after_bounded_resends() {
+        let m = Mock::new(vec![vec![busy()]; 40]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("asleep"), "{e}");
+        assert!((2..=20).contains(&m.sends()), "sends: {}", m.sends());
+    }
+
+    #[test]
+    fn a_write_is_never_resent_for_busy() {
+        let req = Report::new(cmd::SET_DPI_XY, 7, 0x1f);
+        let mut busy_write = req.clone();
+        busy_write.status = 1;
+        let m = Mock::new(vec![vec![busy_write]; 5]);
+        assert!(transact_on(&m, &req).is_err());
+        assert_eq!(m.sends(), 1);
+    }
+
+    /// A backend whose first read gets no answer: the rest of `info()` must not be attempted.
+    struct Gone(RefCell<Vec<&'static str>>);
+    impl Gone {
+        fn asked(&self, what: &'static str) -> io::Error {
+            self.0.borrow_mut().push(what);
+            io::Error::new(io::ErrorKind::TimedOut, "probably asleep")
+        }
+    }
+    impl Backend for Gone {
+        fn kind(&self) -> &'static str {
+            "gone"
+        }
+        fn path(&self) -> &Path {
+            Path::new("/dev/null")
+        }
+        fn name(&self) -> String {
+            "x".into()
+        }
+        fn firmware(&self) -> io::Result<String> {
+            Err(self.asked("firmware"))
+        }
+        fn serial(&self) -> io::Result<String> {
+            Err(self.asked("serial"))
+        }
+        fn dpi(&self) -> io::Result<(u16, u16)> {
+            Err(self.asked("dpi"))
+        }
+        fn set_dpi(&self, _: u16, _: u16) -> io::Result<()> {
+            unreachable!()
+        }
+        fn dpi_stages(&self) -> io::Result<DpiStages> {
+            Err(self.asked("dpi_stages"))
+        }
+        fn poll_rate(&self) -> io::Result<u32> {
+            Err(self.asked("poll_rate"))
+        }
+        fn set_poll_rate(&self, _: u32) -> io::Result<()> {
+            unreachable!()
+        }
+        fn battery_raw(&self) -> io::Result<u8> {
+            Err(self.asked("battery"))
+        }
+        fn charging(&self) -> io::Result<bool> {
+            Err(self.asked("charging"))
+        }
+    }
+
+    #[test]
+    fn info_stops_at_the_first_unanswered_read_and_says_why() {
+        let b = Gone(RefCell::default());
+        let i = b.info();
+        assert_eq!(*b.0.borrow(), vec!["firmware"]);
+        assert!(i.dpi_stages.is_none());
+        assert!(i.dpi_stages_error.unwrap().contains("asleep"));
+    }
+
+    #[test]
+    fn asleep_is_reported_as_asleep() {
+        let m = Mock::new(vec![vec![answer(4, &FULL[..1])]]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("asleep"), "{e}");
+    }
     #[test]
     fn battery_percent() {
         assert_eq!(raw_to_pct(255), 100);
