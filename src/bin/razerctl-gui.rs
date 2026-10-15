@@ -10,6 +10,8 @@
 //! The look (tokens, fonts, widgets, mouse diagram) lives in `razerctl-gui/`; this file keeps the state, the
 //! device / systemctl / config calls and the screen layouts that bind them together.
 
+#[path = "razerctl-gui/carry.rs"]
+mod carry;
 #[path = "razerctl-gui/demo.rs"]
 mod demo;
 #[path = "razerctl-gui/macro_ui.rs"]
@@ -80,19 +82,23 @@ impl ButtonRow {
         } else {
             a.action_string()
         };
-        let (choice, key_text) = match s.as_deref() {
+        let (choice, key_text) = Self::choice_of(s.as_deref());
+        ButtonRow {
+            id: a.button,
+            current: a,
+            choice,
+            key_text,
+        }
+    }
+    /// The dropdown entry and key text that show action string `s` (`None`: an action with no string form).
+    fn choice_of(s: Option<&str>) -> (usize, String) {
+        match s {
             Some(k) if k.starts_with("key:") => (CHOICES.len() - 1, k[4..].to_string()),
             Some(s) => (
                 CHOICES.iter().position(|(_, v)| *v == Some(s)).unwrap_or(0),
                 String::new(),
             ),
             None => (0, String::new()),
-        };
-        ButtonRow {
-            id: a.button,
-            current: a,
-            choice,
-            key_text,
         }
     }
     fn wanted_action(&self) -> String {
@@ -119,6 +125,20 @@ enum Tab {
     Device,
     Software,
     App,
+}
+
+impl Tab {
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Buttons => "buttons",
+            Tab::Device => "device",
+            Tab::Software => "software",
+            Tab::App => "app",
+        }
+    }
+    fn from_name(s: &str) -> Option<Tab> {
+        TABS.into_iter().find(|t| t.name() == s)
+    }
 }
 
 struct App {
@@ -247,8 +267,86 @@ impl App {
         };
         app.refresh_all();
         app.refresh_service();
+        // after the refreshes: what the user had typed wins over what was just read back (see `carry.rs`)
+        if let Some(c) = carry::take_from_env() {
+            app.restore(c);
+        }
         demo::apply(&mut app);
         app
+    }
+
+    /// What the user has changed and not saved, for the new GUI that "Show razerctl" starts (DAN-1516). Each field is
+    /// only included when it differs from what the new process will read for itself, so a carried value never hides a
+    /// newer one on disk or on the mouse. Battery and close settings apply as they are changed and are not unsaved.
+    fn carry_snapshot(&self) -> carry::Carry {
+        let on_disk = std::fs::read_to_string(&self.conf_path).ok();
+        let rules =
+            (on_disk.as_deref() != Some(self.conf_text.as_str())).then(|| self.conf_text.clone());
+        let macros = self.mac.dirty().then(|| carry::Macros {
+            sub: self.mac.sub,
+            sel: self.mac.sel,
+            sel_ev: self.mac.sel_ev,
+            drafts: self.mac.drafts.clone(),
+            remove_rules: self.mac.remove_rules.iter().cloned().collect(),
+        });
+        carry::Carry {
+            tab: Some(self.tab.name().into()),
+            rules,
+            buttons: self
+                .rows
+                .iter()
+                .filter(|r| r.dirty())
+                .map(|r| (r.id, r.wanted_action()))
+                .collect(),
+            dpi: self
+                .info
+                .as_ref()
+                .is_some_and(|i| i.dpi.map(|d| d.0) != Some(self.dpi_edit))
+                .then_some(self.dpi_edit),
+            poll: self
+                .info
+                .as_ref()
+                .is_some_and(|i| i.poll_rate != Some(self.poll_edit))
+                .then_some(self.poll_edit),
+            macros,
+        }
+    }
+
+    /// Put carried edits back over a freshly loaded `App`.
+    fn restore(&mut self, c: carry::Carry) {
+        let mut restored = false;
+        if let Some(t) = c.tab.as_deref().and_then(Tab::from_name) {
+            self.tab = t;
+        }
+        if let Some(r) = c.rules {
+            self.conf_text = r;
+            restored = true;
+        }
+        for (id, action) in c.buttons {
+            if let Some(row) = self.rows.iter_mut().find(|r| r.id == id) {
+                (row.choice, row.key_text) = ButtonRow::choice_of(Some(&action));
+                restored = true;
+            }
+        }
+        if let Some(d) = c.dpi {
+            self.dpi_edit = d;
+            restored = true;
+        }
+        if let Some(p) = c.poll {
+            self.poll_edit = p;
+            restored = true;
+        }
+        if let Some(m) = c.macros.filter(|_| self.mac.load_error.is_none()) {
+            self.mac.sub = m.sub;
+            self.mac.sel = m.sel.min(m.drafts.len().saturating_sub(1));
+            self.mac.sel_ev = m.sel_ev;
+            self.mac.drafts = m.drafts;
+            self.mac.remove_rules = m.remove_rules.into_iter().collect();
+            restored = true;
+        }
+        if restored {
+            self.ok("Restored the edits you hadn't saved when the window was hidden.");
+        }
     }
 
     /// Closing the window, from the title bar, the tray's Quit, Ctrl+Q or the Quit button: decide what happens to the
@@ -261,6 +359,9 @@ impl App {
         let action =
             forced.unwrap_or_else(|| tray::close_action(self.settings.close_to_tray, host.probe()));
         host.set_outcome(action);
+        if action == CloseAction::Hide {
+            host.set_carry(self.carry_snapshot().encode());
+        }
     }
 
     fn quit(&mut self, ctx: &egui::Context) {
@@ -2248,7 +2349,7 @@ fn main() -> eframe::Result {
         if tray::linger(&host) == Cmd::Show {
             eprintln!(
                 "razerctl-gui: reopening the window failed: {}",
-                tray::reopen_window()
+                tray::reopen_window(host.take_carry())
             );
         }
     }
@@ -3834,5 +3935,106 @@ mod tests {
             !app.status_is_error,
             "a warning, not an error: it does not block"
         );
+    }
+
+    // ---- DAN-1516: hide to the tray closes the window and "Show" starts a new GUI; unsaved edits must come back
+
+    /// What `main` does between the two processes: the old window's close decision fills the tray host, `reopen_window`
+    /// stashes it in a file, and the new process's `App::new` takes the file and restores it over a fresh `App`.
+    fn hide_and_show(old: &mut App) -> App {
+        old.tray = Some(tray::Host::fake(true));
+        old.decide_close(None);
+        assert_eq!(
+            old.tray.as_ref().unwrap().outcome(),
+            Some(CloseAction::Hide)
+        );
+        let text = old.tray.as_ref().unwrap().take_carry();
+        let path = text.map(|t| carry::stash(&t).expect("stash"));
+        let mut fresh = macro_app(Sub::Rules); // the state `App::new` builds from disk and the mouse
+        fresh.conf_text = RULES.into();
+        if let Some(c) = path.and_then(|p| carry::take_file(&p)) {
+            fresh.restore(c);
+        }
+        fresh
+    }
+
+    #[test]
+    fn unsaved_edits_survive_hide_to_tray_and_show() {
+        use macro_ui::Ev;
+        let mut old = macro_app(Sub::Rules);
+        old.conf_path =
+            std::env::temp_dir().join("razerctl-gui-test-carry-never-written/remap.conf");
+        old.tab = Tab::Software;
+        old.conf_text = format!("{RULES}# unsaved edit\nmiddle = disable\n");
+        old.dpi_edit = 1600;
+        old.poll_edit = 500;
+        old.rows[3].choice = ButtonRow::choice_of(Some("dpi-up")).0;
+        old.rows[4].choice = ButtonRow::choice_of(Some("key:f13")).0;
+        old.rows[4].key_text = "f13".into();
+        old.mac.sub = Sub::Macros;
+        old.mac.drafts[0].events.push(Ev::Delay(77));
+        let want_drafts = old.mac.drafts.clone();
+        assert!(old.mac.dirty());
+
+        let fresh = hide_and_show(&mut old);
+
+        assert_eq!(fresh.tab, Tab::Software, "the tab you were on");
+        assert!(
+            fresh
+                .conf_text
+                .ends_with("# unsaved edit\nmiddle = disable\n"),
+            "rules editor text"
+        );
+        assert_eq!(
+            (fresh.dpi_edit, fresh.poll_edit),
+            (1600, 500),
+            "unapplied DPI / polling edits"
+        );
+        assert_eq!(fresh.rows[3].wanted_action(), "dpi-up");
+        assert_eq!(fresh.rows[4].wanted_action(), "key:f13");
+        assert!(
+            fresh.rows[3].dirty() && fresh.rows[4].dirty(),
+            "still unsaved, not silently applied"
+        );
+        assert!(
+            !fresh.rows[0].dirty() && !fresh.rows[5].dirty(),
+            "untouched rows stay untouched"
+        );
+        assert_eq!(fresh.mac.drafts, want_drafts, "macro editor drafts");
+        assert!(
+            fresh.mac.dirty(),
+            "Save is still enabled in the macro editor"
+        );
+        assert_eq!(fresh.mac.sub, Sub::Macros);
+    }
+
+    #[test]
+    fn a_hide_with_nothing_unsaved_restores_only_the_tab_and_stays_quiet() {
+        let mut old = macro_app(Sub::Rules);
+        old.conf_path =
+            std::env::temp_dir().join("razerctl-gui-test-carry-never-written/remap.conf");
+        old.tab = Tab::Device;
+        old.conf_text = String::new();
+        let fresh = hide_and_show(&mut old);
+        assert_eq!(fresh.tab, Tab::Device);
+        assert_eq!(
+            fresh.conf_text, RULES,
+            "the file's text, not a carried copy"
+        );
+        assert!(!fresh.mac.dirty());
+        assert!(
+            !fresh.status.contains("Restored"),
+            "no 'restored' note when nothing was: {}",
+            fresh.status
+        );
+    }
+
+    #[test]
+    fn a_quit_stashes_nothing_for_the_next_launch() {
+        let mut old = macro_app(Sub::Rules);
+        old.conf_text = "unsaved = 1\n".into();
+        old.tray = Some(tray::Host::fake(true));
+        old.decide_close(Some(CloseAction::Quit));
+        assert_eq!(old.tray.as_ref().unwrap().take_carry(), None);
     }
 }

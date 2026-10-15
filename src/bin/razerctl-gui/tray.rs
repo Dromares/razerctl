@@ -5,8 +5,8 @@
 //! **How "hide to the tray" works.** winit cannot hide a window on Wayland (`set_visible` is a no-op) and cannot
 //! un-minimise one, so the window is really closed. `main` then keeps the *process* alive, holding the tray icon and
 //! the battery poller, and on *Show razerctl* starts the GUI again with `exec`. On X11 this behaves the same, so
-//! there is one code path to test. What is lost across a hide is the window's unsaved UI state, which closing the
-//! window always lost.
+//! there is one code path to test. The window's unsaved UI state would be lost with it, so the closing window hands
+//! it over (`carry.rs`, DAN-1516) and the re-exec'd GUI puts it back.
 //!
 //! The tray is a StatusNotifierItem over D-Bus (`ksni`, pure Rust; `tray-icon` was rejected because it pulls in GTK3).
 //! The remap service and the low-battery notifier are separate systemd user units and never depend on this process.
@@ -488,6 +488,8 @@ struct Shared {
     poke: Mutex<Sender<()>>,
     /// What closing the window decided; read by `main` once the event loop has returned.
     outcome: Mutex<Option<CloseAction>>,
+    /// The closing window's unsaved UI state (`carry.rs`), handed to the GUI that *Show* starts.
+    carry: Mutex<Option<String>>,
 }
 
 impl Shared {
@@ -640,6 +642,7 @@ impl Host {
             repaint: Mutex::new(None),
             poke: Mutex::new(poke_tx),
             outcome: Mutex::new(None),
+            carry: Mutex::new(None),
         });
         let host = Host {
             shared,
@@ -673,6 +676,7 @@ impl Host {
             repaint: Mutex::new(None),
             poke: Mutex::new(mpsc::channel().0),
             outcome: Mutex::new(None),
+            carry: Mutex::new(None),
         });
         Host {
             shared,
@@ -756,6 +760,22 @@ impl Host {
             .outcome
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = Some(a);
+    }
+
+    pub fn set_carry(&self, text: String) {
+        *self
+            .shared
+            .carry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(text);
+    }
+
+    pub fn take_carry(&self) -> Option<String> {
+        self.shared
+            .carry
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     pub fn outcome(&self) -> Option<CloseAction> {
@@ -843,16 +863,35 @@ pub fn linger(host: &Host) -> Cmd {
     }
 }
 
-/// Replace this process by a fresh GUI. Returns only if that failed.
-pub fn reopen_window() -> std::io::Error {
+/// Replace this process by a fresh GUI. Returns only if that failed. `carry` is the window's unsaved UI state: it
+/// goes to the new process through a private file named by `RAZERCTL_CARRY` (see `carry.rs`). Only this path sets the
+/// variable, so state from a session that quit instead can never be picked up by a later launch.
+pub fn reopen_window(carry: Option<String>) -> std::io::Error {
     use std::os::unix::process::CommandExt;
+    let stash = carry.and_then(|text| match super::carry::stash(&text) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("tray: could not keep the unsaved edits across the reopen: {e}");
+            None
+        }
+    });
     // the tray menu / SNI Activate call that asked for this is answered on a thread of this process: let the reply go
     // out before exec closes the D-Bus connection under it
     std::thread::sleep(Duration::from_millis(250));
     match std::env::current_exe() {
-        Ok(exe) => std::process::Command::new(exe)
-            .args(std::env::args_os().skip(1))
-            .exec(),
+        Ok(exe) => {
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(std::env::args_os().skip(1));
+            match &stash {
+                Some(p) => cmd.env(super::carry::ENV, p),
+                None => cmd.env_remove(super::carry::ENV),
+            };
+            let e = cmd.exec();
+            if let Some(p) = stash {
+                let _ = std::fs::remove_file(p);
+            }
+            e
+        }
         Err(e) => e,
     }
 }
@@ -1110,6 +1149,7 @@ mod tests {
                 repaint: Mutex::new(None),
                 poke: Mutex::new(mpsc::channel().0),
                 outcome: Mutex::new(None),
+                carry: Mutex::new(None),
             });
             Item {
                 shared,
