@@ -1,10 +1,4 @@
-//! Read-only repro harne    // "full": the expected number of stages, each a real DPI value (a half-built table has zeros)
-    let ok = i.dpi_stages.as_ref().is_some_and(|s| {
-        s.stages.len() == expect
-            && s.stages
-                .iter()
-                .all(|(x, y)| (100..=45000).contains(x) && (100..=45000).contains(y))
-    });s for DAN-1526: runs the same device reads `razerctl-gui` does on
+//! Read-only repro harness for DAN-1526: runs the same device reads `razerctl-gui` does on
 //! start (`refresh_device` -> `Backend::info()`, then `refresh_buttons` -> onboard profile/button
 //! reads) once, then `--refreshes` more `info()` rounds, and prints one line per round saying
 //! whether the DPI stages came back complete. Issues no writes: only `Backend::info()` getters
@@ -43,10 +37,13 @@ fn describe(i: &Info, expect: usize) -> (bool, String) {
             s.stages.iter().map(|(x, _)| *x).collect::<Vec<_>>()
         ),
     };
-    let ok = i
-        .dpi_stages
-        .as_ref()
-        .is_some_and(|s| s.stages.len() == expect);
+    // "full": the expected number of stages, each a real DPI value (a half-built table has zeros)
+    let ok = i.dpi_stages.as_ref().is_some_and(|s| {
+        s.stages.len() == expect
+            && s.stages
+                .iter()
+                .all(|(x, y)| (100..=45000).contains(x) && (100..=45000).contains(y))
+    });
     let f = |b: bool| if b { "ok" } else { "MISSING" };
     (
         ok,
