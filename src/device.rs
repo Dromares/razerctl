@@ -51,20 +51,48 @@ pub trait Backend {
     fn charging(&self) -> io::Result<bool>;
 
     fn info(&self) -> Info {
-        let firmware = self.firmware().ok();
-        let serial = self.serial().ok();
-        let dpi = self.dpi().ok();
-        let stages = self.dpi_stages();
+        // The first read that gets no answer at all (TimedOut: asleep / out of range) ends the
+        // round: every further read would wait out its own busy window, freezing the GUI for
+        // seconds, and would fail the same way.
+        let mut gone: Option<String> = None;
+        let firmware = read_unless_gone(&mut gone, || self.firmware());
+        let serial = read_unless_gone(&mut gone, || self.serial());
+        let dpi = read_unless_gone(&mut gone, || self.dpi());
+        let mut dpi_stages_error = gone.clone();
+        let dpi_stages = read_unless_gone(&mut gone, || {
+            self.dpi_stages()
+                .inspect_err(|e| dpi_stages_error = Some(e.to_string()))
+        });
+        let poll_rate = read_unless_gone(&mut gone, || self.poll_rate());
+        let battery_pct = read_unless_gone(&mut gone, || self.battery_raw()).map(raw_to_pct);
+        let charging = read_unless_gone(&mut gone, || self.charging());
         Info {
             name: self.name(),
             firmware,
             serial,
             dpi,
-            dpi_stages_error: stages.as_ref().err().map(ToString::to_string),
-            dpi_stages: stages.ok(),
-            poll_rate: self.poll_rate().ok(),
-            battery_pct: self.battery_raw().ok().map(raw_to_pct),
-            charging: self.charging().ok(),
+            dpi_stages,
+            dpi_stages_error,
+            poll_rate,
+            battery_pct,
+            charging,
+        }
+    }
+}
+
+/// `f()`'s value, or `None` if it failed or the mouse was already found unreachable. A TimedOut
+/// error is remembered in `gone` so [`Backend::info`] can stop asking.
+fn read_unless_gone<T>(gone: &mut Option<String>, f: impl FnOnce() -> io::Result<T>) -> Option<T> {
+    if gone.is_some() {
+        return None;
+    }
+    match f() {
+        Ok(v) => Some(v),
+        Err(e) => {
+            if e.kind() == io::ErrorKind::TimedOut {
+                *gone = Some(e.to_string());
+            }
+            None
         }
     }
 }
@@ -574,14 +602,90 @@ mod tests {
     }
 
     #[test]
-    fn slow_busy_wait_outlasts_the_old_20_poll_budget() {
-        // log: before-A-10 round 0: 04:86 answered Busy for >20 polls (~120 ms), then Success
-        let mut seq = vec![busy(); 40];
-        seq.push(full());
-        let m = Mock::new(vec![seq]);
+    fn busy_longer_than_one_window_is_requeried_not_given_up_on() {
+        // log: before-A-10 round 0: 04:86 Busy for >20 polls -> "device stayed busy" -> no stages.
+        // dpi_latency: an idle mouse can leave a request Busy for 6 s; a re-send gets answered.
+        let mut lost = vec![busy(); 35];
+        lost.push(full()); // never reached: the request is re-sent after one window
+        let m = Mock::new(vec![lost, vec![busy(), busy(), full()]]);
         let s = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap();
         assert_eq!(s.stages, WANT.to_vec());
-        assert_eq!(m.sends(), 1, "waiting on Busy must not resend the request");
+        assert_eq!(m.sends(), 2);
+    }
+
+    #[test]
+    fn always_busy_ends_as_asleep_after_bounded_resends() {
+        let m = Mock::new(vec![vec![busy()]; 40]);
+        let e = read_dpi_stages_on(&m, 0x1f, NO_WAIT).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut);
+        assert!(e.to_string().contains("asleep"), "{e}");
+        assert!((2..=20).contains(&m.sends()), "sends: {}", m.sends());
+    }
+
+    #[test]
+    fn a_write_is_never_resent_for_busy() {
+        let req = Report::new(cmd::SET_DPI_XY, 7, 0x1f);
+        let mut busy_write = req.clone();
+        busy_write.status = 1;
+        let m = Mock::new(vec![vec![busy_write]; 5]);
+        assert!(transact_on(&m, &req).is_err());
+        assert_eq!(m.sends(), 1);
+    }
+
+    /// A backend whose first read gets no answer: the rest of `info()` must not be attempted.
+    struct Gone(RefCell<Vec<&'static str>>);
+    impl Gone {
+        fn asked(&self, what: &'static str) -> io::Error {
+            self.0.borrow_mut().push(what);
+            io::Error::new(io::ErrorKind::TimedOut, "probably asleep")
+        }
+    }
+    impl Backend for Gone {
+        fn kind(&self) -> &'static str {
+            "gone"
+        }
+        fn path(&self) -> &Path {
+            Path::new("/dev/null")
+        }
+        fn name(&self) -> String {
+            "x".into()
+        }
+        fn firmware(&self) -> io::Result<String> {
+            Err(self.asked("firmware"))
+        }
+        fn serial(&self) -> io::Result<String> {
+            Err(self.asked("serial"))
+        }
+        fn dpi(&self) -> io::Result<(u16, u16)> {
+            Err(self.asked("dpi"))
+        }
+        fn set_dpi(&self, _: u16, _: u16) -> io::Result<()> {
+            unreachable!()
+        }
+        fn dpi_stages(&self) -> io::Result<DpiStages> {
+            Err(self.asked("dpi_stages"))
+        }
+        fn poll_rate(&self) -> io::Result<u32> {
+            Err(self.asked("poll_rate"))
+        }
+        fn set_poll_rate(&self, _: u32) -> io::Result<()> {
+            unreachable!()
+        }
+        fn battery_raw(&self) -> io::Result<u8> {
+            Err(self.asked("battery"))
+        }
+        fn charging(&self) -> io::Result<bool> {
+            Err(self.asked("charging"))
+        }
+    }
+
+    #[test]
+    fn info_stops_at_the_first_unanswered_read_and_says_why() {
+        let b = Gone(RefCell::default());
+        let i = b.info();
+        assert_eq!(*b.0.borrow(), vec!["firmware"]);
+        assert!(i.dpi_stages.is_none());
+        assert!(i.dpi_stages_error.unwrap().contains("asleep"));
     }
 
     #[test]

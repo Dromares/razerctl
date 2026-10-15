@@ -207,19 +207,36 @@ fn trace(attempt: usize, poll: usize, sent: (u8, u8), resp: &Report) {
     );
 }
 
-/// Send a request and poll for its response, retrying while the device
-/// reports Busy (Synapse's mutex+retry loop around sendFeatureReport).
+/// How long one request is awaited, in polls of ~5 ms, before a Busy answer is treated as lost.
+const BUSY_WINDOW_POLLS: usize = 30;
+/// Re-sends of a *read* that stays Busy (each after a window), ≈ 1.8 s in all.
+const READ_ATTEMPTS: usize = 12;
+
+/// Send a request and poll for its response.
 ///
-/// If another program (e.g. openrazer-daemon polling battery) talks to the
-/// mouse between our write and read, the response belongs to *its* command
-/// (Mismatch). That is a collision, not a device error, so we resend.
+/// * Busy is waited out for a window of [`BUSY_WINDOW_POLLS`]. An idle wireless mouse can keep
+///   the receiver Busy for seconds and sometimes never answers that request (DAN-1526: 6 s
+///   without a reply, while a re-send was answered within ~1.5 s), so a *read* (command id has
+///   the 0x80 "get" bit) is re-sent after each window, with a growing short backoff. A write is
+///   never re-sent for Busy; it just waits a longer window. Still Busy at the end is reported as
+///   the mouse being asleep.
+/// * If another program (e.g. openrazer-daemon polling battery) talks to the mouse between our
+///   write and read, the response belongs to *its* command (Mismatch). That is a collision, not
+///   a device error, so we resend.
 pub fn transact_on(io: &impl FeatureIo, req: &Report) -> io::Result<Report> {
     let sent = (req.command_class, req.command_id);
+    let is_read = req.command_id & 0x80 != 0;
+    let (attempts, window) = if is_read {
+        (READ_ATTEMPTS, BUSY_WINDOW_POLLS)
+    } else {
+        (5, 100)
+    };
     let mut last = None;
-    for attempt in 0..5 {
+    let mut busy = false;
+    for attempt in 0..attempts {
         io.send_feature(&req.to_bytes())?;
         let mut collided = false;
-        for poll in 0..100 {
+        for poll in 0..window {
             std::thread::sleep(std::time::Duration::from_millis(2));
             let raw = io.get_feature()?;
             let resp = Report::parse(&raw).map_err(io::Error::other)?;
@@ -232,24 +249,32 @@ pub fn transact_on(io: &impl FeatureIo, req: &Report) -> io::Result<Report> {
                     last = Some(resp);
                     break;
                 }
-                Status::Timeout => {
-                    return Err(io::Error::new(io::ErrorKind::TimedOut,
-                        "the receiver can't reach the mouse (status 0x04) — it is probably asleep; move it or click, then retry"))
-                }
+                Status::Timeout => return Err(asleep()),
                 s => return Err(io::Error::other(format!("device returned {s:?}: {resp:?}"))),
             }
         }
-        if !collided {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "device stayed busy",
-            ));
+        busy = !collided;
+        if collided {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        } else if is_read {
+            std::thread::sleep(std::time::Duration::from_millis(5 * attempt as u64));
+        } else {
+            break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if busy {
+        return Err(asleep());
     }
     Err(io::Error::other(format!(
         "response kept colliding with another program's command: {last:?}"
     )))
+}
+
+fn asleep() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "the receiver can't reach the mouse (it kept answering busy or 0x04) — it is probably asleep; move it or click, then retry",
+    )
 }
 
 #[cfg(test)]
