@@ -28,6 +28,8 @@ pub struct Info {
     pub serial: Option<String>,
     pub dpi: Option<(u16, u16)>,
     pub dpi_stages: Option<DpiStages>,
+    /// Why `dpi_stages` is `None` (asleep, never completed, ...). `None` when the read worked.
+    pub dpi_stages_error: Option<String>,
     pub poll_rate: Option<u32>,
     pub battery_pct: Option<u8>,
     pub charging: Option<bool>,
@@ -49,12 +51,17 @@ pub trait Backend {
     fn charging(&self) -> io::Result<bool>;
 
     fn info(&self) -> Info {
+        let firmware = self.firmware().ok();
+        let serial = self.serial().ok();
+        let dpi = self.dpi().ok();
+        let stages = self.dpi_stages();
         Info {
             name: self.name(),
-            firmware: self.firmware().ok(),
-            serial: self.serial().ok(),
-            dpi: self.dpi().ok(),
-            dpi_stages: self.dpi_stages().ok(),
+            firmware,
+            serial,
+            dpi,
+            dpi_stages_error: stages.as_ref().err().map(ToString::to_string),
+            dpi_stages: stages.ok(),
             poll_rate: self.poll_rate().ok(),
             battery_pct: self.battery_raw().ok().map(raw_to_pct),
             charging: self.charging().ok(),
@@ -78,19 +85,40 @@ fn check_dpi(x: u16, y: u16) -> io::Result<()> {
 
 /// Shared decoder for the 04:86 dpi-stages payload (hidraw) — layout:
 /// [varstore, active, count, (idx, x_hi, x_lo, y_hi, y_lo, 0, 0) * count]
-pub fn decode_dpi_stages_proto(args: &[u8]) -> DpiStages {
+///
+/// Strict: the firmware can answer Success with the table half built (see
+/// [`read_dpi_stages_on`]), so every entry must be present, numbered 1..=count and carry a DPI
+/// in the supported range, or the whole table is rejected as `InvalidData`.
+pub fn decode_dpi_stages_proto(args: &[u8]) -> io::Result<DpiStages> {
+    let bad = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
+    if args.len() < 3 {
+        return Err(bad(format!("payload is {} bytes", args.len())));
+    }
     let active = args[1];
-    let count = (args[2] as usize).min(5);
-    let stages = (0..count)
-        .map(|i| {
-            let o = 3 + i * 7;
-            (
-                u16::from_be_bytes([args[o + 1], args[o + 2]]),
-                u16::from_be_bytes([args[o + 3], args[o + 4]]),
-            )
-        })
-        .collect();
-    DpiStages { active, stages }
+    let count = args[2] as usize;
+    if !(1..=5).contains(&count) {
+        return Err(bad(format!("stage count {count}")));
+    }
+    if args.len() < 3 + count * 7 {
+        return Err(bad(format!("{} bytes for {count} stages", args.len())));
+    }
+    let mut stages = Vec::with_capacity(count);
+    for i in 0..count {
+        let o = 3 + i * 7;
+        let (x, y) = (
+            u16::from_be_bytes([args[o + 1], args[o + 2]]),
+            u16::from_be_bytes([args[o + 3], args[o + 4]]),
+        );
+        if args[o] as usize != i + 1 || check_dpi(x, y).is_err() {
+            return Err(bad(format!(
+                "stage {} is {x}x{y} (index byte {})",
+                i + 1,
+                args[o]
+            )));
+        }
+        stages.push((x, y));
+    }
+    Ok(DpiStages { active, stages })
 }
 
 /// Decoder for OpenRazer's binary dpi_stages sysfs file:
@@ -114,17 +142,38 @@ pub fn decode_dpi_stages_sysfs(b: &[u8]) -> io::Result<DpiStages> {
     })
 }
 
-/// Query the stage table on `io` (old behaviour, unchanged by this commit): one transaction, decoded as is.
+/// Query the stage table, retrying while the answer is not a complete table.
+///
+/// The firmware flips the status to Success (0x02) as soon as it starts building this answer: on
+/// the Viper Mini SE the payload can still hold only the first k of the 5 stage entries (rest
+/// zero) or a garbage table, and re-reading that same answer never completes it (DAN-1526). A
+/// valid table is the only thing accepted; anything else is re-requested after a short, growing
+/// backoff, and if it never completes the caller gets an error, never a partial set.
 pub fn read_dpi_stages_on(
     io: &impl FeatureIo,
     tid: u8,
-    _backoff: std::time::Duration,
+    backoff: std::time::Duration,
 ) -> io::Result<DpiStages> {
-    let r = transact_on(
-        io,
-        &Report::new(cmd::GET_DPI_STAGES, 0x26, tid).with_args(&[VARSTORE]),
-    )?;
-    Ok(decode_dpi_stages_proto(&r.args))
+    const ATTEMPTS: u32 = 8;
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(backoff * attempt);
+        }
+        let r = transact_on(
+            io,
+            &Report::new(cmd::GET_DPI_STAGES, 0x26, tid).with_args(&[VARSTORE]),
+        )?;
+        let n = (r.data_size as usize).min(r.args.len());
+        match decode_dpi_stages_proto(&r.args[..n]) {
+            Ok(s) => return Ok(s),
+            Err(e) => last = e.to_string(),
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("incomplete DPI stage table after {ATTEMPTS} reads ({last})"),
+    ))
 }
 
 // ---------------------------------------------------------------- hidraw
@@ -378,7 +427,7 @@ mod tests {
     fn proto_stages_decoder() {
         let mut a = [0u8; 80];
         a[..10].copy_from_slice(&[1, 2, 1, 1, 0x03, 0x20, 0x03, 0x20, 0, 0]);
-        let s = decode_dpi_stages_proto(&a);
+        let s = decode_dpi_stages_proto(&a).unwrap();
         assert_eq!(
             s,
             DpiStages {

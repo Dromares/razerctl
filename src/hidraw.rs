@@ -219,7 +219,7 @@ pub fn transact_on(io: &impl FeatureIo, req: &Report) -> io::Result<Report> {
     for attempt in 0..5 {
         io.send_feature(&req.to_bytes())?;
         let mut collided = false;
-        for poll in 0..20 {
+        for poll in 0..100 {
             std::thread::sleep(std::time::Duration::from_millis(2));
             let raw = io.get_feature()?;
             let resp = Report::parse(&raw).map_err(io::Error::other)?;
