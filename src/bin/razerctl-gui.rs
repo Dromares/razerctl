@@ -4011,10 +4011,14 @@ mod tests {
     #[test]
     fn a_hide_with_nothing_unsaved_restores_only_the_tab_and_stays_quiet() {
         let mut old = macro_app(Sub::Rules);
-        old.conf_path =
-            std::env::temp_dir().join("razerctl-gui-test-carry-never-written/remap.conf");
+        let dir =
+            std::env::temp_dir().join(format!("razerctl-gui-test-carry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        old.conf_path = dir.join("remap.conf");
+        std::fs::write(&old.conf_path, RULES).unwrap();
         old.tab = Tab::Device;
-        old.conf_text = String::new();
+        old.conf_text = RULES.into(); // the editor holds exactly what the file does: nothing unsaved
+        let _ = std::fs::remove_dir_all(&dir);
         let fresh = hide_and_show(&mut old);
         assert_eq!(fresh.tab, Tab::Device);
         assert_eq!(
