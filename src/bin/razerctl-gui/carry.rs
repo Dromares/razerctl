@@ -201,21 +201,26 @@ fn flag(down: bool) -> &'static str {
 
 // ------------------------------------------------------------------------------------------------ the hand-over file
 
-/// Where the old process leaves the state: the runtime dir (private to the user), else the temp dir. The pid survives
-/// `exec`, so it is both unique and findable.
-fn path_for(pid: u32) -> std::path::PathBuf {
+/// Where the old process leaves the state: the runtime dir (private to the user), else the temp dir. The name is the pid
+/// (unique between processes; the receiver is handed the path, so it never has to guess) plus a per-process counter, so
+/// two stashes in one process (the tests share a pid and run in parallel) never write the same file.
+fn path_for(pid: u32, seq: u64) -> std::path::PathBuf {
     let dir = std::env::var_os("XDG_RUNTIME_DIR")
         .map(std::path::PathBuf::from)
         .filter(|d| d.is_dir())
         .unwrap_or_else(std::env::temp_dir);
-    dir.join(format!("{FILE_PREFIX}{pid}"))
+    dir.join(format!("{FILE_PREFIX}{pid}-{seq}"))
 }
 
 /// Write `text` for the next process. Returns the path to put in `ENV`.
 pub fn stash(text: &str) -> std::io::Result<std::path::PathBuf> {
     use std::io::Write as _;
     use std::os::unix::fs::OpenOptionsExt as _;
-    let path = path_for(std::process::id());
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let path = path_for(
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+    );
     let _ = std::fs::remove_file(&path);
     let mut f = std::fs::OpenOptions::new()
         .write(true)
@@ -297,6 +302,15 @@ mod tests {
     #[test]
     fn empty_text_is_an_empty_carry() {
         assert_eq!(Carry::decode(""), Some(Carry::default()));
+    }
+
+    #[test]
+    fn two_stashes_in_one_process_do_not_share_a_file() {
+        let a = stash("dpi\t800\n").unwrap();
+        let b = stash("dpi\t1600\n").unwrap();
+        assert_ne!(a, b);
+        assert_eq!(take_file(&a).and_then(|c| c.dpi), Some(800));
+        assert_eq!(take_file(&b).and_then(|c| c.dpi), Some(1600));
     }
 
     #[test]
