@@ -1,5 +1,9 @@
 # razerctl
 
+> razerctl is an independent, community project. It is **not affiliated with, authorized, sponsored or endorsed by Razer Inc.**
+> "Razer", "Synapse", "Viper" and related names and marks are trademarks of Razer Inc. and are used here only to describe
+> which hardware and protocol this tool is compatible with.
+
 ![razerctl GUI](docs/screenshot-buttons.png)
 
 ## Install
