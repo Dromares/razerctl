@@ -27,6 +27,7 @@ pub const HEIGHT: f32 = 316.0;
 /// rebuilds the right. Kept verbatim from the spec, so rustfmt leaves the lists alone.
 #[rustfmt::skip]
 mod data {
+    #[cfg(test)]
     pub const LEN_MM: f32 = 118.6;
     pub const WID_MM: f32 = 61.6;
 
@@ -137,6 +138,7 @@ fn circle_pts(c: Pos2, r: f32) -> Vec<Pos2> {
 }
 
 /// The smoothed silhouette in mm (what `paint_body` strokes, before the mm -> px scale).
+#[cfg(test)]
 fn outline_mm() -> Vec<Pos2> {
     let unit = Xf {
         c: Pos2::ZERO,
