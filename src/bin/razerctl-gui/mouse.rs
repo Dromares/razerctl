@@ -514,8 +514,29 @@ mod tests {
             (got - want).abs() < 0.04 * want,
             "L:W {got:.3} vs {want:.3}"
         );
-        // the old superellipse was 224 : ~124 px = 1.81; this mouse is 1.93
-        assert!(got > 1.88, "L:W {got:.3} reads as the generic mouse");
+    }
+
+    /// Widest half-extent of the outline among points with `y` in `lo..=hi` mm.
+    fn half_width(outline: &[Pos2], lo: f32, hi: f32) -> f32 {
+        outline
+            .iter()
+            .filter(|q| q.y >= lo && q.y <= hi)
+            .map(|q| q.x.abs())
+            .fold(0.0, f32::max)
+    }
+
+    /// The Viper Mini SE has a waist behind the side buttons: the body is narrower there than at the front shoulders
+    /// and at the rear. The old generic superellipse only ever widened toward the tail.
+    #[test]
+    fn outline_has_the_waist() {
+        let o = outline_mm();
+        let (front, waist, rear) = (
+            half_width(&o, -24.0, -12.0),
+            half_width(&o, 0.0, 8.0),
+            half_width(&o, 20.0, 34.0),
+        );
+        assert!(waist + 0.5 < front, "waist {waist} mm vs front {front}");
+        assert!(waist + 0.5 < rear, "waist {waist} mm vs rear {rear}");
     }
 
     /// Every leader lands on the mouse: inside the outline, or on a side button (which straddles the edge by design).
