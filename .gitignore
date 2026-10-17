@@ -4,3 +4,4 @@
 /packaging/src/
 /packaging/*.pkg.tar.*
 *.service.pkg
+/dist

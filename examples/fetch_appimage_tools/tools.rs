@@ -9,6 +9,12 @@ use std::process::Command;
 
 pub const ARCH: &str = "x86_64";
 
+/// Embedded in the AppImage so AppImageUpdate and `appimageupdatetool` can find the next release on GitHub: appimagetool `-u` reads
+/// it from `LDAI_UPDATE_INFORMATION`, writes it into the image and runs its bundled `zsyncmake`, leaving a `.zsync` beside the image
+/// (DAN-1668). `latest` is the newest non-draft, non-pre-release release; `*` is the version in the asset name.
+pub const UPDATE_INFO: &str =
+    "gh-releases-zsync|Dromares|razerctl|latest|razerctl-*-x86_64.AppImage.zsync";
+
 pub struct Pin {
     pub name: &'static str,
     pub url: &'static str,

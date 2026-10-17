@@ -132,6 +132,19 @@ The packaging settings are in `Cargo.toml` under `[package.metadata.packager]`; 
 `target/packager/razerctl-gui_<version>_x86_64.AppImage`, renamed to `razerctl-<version>-x86_64.AppImage` for the release.
 It needs `patchelf`, `file`, `desktop-file-utils` and `squashfs-tools` installed.
 
+`fetch_appimage_tools` also sets `LDAI_UPDATE_INFORMATION` (`tools::UPDATE_INFO`), so the image embeds `gh-releases-zsync|Dromares|razerctl|latest|razerctl-*-x86_64.AppImage.zsync` and tools such as AppImageUpdate can delta-update it from the newest release; `./razerctl-X.Y.Z-x86_64.AppImage --appimage-updateinformation` prints it back. appimagetool then runs `zsyncmake` (the `zsync` package) and leaves a `.zsync` under `target/packager/.cargo-packager/appimage/`, but that file names the packager's `razerctl-gui_<version>_x86_64.AppImage`, so the release job runs `zsyncmake` again on the renamed copy.
+
+#### Release assets
+
+Pushing a tag `vX.Y.Z` runs `.github/workflows/release.yml`, which refuses a tag that is not `v` plus the `Cargo.toml` version or has no `## vX.Y.Z` section in `CHANGELOG.md` (`examples/release_notes` prints that section as the release notes), builds and tests, and creates a **draft** release with these assets; a person publishes the draft:
+
+- `razerctl-X.Y.Z-x86_64.AppImage` and `razerctl-X.Y.Z-x86_64.AppImage.zsync`
+- `razerctl-X.Y.Z-x86_64-linux.tar.gz`: one directory `razerctl-X.Y.Z-x86_64-linux/` with `razerctl`, `razerctl-gui`, `70-razerctl.rules`, `razerctl.desktop`, `razerctl.svg`, `razerctl.png`, `icons/` (the symbolic tray icons), `systemd/` (the two user units, unmodified: `ExecStart=%h/.local/bin/razerctl`), `LICENSE` and `README.md`
+- `70-razerctl.rules`, the same file as `udev/70-razerctl.rules`
+- `SHA256SUMS`, `sha256sum -c` format, one line for each of the four assets above
+
+A tag with a `-` in it (`v0.2.90-test.1`) is created as a pre-release. The workflow has not run on hosted runners yet; the steps were run by hand in an Ubuntu 22.04 root filesystem (DAN-1668).
+
 The image contains four third-party binaries that `cargo-packager` would otherwise fetch from moving release tags at build
 time, unverified. `examples/fetch_appimage_tools` (Rust, like `gen_icons`) downloads them with `curl`, checks them against the sha256 values below, and aborts
 on a mismatch before anything is built (`LDAI_RUNTIME_FILE` makes the plugin use the checked runtime instead of downloading one):
