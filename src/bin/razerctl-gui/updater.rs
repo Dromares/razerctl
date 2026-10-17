@@ -324,6 +324,38 @@ fn megabytes(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / 1_000_000.0)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Block {
+    Gap,
+    Para(String),
+    Bullet(String),
+}
+
+/// The notes as the box draws them: a `- ` or `* ` line starts a bullet, a blank line is a gap, and any other line joins the
+/// block above it (the CHANGELOG is hard-wrapped, so a bullet's second line must not become a paragraph of its own).
+fn blocks(notes: &str) -> Vec<Block> {
+    let mut out: Vec<Block> = Vec::new();
+    for line in notes.lines() {
+        let t = line.trim();
+        if t.is_empty() {
+            if !matches!(out.last(), Some(Block::Gap) | None) {
+                out.push(Block::Gap);
+            }
+        } else if let Some(b) = t.strip_prefix("- ").or_else(|| t.strip_prefix("* ")) {
+            out.push(Block::Bullet(plain(b)));
+        } else {
+            match out.last_mut() {
+                Some(Block::Bullet(s) | Block::Para(s)) => {
+                    s.push(' ');
+                    s.push_str(&plain(t));
+                }
+                _ => out.push(Block::Para(plain(t))),
+            }
+        }
+    }
+    out
+}
+
 /// A line of release notes as plain text: heading marks and emphasis dropped.
 fn plain(line: &str) -> String {
     line.trim_start_matches('#')
@@ -868,40 +900,38 @@ fn changelog_box(ui: &mut Ui, p: &Pal, rel: &Release, h: f32) {
                                 .color(p.i65()),
                         ));
                     }
-                    for line in notes.lines() {
-                        if line.trim().is_empty() {
-                            ui.add_space(2.0);
-                        } else if let Some(t) = line
-                            .trim_start()
-                            .strip_prefix("- ")
-                            .or_else(|| line.trim_start().strip_prefix("* "))
-                        {
-                            ui.horizontal_top(|ui| {
-                                ui.spacing_mut().item_spacing.x = S2;
-                                ui.label(RichText::new("–").font(mono(T_DATA)).color(p.i65()));
+                    for block in blocks(&notes) {
+                        match block {
+                            Block::Gap => {
+                                ui.add_space(2.0);
+                            }
+                            Block::Bullet(t) => {
+                                ui.horizontal_top(|ui| {
+                                    ui.spacing_mut().item_spacing.x = S2;
+                                    ui.label(RichText::new("–").font(mono(T_DATA)).color(p.i65()));
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(t).font(sans(T_SMALL)).color(p.i100()),
+                                        )
+                                        .wrap(),
+                                    );
+                                });
+                            }
+                            Block::Para(t) => {
                                 ui.add(
                                     egui::Label::new(
-                                        RichText::new(plain(t)).font(sans(T_SMALL)).color(p.i100()),
+                                        RichText::new(t).font(sans(T_SMALL)).color(p.i100()),
                                     )
                                     .wrap(),
                                 );
-                            });
-                        } else {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(plain(line))
-                                        .font(sans(T_SMALL))
-                                        .color(p.i100()),
-                                )
-                                .wrap(),
-                            );
+                            }
                         }
                     }
                 });
         });
     ui.add_space(S1);
     ui.label(
-        RichText::new("Plain text from this release's notes.")
+        RichText::new("Plain text from the CHANGELOG.md section for this release.")
             .font(mono(T_MICRO))
             .color(p.i65()),
     );
@@ -1563,6 +1593,23 @@ mod tests {
             "/tmp/.mount_razerckAbcd/x:/a",
             "whole components only"
         );
+    }
+
+    #[test]
+    fn hard_wrapped_notes_join_into_one_block_per_bullet_and_paragraph() {
+        let notes = "**What it is.** A tool,\nwrapped.\n\n\n- **Buttons:** remaps\n  saved into the mouse.\n- Device: battery\n\nClosing line.";
+        assert_eq!(
+            blocks(notes),
+            [
+                Block::Para("What it is. A tool, wrapped.".into()),
+                Block::Gap,
+                Block::Bullet("Buttons: remaps saved into the mouse.".into()),
+                Block::Bullet("Device: battery".into()),
+                Block::Gap,
+                Block::Para("Closing line.".into()),
+            ]
+        );
+        assert_eq!(blocks(""), []);
     }
 
     #[test]
