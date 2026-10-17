@@ -32,9 +32,11 @@ Protocol details: [docs/onboard-button-protocol.md](docs/onboard-button-protocol
 
 ### AppImage
 
-A release carries `razerctl-X.Y.Z-x86_64.AppImage`: the GUI as one file, built against glibc 2.35 (Ubuntu 22.04), so it
-starts on distributions from about that age on. It bundles no graphics libraries: Wayland, X11, xkbcommon and OpenGL
-come from the host. It does **not** install the udev rule, so the mouse stays unreachable until you do:
+A release carries `razerctl-X.Y.Z-x86_64.AppImage`: the GUI as one file, built in an Ubuntu 22.04 root filesystem. It
+**needs glibc 2.35 or newer** (the GUI binary's highest symbol is `GLIBC_2.35`): Ubuntu 22.04, Debian 12 and Fedora 36
+or newer are fine; RHEL, Rocky and Alma 9 (glibc 2.34), Ubuntu 20.04 and Debian 11 refuse to start with
+`GLIBC_2.35 not found`. It bundles no graphics libraries: Wayland, X11, xkbcommon and OpenGL come from the host. It
+does **not** install the udev rule, so the mouse stays unreachable until you do:
 
 ```
 chmod +x razerctl-0.2.0-x86_64.AppImage && ./razerctl-0.2.0-x86_64.AppImage

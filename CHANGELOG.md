@@ -38,5 +38,8 @@ udev rule from `udev/70-razerctl.rules` (`./install.sh` does this with sudo, or 
 and reload udev). Nothing else installs it, including the AppImage.
 
 **Packaging.** `razerctl-0.2.0-x86_64.AppImage` is the GUI as a single file (build recipe in the README). It needs
-the host's graphics stack (Wayland or X11, xkbcommon, OpenGL) and the udev rule above. An Arch/CachyOS
-`PKGBUILD` and `./install.sh` are in the repository.
+glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 or newer; not RHEL/Rocky/Alma 9, Ubuntu 20.04 or Debian 11),
+the host's graphics stack (Wayland or X11, xkbcommon, OpenGL) and the udev rule above. It was started on Debian 12,
+Fedora 42 and Ubuntu 24.04 under Wayland and X11, with software GL and no real mouse; hardware GL, the tray with a real
+StatusNotifier host, and a real device in the AppImage were not tested. An Arch/CachyOS `PKGBUILD` and `./install.sh`
+are in the repository.
