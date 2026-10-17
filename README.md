@@ -48,14 +48,26 @@ To build one (the image needs at least the build machine's glibc, so the release
 in an Ubuntu 22.04 root filesystem):
 
 ```
-cargo install cargo-packager --locked
-cargo build --release --locked && cargo packager --release --formats appimage
+cargo install cargo-packager --locked --version 0.11.8
+cargo build --release --locked && packaging/fetch-appimage-tools.sh cargo packager --release --formats appimage
 ```
 
 The packaging settings are in `Cargo.toml` under `[package.metadata.packager]`; the output is
 `target/packager/razerctl-gui_<version>_x86_64.AppImage`, renamed to `razerctl-<version>-x86_64.AppImage` for the release.
-`cargo-packager` downloads `linuxdeploy` and the AppImage runtime when it runs, and needs `patchelf`, `file`,
-`desktop-file-utils` and `squashfs-tools` installed.
+It needs `patchelf`, `file`, `desktop-file-utils` and `squashfs-tools` installed.
+
+The image contains four third-party binaries that `cargo-packager` would otherwise fetch from moving release tags at build
+time, unverified. `packaging/fetch-appimage-tools.sh` downloads them, checks them against the sha256 values below, and aborts
+on a mismatch before anything is built (`LDAI_RUNTIME_FILE` makes the plugin use the checked runtime instead of downloading one):
+
+| File | Source | sha256 |
+|---|---|---|
+| `AppRun-x86_64` | tauri-apps/binary-releases `apprun-old` | `f30140a43a0a59e46db21bdefdf749b9e9f2c6946e92afabbacf98b8ae73fb4f` |
+| `linuxdeploy-x86_64.AppImage` | tauri-apps/binary-releases `linuxdeploy` | `e762bea85c8eb0d4b3508d46e5c1f037f717d0f9303ae3b4aafc8b04991fa1ef` |
+| `linuxdeploy-plugin-appimage-x86_64.AppImage` | linuxdeploy/linuxdeploy-plugin-appimage `continuous` | `49d6a17160675a6bd1781699aae6bdf7692d98552e02a3671d2183d10547842e` |
+| `runtime-x86_64` | AppImage/type2-runtime `continuous` | `156f4bdbde9c52d01814600013e0a273f0118dc2de98975f3c8c63427ec79074` |
+
+The upstream tags can move; when one does the script fails closed, and the pin is bumped deliberately (edit the script and this table).
 
 ---
 
