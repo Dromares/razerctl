@@ -30,6 +30,33 @@ Then open **razerctl** from the app menu (or run `razerctl-gui`).
 CLI equivalent: `razerctl --backend hidraw onboard` / `onboard set BUTTON ACTION`.
 Protocol details: [docs/onboard-button-protocol.md](docs/onboard-button-protocol.md).
 
+### AppImage
+
+A release carries `razerctl-X.Y.Z-x86_64.AppImage`: the GUI as one file, built against glibc 2.35 (Ubuntu 22.04), so it
+starts on distributions from about that age on. It bundles no graphics libraries: Wayland, X11, xkbcommon and OpenGL
+come from the host. It does **not** install the udev rule, so the mouse stays unreachable until you do:
+
+```
+chmod +x razerctl-0.2.0-x86_64.AppImage && ./razerctl-0.2.0-x86_64.AppImage
+sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+```
+
+The command-line tool is inside it too (`--appimage-extract`, then `squashfs-root/usr/bin/razerctl`). The
+systemd units are not packaged; use `./install.sh` if you want the remap service or the low-battery notifier.
+
+To build one (the image needs at least the build machine's glibc, so the release is built
+in an Ubuntu 22.04 root filesystem):
+
+```
+cargo install cargo-packager --locked
+cargo build --release --locked && cargo packager --release --formats appimage
+```
+
+The packaging settings are in `Cargo.toml` under `[package.metadata.packager]`; the output is
+`target/packager/razerctl-gui_<version>_x86_64.AppImage`, renamed to `razerctl-<version>-x86_64.AppImage` for the release.
+`cargo-packager` downloads `linuxdeploy` and the AppImage runtime when it runs, and needs `patchelf`, `file`,
+`desktop-file-utils` and `squashfs-tools` installed.
+
 ---
 
 A Linux rewrite, in Rust, of the device-control core of **Razer Synapse 4 for macOS**
