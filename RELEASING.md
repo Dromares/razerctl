@@ -141,7 +141,7 @@ Build the tarball with this layout (one top-level directory), then the checksums
 
 ```sh
 D=razerctl-X.Y.Z-x86_64-linux && mkdir -p out/$D/icons out/$D/systemd
-cp target/release/razerctl target/release/razerctl-gui udev/70-razerctl.rules packaging/razerctl.desktop packaging/razerctl.svg LICENSE README.md out/$D/
+cp target/release/razerctl target/release/razerctl-gui udev/70-razerctl.rules packaging/razerctl.desktop packaging/razerctl.svg packaging/razerctl.png LICENSE README.md out/$D/
 cp packaging/icons/razerctl-*symbolic.svg out/$D/icons/ && cp systemd/*.service out/$D/systemd/
 tar -C out -czf out/$D.tar.gz $D
 cp udev/70-razerctl.rules out/
