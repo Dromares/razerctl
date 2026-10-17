@@ -115,7 +115,11 @@ pub struct Paths {
 impl Paths {
     /// `~/.config/razerctl/update.state` and `update-latest.json`.
     pub fn default_paths() -> Paths {
-        Paths::in_dir(crate::battery::config_path().parent().unwrap_or(Path::new("")))
+        Paths::in_dir(
+            crate::battery::config_path()
+                .parent()
+                .unwrap_or(Path::new("")),
+        )
     }
 
     pub fn in_dir(dir: impl AsRef<Path>) -> Paths {
@@ -176,13 +180,24 @@ mod tests {
         };
         assert_eq!(State::parse(&s.format()), s);
         assert_eq!(State::parse(""), State::default());
-        let junk = State::parse("last_check = soon\noutcome = great\nwhat\ndismissed=5\nextra = 1\n");
-        assert_eq!(junk, State { last_check: None, outcome: None, dismissed: Some(5) });
+        let junk =
+            State::parse("last_check = soon\noutcome = great\nwhat\ndismissed=5\nextra = 1\n");
+        assert_eq!(
+            junk,
+            State {
+                last_check: None,
+                outcome: None,
+                dismissed: Some(5)
+            }
+        );
     }
 
     #[test]
     fn a_check_is_due_after_a_day_and_after_a_clock_that_ran_backwards() {
-        let s = State { last_check: Some(1000), ..State::default() };
+        let s = State {
+            last_check: Some(1000),
+            ..State::default()
+        };
         assert!(!s.due(1000));
         assert!(!s.due(1000 + INTERVAL_SECS - 1));
         assert!(s.due(1000 + INTERVAL_SECS));
@@ -192,7 +207,10 @@ mod tests {
 
     #[test]
     fn not_now_silences_the_banner_for_a_day() {
-        let s = State { dismissed: Some(1000), ..State::default() };
+        let s = State {
+            dismissed: Some(1000),
+            ..State::default()
+        };
         assert!(!s.banner_wanted(1000));
         assert!(!s.banner_wanted(1000 + INTERVAL_SECS - 1));
         assert!(s.banner_wanted(1000 + INTERVAL_SECS));

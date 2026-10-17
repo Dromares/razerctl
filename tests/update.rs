@@ -6,8 +6,9 @@
 
 use razerctl::sha256;
 use razerctl::update::{
-    apply_appimage, check, check_and_record, check_if_due, dismiss, pending_release, Applied, CheckResult, FetchError,
-    InstallType, Outcome, Paths, Source, Stage, UpdateError, Version, INTERVAL_SECS,
+    apply_appimage, check, check_and_record, check_if_due, dismiss, pending_release, Applied,
+    CheckResult, FetchError, InstallType, Outcome, Paths, Source, Stage, UpdateError, Version,
+    INTERVAL_SECS,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -55,7 +56,10 @@ impl Fixture {
                     let path = line.split_whitespace().nth(1).unwrap_or("/").to_string();
                     h.lock().unwrap().push(path.clone());
                     let route = r.lock().unwrap().get(&path).cloned();
-                    let route = route.unwrap_or(Route { status: 404, body: b"{\"message\":\"Not Found\"}".to_vec() });
+                    let route = route.unwrap_or(Route {
+                        status: 404,
+                        body: b"{\"message\":\"Not Found\"}".to_vec(),
+                    });
                     let head = format!(
                         "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         route.status,
@@ -74,10 +78,13 @@ impl Fixture {
     }
 
     fn put(&self, path: &str, status: u16, body: impl Into<Vec<u8>>) {
-        self.routes
-            .lock()
-            .unwrap()
-            .insert(path.into(), Route { status, body: body.into() });
+        self.routes.lock().unwrap().insert(
+            path.into(),
+            Route {
+                status,
+                body: body.into(),
+            },
+        );
     }
 
     fn requests(&self) -> Vec<String> {
@@ -96,7 +103,11 @@ impl Fixture {
         let json = release_json(&self.base, tag, ver, payload.len());
         self.put("/repos/Dromares/razerctl/releases/latest", 200, json);
         self.put(&format!("/dl/{tag}/{name}"), 200, payload);
-        let sums = format!("{}  {name}\n{}  70-razerctl.rules\n", hex(sums_for), hex(b"rules"));
+        let sums = format!(
+            "{}  {name}\n{}  70-razerctl.rules\n",
+            hex(sums_for),
+            hex(b"rules")
+        );
         self.put(&format!("/dl/{tag}/SHA256SUMS"), 200, sums);
     }
 }
@@ -175,7 +186,8 @@ impl Drop for Dir {
     fn drop(&mut self) {
         // a test that chmod'ed a directory read-only must still be able to clean up
         for rel in ["ro", "."] {
-            let _ = std::fs::set_permissions(self.path(rel), std::fs::Permissions::from_mode(0o755));
+            let _ =
+                std::fs::set_permissions(self.path(rel), std::fs::Permissions::from_mode(0o755));
         }
         let _ = std::fs::remove_dir_all(&self.0);
     }
@@ -194,11 +206,20 @@ fn finds_a_newer_release_and_reads_its_notes_and_assets() {
     assert!(body.is_some());
     assert_eq!(r.tag, "v0.3.0");
     assert_eq!(r.version, v("0.3.0"));
-    assert_eq!(r.notes_text(), "First line.\n\n- fixed a thing\n- added another");
+    assert_eq!(
+        r.notes_text(),
+        "First line.\n\n- fixed a thing\n- added another"
+    );
     assert_eq!(r.published, "2026-10-17T15:23:45Z");
-    assert_eq!(r.page, "https://github.com/Dromares/razerctl/releases/tag/v0.3.0");
+    assert_eq!(
+        r.page,
+        "https://github.com/Dromares/razerctl/releases/tag/v0.3.0"
+    );
     assert_eq!(r.appimage().unwrap().size, 3);
-    assert_eq!(r.appimage().unwrap().url, format!("{}/dl/v0.3.0/razerctl-0.3.0-x86_64.AppImage", fx.base));
+    assert_eq!(
+        r.appimage().unwrap().url,
+        format!("{}/dl/v0.3.0/razerctl-0.3.0-x86_64.AppImage", fx.base)
+    );
     assert!(r.sums().is_some());
     assert_eq!(fx.requests(), [LATEST], "one request, to /releases/latest");
 }
@@ -207,16 +228,37 @@ fn finds_a_newer_release_and_reads_its_notes_and_assets() {
 fn the_same_or_an_older_release_is_up_to_date_and_pre_releases_compare_by_semver() {
     let fx = Fixture::start();
     fx.publish("v0.2.0", b"x", b"x");
-    assert!(matches!(check(&fx.src(), &v("0.2.0")).0, CheckResult::UpToDate(_)));
-    assert!(matches!(check(&fx.src(), &v("0.3.0")).0, CheckResult::UpToDate(_)), "never a downgrade");
+    assert!(matches!(
+        check(&fx.src(), &v("0.2.0")).0,
+        CheckResult::UpToDate(_)
+    ));
+    assert!(
+        matches!(check(&fx.src(), &v("0.3.0")).0, CheckResult::UpToDate(_)),
+        "never a downgrade"
+    );
     // the Step 3 test tags: .1 < .2 < the release
     fx.publish("v0.2.91-test.2", b"x", b"x");
-    assert!(matches!(check(&fx.src(), &v("0.2.90-test.1")).0, CheckResult::Available(_)));
-    assert!(matches!(check(&fx.src(), &v("0.2.91-test.2")).0, CheckResult::UpToDate(_)));
-    assert!(matches!(check(&fx.src(), &v("0.3.0")).0, CheckResult::UpToDate(_)), "0.3.0 is newer than 0.2.91-test.2");
+    assert!(matches!(
+        check(&fx.src(), &v("0.2.90-test.1")).0,
+        CheckResult::Available(_)
+    ));
+    assert!(matches!(
+        check(&fx.src(), &v("0.2.91-test.2")).0,
+        CheckResult::UpToDate(_)
+    ));
+    assert!(
+        matches!(check(&fx.src(), &v("0.3.0")).0, CheckResult::UpToDate(_)),
+        "0.3.0 is newer than 0.2.91-test.2"
+    );
     fx.publish("v0.3.0", b"x", b"x");
-    assert!(matches!(check(&fx.src(), &v("0.2.91-test.2")).0, CheckResult::Available(_)));
-    assert!(matches!(check(&fx.src(), &v("0.3.0-rc.1")).0, CheckResult::Available(_)));
+    assert!(matches!(
+        check(&fx.src(), &v("0.2.91-test.2")).0,
+        CheckResult::Available(_)
+    ));
+    assert!(matches!(
+        check(&fx.src(), &v("0.3.0-rc.1")).0,
+        CheckResult::Available(_)
+    ));
 }
 
 #[test]
@@ -227,9 +269,15 @@ fn offline_a_rate_limit_and_a_404_are_failures_with_their_own_outcome() {
     assert_eq!(res, CheckResult::Failed(FetchError::NotFound));
     assert_eq!((res.outcome(), body), (Outcome::Failed, None));
     fx.put(LATEST, 403, r#"{"message":"API rate limit exceeded"}"#);
-    assert_eq!(check(&fx.src(), &v("0.2.0")).0.outcome(), Outcome::RateLimited);
+    assert_eq!(
+        check(&fx.src(), &v("0.2.0")).0.outcome(),
+        Outcome::RateLimited
+    );
     fx.put(LATEST, 429, "");
-    assert_eq!(check(&fx.src(), &v("0.2.0")).0.outcome(), Outcome::RateLimited);
+    assert_eq!(
+        check(&fx.src(), &v("0.2.0")).0.outcome(),
+        Outcome::RateLimited
+    );
     fx.put(LATEST, 500, "boom");
     assert_eq!(check(&fx.src(), &v("0.2.0")).0.outcome(), Outcome::Failed);
     fx.put(LATEST, 200, "<html>captive portal</html>");
@@ -239,7 +287,10 @@ fn offline_a_rate_limit_and_a_404_are_failures_with_their_own_outcome() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
         format!("http://127.0.0.1:{}", l.local_addr().unwrap().port())
     };
-    assert_eq!(check(&Source::loopback(&dead), &v("0.2.0")).0.outcome(), Outcome::Offline);
+    assert_eq!(
+        check(&Source::loopback(&dead), &v("0.2.0")).0.outcome(),
+        Outcome::Offline
+    );
 }
 
 #[test]
@@ -274,11 +325,17 @@ fn a_failed_check_also_uses_up_the_day_and_a_manual_check_ignores_the_throttle()
     let cur = v("0.2.0");
     assert!(check_if_due(&fx.src(), &paths, &cur, 1000, true).is_some());
     assert_eq!(paths.load().outcome, Some(Outcome::Failed));
-    assert!(check_if_due(&fx.src(), &paths, &cur, 2000, true).is_none(), "an offline start does not retry in a loop");
+    assert!(
+        check_if_due(&fx.src(), &paths, &cur, 2000, true).is_none(),
+        "an offline start does not retry in a loop"
+    );
     assert_eq!(fx.count(LATEST), 1);
     // Check now: not throttled, and it records its own time
     fx.publish("v0.3.0", b"x", b"x");
-    assert!(matches!(check_and_record(&fx.src(), &paths, &cur, 2000), CheckResult::Available(_)));
+    assert!(matches!(
+        check_and_record(&fx.src(), &paths, &cur, 2000),
+        CheckResult::Available(_)
+    ));
     assert_eq!(fx.count(LATEST), 2);
     assert_eq!(paths.load().last_check, Some(2000));
 }
@@ -290,7 +347,11 @@ fn the_off_switch_means_no_request_at_all() {
     let dir = Dir::new("off");
     let paths = Paths::in_dir(dir.path("cfg"));
     assert!(check_if_due(&fx.src(), &paths, &v("0.2.0"), 1_760_000_000, false).is_none());
-    assert!(fx.requests().is_empty(), "disabled: nothing sent, got {:?}", fx.requests());
+    assert!(
+        fx.requests().is_empty(),
+        "disabled: nothing sent, got {:?}",
+        fx.requests()
+    );
     assert!(!paths.state.exists(), "and nothing written");
 }
 
@@ -305,7 +366,11 @@ fn the_dialog_can_be_rebuilt_from_the_cache_and_not_now_lasts_a_day_unless_a_new
     check_and_record(&fx.src(), &paths, &cur, 1000);
     let r = pending_release(&paths, &cur).expect("cached");
     assert_eq!(r.tag, "v0.3.0");
-    assert_eq!(pending_release(&paths, &v("0.3.0")), None, "updated by hand since: nothing pending");
+    assert_eq!(
+        pending_release(&paths, &v("0.3.0")),
+        None,
+        "updated by hand since: nothing pending"
+    );
 
     dismiss(&paths, 5000);
     assert!(!paths.load().banner_wanted(5000 + 60));
@@ -336,13 +401,28 @@ fn setup(sums_for: &[u8], dir: &Dir) -> (Fixture, razerctl::update::Release, Pat
     (fx, rel, target)
 }
 
-fn run(fx: &Fixture, rel: &razerctl::update::Release, target: &Path, fallback: &Path) -> (Result<Applied, UpdateError>, Vec<Stage>) {
+fn run(
+    fx: &Fixture,
+    rel: &razerctl::update::Release,
+    target: &Path,
+    fallback: &Path,
+) -> (Result<Applied, UpdateError>, Vec<Stage>) {
     let mut stages = Vec::new();
-    let r = apply_appimage(&fx.src(), rel, target, fallback, &AtomicBool::new(false), &mut |s| {
-        if !matches!((stages.last(), s), (Some(Stage::Downloading { .. }), Stage::Downloading { .. })) {
-            stages.push(s);
-        }
-    });
+    let r = apply_appimage(
+        &fx.src(),
+        rel,
+        target,
+        fallback,
+        &AtomicBool::new(false),
+        &mut |s| {
+            if !matches!(
+                (stages.last(), s),
+                (Some(Stage::Downloading { .. }), Stage::Downloading { .. })
+            ) {
+                stages.push(s);
+            }
+        },
+    );
     (r, stages)
 }
 
@@ -352,13 +432,40 @@ fn a_verified_download_replaces_the_file_in_place_and_keeps_the_old_one() {
     let (fx, rel, target) = setup(NEW, &dir);
     let (res, stages) = run(&fx, &rel, &target, &dir.path("dl"));
     let old = dir.path("apps/razerctl-0.2.0-x86_64.AppImage.old");
-    assert_eq!(res, Ok(Applied::Replaced { path: target.clone(), old: Some(old.clone()) }));
+    assert_eq!(
+        res,
+        Ok(Applied::Replaced {
+            path: target.clone(),
+            old: Some(old.clone())
+        })
+    );
     assert_eq!(std::fs::read(&target).unwrap(), NEW);
-    assert_eq!(std::fs::read(&old).unwrap(), OLD, "the previous file is kept as <name>.old");
-    assert_eq!(std::fs::metadata(&target).unwrap().permissions().mode() & 0o777, 0o755);
-    assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage", "razerctl-0.2.0-x86_64.AppImage.old"], "no .part left");
-    assert!(matches!(stages[0], Stage::Downloading { .. }) && stages[1..] == [Stage::Verifying, Stage::Replacing], "{stages:?}");
-    assert!(!dir.path("dl").exists(), "the fallback folder is not touched");
+    assert_eq!(
+        std::fs::read(&old).unwrap(),
+        OLD,
+        "the previous file is kept as <name>.old"
+    );
+    assert_eq!(
+        std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+    assert_eq!(
+        dir.names("apps"),
+        [
+            "razerctl-0.2.0-x86_64.AppImage",
+            "razerctl-0.2.0-x86_64.AppImage.old"
+        ],
+        "no .part left"
+    );
+    assert!(
+        matches!(stages[0], Stage::Downloading { .. })
+            && stages[1..] == [Stage::Verifying, Stage::Replacing],
+        "{stages:?}"
+    );
+    assert!(
+        !dir.path("dl").exists(),
+        "the fallback folder is not touched"
+    );
 
     // a second update replaces the previous .old
     std::fs::write(&target, b"0.3.0 on disk").unwrap();
@@ -374,13 +481,31 @@ fn a_checksum_mismatch_refuses_and_changes_nothing() {
     let (res, stages) = run(&fx, &rel, &target, &dir.path("dl"));
     assert_eq!(
         res,
-        Err(UpdateError::Mismatch { expected: hex(b"some other bytes"), got: hex(NEW) }),
+        Err(UpdateError::Mismatch {
+            expected: hex(b"some other bytes"),
+            got: hex(NEW)
+        }),
         "{res:?}"
     );
-    assert_eq!(std::fs::read(&target).unwrap(), OLD, "the installed file is exactly as it was");
-    assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"], "no .old, no .part, no new file");
-    assert!(!dir.path("dl").exists(), "and nothing was saved to the fallback folder");
-    assert_eq!(stages.last(), Some(&Stage::Verifying), "it never reached the replace step: {stages:?}");
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        OLD,
+        "the installed file is exactly as it was"
+    );
+    assert_eq!(
+        dir.names("apps"),
+        ["razerctl-0.2.0-x86_64.AppImage"],
+        "no .old, no .part, no new file"
+    );
+    assert!(
+        !dir.path("dl").exists(),
+        "and nothing was saved to the fallback folder"
+    );
+    assert_eq!(
+        stages.last(),
+        Some(&Stage::Verifying),
+        "it never reached the replace step: {stages:?}"
+    );
 }
 
 #[test]
@@ -388,18 +513,31 @@ fn a_release_without_usable_checksums_is_refused_before_any_download() {
     let dir = Dir::new("nosums");
     let (fx, rel, target) = setup(NEW, &dir);
     // SHA256SUMS exists but has no line for the AppImage
-    fx.put("/dl/v0.3.0/SHA256SUMS", 200, format!("{}  70-razerctl.rules\n", hex(b"rules")));
+    fx.put(
+        "/dl/v0.3.0/SHA256SUMS",
+        200,
+        format!("{}  70-razerctl.rules\n", hex(b"rules")),
+    );
     let (res, _) = run(&fx, &rel, &target, &dir.path("dl"));
     assert!(matches!(res, Err(UpdateError::MissingAsset(_))), "{res:?}");
-    assert_eq!(fx.count("/dl/v0.3.0/razerctl-0.3.0-x86_64.AppImage"), 0, "the big download never started");
+    assert_eq!(
+        fx.count("/dl/v0.3.0/razerctl-0.3.0-x86_64.AppImage"),
+        0,
+        "the big download never started"
+    );
     // SHA256SUMS missing from the server
     fx.put("/dl/v0.3.0/SHA256SUMS", 404, "");
-    assert!(matches!(run(&fx, &rel, &target, &dir.path("dl")).0, Err(UpdateError::Net(FetchError::NotFound))));
+    assert!(matches!(
+        run(&fx, &rel, &target, &dir.path("dl")).0,
+        Err(UpdateError::Net(FetchError::NotFound))
+    ));
     assert_eq!(std::fs::read(&target).unwrap(), OLD);
     // the release lists no SHA256SUMS asset at all
     let mut bare = rel.clone();
     bare.assets.retain(|a| a.name != "SHA256SUMS");
-    assert!(matches!(run(&fx, &bare, &target, &dir.path("dl")).0, Err(UpdateError::MissingAsset(n)) if n == "SHA256SUMS"));
+    assert!(
+        matches!(run(&fx, &bare, &target, &dir.path("dl")).0, Err(UpdateError::MissingAsset(n)) if n == "SHA256SUMS")
+    );
     assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"]);
 }
 
@@ -425,9 +563,21 @@ fn an_unwritable_directory_falls_back_to_downloaded_to() {
         other => panic!("expected the fallback, got {other:?}"),
     }
     assert_eq!(std::fs::read(&saved).unwrap(), NEW, "saved, verified");
-    assert_eq!(std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777, 0o755, "ready to run");
-    assert_eq!(std::fs::read(&target).unwrap(), OLD, "the running file is untouched");
-    assert_eq!(dir.names("Downloads"), ["razerctl-0.3.0-x86_64.AppImage"], "no .part left behind");
+    assert_eq!(
+        std::fs::metadata(&saved).unwrap().permissions().mode() & 0o777,
+        0o755,
+        "ready to run"
+    );
+    assert_eq!(
+        std::fs::read(&target).unwrap(),
+        OLD,
+        "the running file is untouched"
+    );
+    assert_eq!(
+        dir.names("Downloads"),
+        ["razerctl-0.3.0-x86_64.AppImage"],
+        "no .part left behind"
+    );
     assert!(!stages.contains(&Stage::Replacing), "{stages:?}");
 }
 
@@ -438,7 +588,10 @@ fn a_target_directory_that_is_gone_also_falls_back() {
     let target = dir.path("not-there/razerctl-0.2.0-x86_64.AppImage");
     let (res, _) = run(&fx, &rel, &target, &dir.path("Downloads"));
     assert!(matches!(res, Ok(Applied::Saved { .. })), "{res:?}");
-    assert_eq!(std::fs::read(dir.path("Downloads/razerctl-0.3.0-x86_64.AppImage")).unwrap(), NEW);
+    assert_eq!(
+        std::fs::read(dir.path("Downloads/razerctl-0.3.0-x86_64.AppImage")).unwrap(),
+        NEW
+    );
     assert!(!target.exists());
 }
 
@@ -447,7 +600,14 @@ fn a_cancelled_download_leaves_nothing() {
     let dir = Dir::new("cancel");
     let (fx, rel, target) = setup(NEW, &dir);
     let cancel = AtomicBool::new(true);
-    let r = apply_appimage(&fx.src(), &rel, &target, &dir.path("dl"), &cancel, &mut |_| {});
+    let r = apply_appimage(
+        &fx.src(),
+        &rel,
+        &target,
+        &dir.path("dl"),
+        &cancel,
+        &mut |_| {},
+    );
     assert_eq!(r, Err(UpdateError::Cancelled));
     assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"]);
     assert_eq!(std::fs::read(&target).unwrap(), OLD);
@@ -458,17 +618,39 @@ fn asset_urls_must_be_https_unless_the_source_is_the_loopback_fixture() {
     let dir = Dir::new("https");
     let (_fx, rel, target) = setup(NEW, &dir);
     // the real source refuses the fixture's http:// asset URLs outright
-    let r = apply_appimage(&Source::github(), &rel, &target, &dir.path("dl"), &AtomicBool::new(false), &mut |_| {});
-    assert!(matches!(&r, Err(UpdateError::Net(FetchError::Other(m))) if m.contains("non-https")), "{r:?}");
+    let r = apply_appimage(
+        &Source::github(),
+        &rel,
+        &target,
+        &dir.path("dl"),
+        &AtomicBool::new(false),
+        &mut |_| {},
+    );
+    assert!(
+        matches!(&r, Err(UpdateError::Net(FetchError::Other(m))) if m.contains("non-https")),
+        "{r:?}"
+    );
     assert_eq!(std::fs::read(&target).unwrap(), OLD);
 }
 
 // ------------------------------------------------------------------------------------------------ the CLI
 
-fn cli(fx: &Fixture, args: &[&str], install: &InstallType, answer: &str) -> (Result<(), String>, String) {
+fn cli(
+    fx: &Fixture,
+    args: &[&str],
+    install: &InstallType,
+    answer: &str,
+) -> (Result<(), String>, String) {
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
     let mut out = Vec::new();
-    let r = razerctl::update::cli::run(&args, &fx.src(), &v("0.2.0"), install, &mut answer.as_bytes(), &mut out);
+    let r = razerctl::update::cli::run(
+        &args,
+        &fx.src(),
+        &v("0.2.0"),
+        install,
+        &mut answer.as_bytes(),
+        &mut out,
+    );
     (r, String::from_utf8(out).unwrap())
 }
 
@@ -476,7 +658,12 @@ fn appimage_install(dir: &Dir) -> (InstallType, PathBuf) {
     std::fs::create_dir_all(dir.path("apps")).unwrap();
     let target = dir.path("apps/razerctl-0.2.0-x86_64.AppImage");
     std::fs::write(&target, OLD).unwrap();
-    (InstallType::AppImage { path: target.clone() }, target)
+    (
+        InstallType::AppImage {
+            path: target.clone(),
+        },
+        target,
+    )
 }
 
 #[test]
@@ -502,8 +689,14 @@ fn update_asks_before_doing_anything_and_n_changes_nothing() {
     for answer in ["n\n", "\n", "", "later\n"] {
         let (res, out) = cli(&fx, &[], &install, answer);
         assert_eq!(res, Ok(()));
-        assert!(out.contains("[y/N]") && out.contains("Nothing was changed."), "{out}");
-        assert!(out.contains("- fixed a thing"), "the notes come before the question");
+        assert!(
+            out.contains("[y/N]") && out.contains("Nothing was changed."),
+            "{out}"
+        );
+        assert!(
+            out.contains("- fixed a thing"),
+            "the notes come before the question"
+        );
         assert_eq!(std::fs::read(&target).unwrap(), OLD, "answer {answer:?}");
     }
     assert!(
@@ -521,9 +714,15 @@ fn update_with_a_yes_downloads_verifies_and_replaces() {
     let (install, target) = appimage_install(&dir);
     let (res, out) = cli(&fx, &[], &install, "y\n");
     assert_eq!(res, Ok(()));
-    assert!(out.contains("is installed at") && out.contains("Restart razerctl"), "{out}");
+    assert!(
+        out.contains("is installed at") && out.contains("Restart razerctl"),
+        "{out}"
+    );
     assert_eq!(std::fs::read(&target).unwrap(), NEW);
-    assert_eq!(std::fs::read(dir.path("apps/razerctl-0.2.0-x86_64.AppImage.old")).unwrap(), OLD);
+    assert_eq!(
+        std::fs::read(dir.path("apps/razerctl-0.2.0-x86_64.AppImage.old")).unwrap(),
+        OLD
+    );
 }
 
 #[test]
@@ -544,11 +743,21 @@ fn package_and_tarball_installs_are_told_where_and_never_asked() {
     fx.publish("v0.3.0", NEW, NEW);
     let (res, out) = cli(&fx, &[], &InstallType::Package, "y\n");
     assert_eq!(res, Ok(()));
-    assert!(out.contains("package manager") && !out.contains("[y/N]"), "{out}");
+    assert!(
+        out.contains("package manager") && !out.contains("[y/N]"),
+        "{out}"
+    );
     let (res, out) = cli(&fx, &[], &InstallType::Tarball, "y\n");
     assert_eq!(res, Ok(()));
-    assert!(out.contains("releases/tag/v0.3.0") && !out.contains("[y/N]"), "{out}");
-    assert!(fx.requests().iter().all(|h| h == LATEST), "neither downloads: {:?}", fx.requests());
+    assert!(
+        out.contains("releases/tag/v0.3.0") && !out.contains("[y/N]"),
+        "{out}"
+    );
+    assert!(
+        fx.requests().iter().all(|h| h == LATEST),
+        "neither downloads: {:?}",
+        fx.requests()
+    );
 }
 
 #[test]
@@ -560,7 +769,10 @@ fn update_says_when_it_is_current_and_why_a_check_failed() {
     assert!(out.contains("up to date"), "{out}");
     let down = Fixture::start();
     let (res, _) = cli(&down, &["--check"], &InstallType::Tarball, "");
-    assert!(res.unwrap_err().contains("couldn't check for updates"), "an explicit check does say why");
+    assert!(
+        res.unwrap_err().contains("couldn't check for updates"),
+        "an explicit check does say why"
+    );
     assert!(cli(&fx, &["--bogus"], &InstallType::Tarball, "").0.is_err());
 }
 
@@ -569,12 +781,23 @@ fn cancel_while_verifying_deletes_the_download_and_replaces_nothing() {
     let dir = Dir::new("cancel-verify");
     let (fx, rel, target) = setup(NEW, &dir);
     let cancel = AtomicBool::new(false);
-    let r = apply_appimage(&fx.src(), &rel, &target, &dir.path("dl"), &cancel, &mut |s| {
-        if s == Stage::Verifying {
-            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
-    });
+    let r = apply_appimage(
+        &fx.src(),
+        &rel,
+        &target,
+        &dir.path("dl"),
+        &cancel,
+        &mut |s| {
+            if s == Stage::Verifying {
+                cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        },
+    );
     assert_eq!(r, Err(UpdateError::Cancelled));
-    assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"], "no .part, no .old");
+    assert_eq!(
+        dir.names("apps"),
+        ["razerctl-0.2.0-x86_64.AppImage"],
+        "no .part, no .old"
+    );
     assert_eq!(std::fs::read(&target).unwrap(), OLD);
 }

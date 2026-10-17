@@ -1741,7 +1741,11 @@ impl App {
         if c.dpi.is_some() || c.poll.is_some() {
             parts.push("device settings".to_string());
         }
-        let verb = if parts.len() == 1 && n == 1 { "is" } else { "are" };
+        let verb = if parts.len() == 1 && n == 1 {
+            "is"
+        } else {
+            "are"
+        };
         (!parts.is_empty()).then(|| format!("{} {verb}", parts.join(" and ")))
     }
 
@@ -4184,7 +4188,10 @@ mod tests {
         .unwrap()
     }
 
-    fn state(outcome: razerctl::update::Outcome, dismissed: Option<u64>) -> razerctl::update::State {
+    fn state(
+        outcome: razerctl::update::Outcome,
+        dismissed: Option<u64>,
+    ) -> razerctl::update::State {
         let now = razerctl::update::now_secs();
         razerctl::update::State {
             last_check: Some(now - 60),
@@ -4216,7 +4223,10 @@ mod tests {
         }
         let text = "close_to_tray = true\ncheck_updates = false\n";
         assert_eq!(tray::parse_settings(text).check_updates, Some(false));
-        assert_eq!(tray::parse_settings("check_updates = true").check_updates, Some(true));
+        assert_eq!(
+            tray::parse_settings("check_updates = true").check_updates,
+            Some(true)
+        );
         assert_eq!(
             tray::parse_settings("check_updates = whatever").check_updates,
             None,
@@ -4231,8 +4241,16 @@ mod tests {
         app.update.install = appimage();
         for (outcome, chip, line) in [
             (UpToDate, "UP TO DATE", "Next check in about 24 hours."),
-            (Offline, "COULDN'T CONNECT", "No answer from api.github.com."),
-            (RateLimited, "RATE LIMITED", "GitHub asked razerctl to wait."),
+            (
+                Offline,
+                "COULDN'T CONNECT",
+                "No answer from api.github.com.",
+            ),
+            (
+                RateLimited,
+                "RATE LIMITED",
+                "GitHub asked razerctl to wait.",
+            ),
         ] {
             app.update.stage(None, state(outcome, None), None);
             let l = lines_of(&mut app, Tab::App, SIZES[0]);
@@ -4240,24 +4258,42 @@ mod tests {
             assert!(l.iter().any(|s| s.contains(line)), "{line}: {l:?}");
             assert!(l.iter().any(|s| s.contains("CHECK NOW")), "{l:?}");
             assert!(
-                !l.iter().any(|s| s.contains("is available") || s.contains("UPDATE AVAILABLE")),
+                !l.iter()
+                    .any(|s| s.contains("is available") || s.contains("UPDATE AVAILABLE")),
                 "no banner, no dialog: {l:?}"
             );
             assert_eq!(app.status, "", "no status message either");
         }
         // an update waiting: the chip names it, the button becomes View update, and Not now is remembered in the line
-        app.update.stage(Some(release()), state(Available, Some(razerctl::update::now_secs())), None);
+        app.update.stage(
+            Some(release()),
+            state(Available, Some(razerctl::update::now_secs())),
+            None,
+        );
         let l = lines_of(&mut app, Tab::App, SIZES[0]);
         assert!(l.iter().any(|s| s.contains("0.3.0 AVAILABLE")), "{l:?}");
         assert!(l.iter().any(|s| s.contains("VIEW UPDATE")), "{l:?}");
-        assert!(l.iter().any(|s| s.contains("You chose Not now; razerctl will ask again tomorrow.")), "{l:?}");
+        assert!(
+            l.iter()
+                .any(|s| s.contains("You chose Not now; razerctl will ask again tomorrow.")),
+            "{l:?}"
+        );
         // switched off: no check, and Check now is disabled
         app.settings.check_updates = Some(false);
         let t = render_texts(&mut app, Tab::App, Mode::Dark, SIZES[0]);
         assert!(t.iter().any(|(s, ..)| s.contains("NOT CHECKING")));
-        let check = t.iter().find(|(s, ..)| s.contains("CHECK NOW")).expect("button stays, disabled");
-        let enabled = t.iter().find(|(s, ..)| s == "OFF" || s.contains("RESET")).and_then(|(_, _, c)| *c);
-        assert_ne!(check.2, enabled, "a disabled button paints its label in another colour");
+        let check = t
+            .iter()
+            .find(|(s, ..)| s.contains("CHECK NOW"))
+            .expect("button stays, disabled");
+        let enabled = t
+            .iter()
+            .find(|(s, ..)| s == "OFF" || s.contains("RESET"))
+            .and_then(|(_, _, c)| *c);
+        assert_ne!(
+            check.2, enabled,
+            "a disabled button paints its label in another colour"
+        );
     }
 
     #[test]
@@ -4268,10 +4304,22 @@ mod tests {
         app.update.stage(None, state(Outcome::UpToDate, None), None);
         for size in [SIZES[0], (SIZES[1].0, TALL)] {
             let l = lines_of(&mut app, Tab::App, size);
-            assert!(l.iter().any(|s| s == "03 // UPDATES" || s.ends_with("UPDATES")), "{size:?}: {l:?}");
+            assert!(
+                l.iter()
+                    .any(|s| s == "03 // UPDATES" || s.ends_with("UPDATES")),
+                "{size:?}: {l:?}"
+            );
             assert!(l.iter().any(|s| s.contains("System package")), "{l:?}");
-            assert!(l.iter().any(|s| s == "Tell me when a new version is released"), "{l:?}");
-            assert!(l.iter().any(|s| s.starts_with("Updates come from your system package manager")), "{l:?}");
+            assert!(
+                l.iter()
+                    .any(|s| s == "Tell me when a new version is released"),
+                "{l:?}"
+            );
+            assert!(
+                l.iter()
+                    .any(|s| s.starts_with("Updates come from your system package manager")),
+                "{l:?}"
+            );
         }
     }
 
@@ -4281,22 +4329,48 @@ mod tests {
         let now = razerctl::update::now_secs();
         let mut app = test_app();
         app.update.install = appimage();
-        app.update.stage(Some(release()), state(Available, None), None);
+        app.update
+            .stage(Some(release()), state(Available, None), None);
         let l = lines_of(&mut app, Tab::Buttons, SIZES[0]);
-        assert!(l.iter().any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."), "{l:?}");
-        assert!(l.iter().any(|s| s.contains("SEE WHAT'S NEW")) && l.iter().any(|s| s.contains("NOT NOW")), "{l:?}");
+        assert!(
+            l.iter()
+                .any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."),
+            "{l:?}"
+        );
+        assert!(
+            l.iter().any(|s| s.contains("SEE WHAT'S NEW"))
+                && l.iter().any(|s| s.contains("NOT NOW")),
+            "{l:?}"
+        );
         // turned down an hour ago: gone for the day; a day and a bit later: back
-        app.update.stage(Some(release()), state(Available, Some(now - 3600)), None);
-        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0]).iter().any(|s| s.contains("is available")));
-        app.update.stage(Some(release()), state(Available, Some(now - 25 * 3600)), None);
-        assert!(lines_of(&mut app, Tab::Buttons, SIZES[0]).iter().any(|s| s.contains("is available")));
+        app.update
+            .stage(Some(release()), state(Available, Some(now - 3600)), None);
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
+        app.update.stage(
+            Some(release()),
+            state(Available, Some(now - 25 * 3600)),
+            None,
+        );
+        assert!(lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
         // the switch is off: nothing, whatever the cache says
         app.settings.check_updates = Some(false);
-        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0]).iter().any(|s| s.contains("is available")));
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
         // while the dialog is open the banner steps aside
         app.settings.check_updates = None;
-        app.update.stage(Some(release()), state(Available, None), Some(updater::Dialog::Offer));
-        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0]).iter().any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."));
+        app.update.stage(
+            Some(release()),
+            state(Available, None),
+            Some(updater::Dialog::Offer),
+        );
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."));
     }
 
     #[test]
@@ -4304,22 +4378,50 @@ mod tests {
         use razerctl::update::{InstallType, Outcome::Available};
         let mut app = test_app();
         for (install, want, absent) in [
-            (appimage(), vec!["UPDATE", "NOT NOW"], vec!["OPEN RELEASE PAGE", "CLOSE"]),
-            (InstallType::Tarball, vec!["OPEN RELEASE PAGE", "NOT NOW"], vec!["UPDATE", "CLOSE"]),
-            (InstallType::Package, vec!["CLOSE", "yay -Syu", "paru -Syu"], vec!["UPDATE", "NOT NOW", "OPEN RELEASE PAGE"]),
+            (
+                appimage(),
+                vec!["UPDATE", "NOT NOW"],
+                vec!["OPEN RELEASE PAGE", "CLOSE"],
+            ),
+            (
+                InstallType::Tarball,
+                vec!["OPEN RELEASE PAGE", "NOT NOW"],
+                vec!["UPDATE", "CLOSE"],
+            ),
+            (
+                InstallType::Package,
+                vec!["CLOSE", "yay -Syu", "paru -Syu"],
+                vec!["UPDATE", "NOT NOW", "OPEN RELEASE PAGE"],
+            ),
         ] {
             app.update.install = install.clone();
-            app.update.stage(Some(release()), state(Available, None), Some(updater::Dialog::Offer));
+            app.update.stage(
+                Some(release()),
+                state(Available, None),
+                Some(updater::Dialog::Offer),
+            );
             for size in SIZES {
                 let l = lines_of(&mut app, Tab::Buttons, size);
                 for w in &want {
-                    assert!(l.iter().any(|s| s == w), "{install:?} {size:?}: {w} missing in {l:?}");
+                    assert!(
+                        l.iter().any(|s| s == w),
+                        "{install:?} {size:?}: {w} missing in {l:?}"
+                    );
                 }
                 for w in &absent {
-                    assert!(!l.iter().any(|s| s == w), "{install:?} {size:?}: {w} must not be offered");
+                    assert!(
+                        !l.iter().any(|s| s == w),
+                        "{install:?} {size:?}: {w} must not be offered"
+                    );
                 }
-                assert!(l.iter().any(|s| s == "razerctl 0.3.0 is available"), "{l:?}");
-                assert!(l.iter().any(|s| s.starts_with("Released 14 Oct 2026")), "{l:?}");
+                assert!(
+                    l.iter().any(|s| s == "razerctl 0.3.0 is available"),
+                    "{l:?}"
+                );
+                assert!(
+                    l.iter().any(|s| s.starts_with("Released 14 Oct 2026")),
+                    "{l:?}"
+                );
             }
         }
     }
@@ -4332,42 +4434,94 @@ mod tests {
         app.conf_text = DEFAULT_RULES.into(); // nothing unsaved until a test says so
         app.update.install = appimage();
         let show = |app: &mut App, d: Dialog, size| {
-            app.update.stage(Some(release()), state(Available, None), Some(d));
+            app.update
+                .stage(Some(release()), state(Available, None), Some(d));
             lines_of(app, Tab::Buttons, size)
         };
-        let l = show(&mut app, Dialog::Working(Stage::Downloading { done: 9_400_000, total: 14_200_000 }), SIZES[0]);
+        let l = show(
+            &mut app,
+            Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            }),
+            SIZES[0],
+        );
         assert!(l.iter().any(|s| s == "Downloading razerctl 0.3.0"), "{l:?}");
         assert!(l.iter().any(|s| s == "9.4 of 14.2 MB"), "{l:?}");
         let l = show(&mut app, Dialog::Working(Stage::Verifying), SIZES[0]);
-        assert!(l.iter().any(|s| s == "Checking razerctl 0.3.0") && l.iter().any(|s| s.contains("Nothing has been replaced yet.")), "{l:?}");
-        let mismatch = UpdateError::Mismatch { expected: "ab".repeat(32), got: "cd".repeat(32) };
+        assert!(
+            l.iter().any(|s| s == "Checking razerctl 0.3.0")
+                && l.iter()
+                    .any(|s| s.contains("Nothing has been replaced yet.")),
+            "{l:?}"
+        );
+        let mismatch = UpdateError::Mismatch {
+            expected: "ab".repeat(32),
+            got: "cd".repeat(32),
+        };
         for size in SIZES {
             let l = show(&mut app, Dialog::Failed(mismatch.clone()), size);
             assert!(l.iter().any(|s| s == "The download didn't match"), "{l:?}");
             assert!(l.iter().any(|s| s == "Nothing was changed"), "{l:?}");
-            assert!(l.iter().any(|s| s.contains("razerctl-0.2.0-x86_64.AppImage is exactly as it was")), "{l:?}");
-            assert!(l.iter().any(|s| s == "abababababab…abab") && l.iter().any(|s| s == "cdcdcdcdcdcd…cdcd"), "{l:?}");
-            assert!(["TRY AGAIN", "OPEN RELEASE PAGE", "CLOSE"].iter().all(|b| l.iter().any(|s| s == b)), "{l:?}");
+            assert!(
+                l.iter()
+                    .any(|s| s.contains("razerctl-0.2.0-x86_64.AppImage is exactly as it was")),
+                "{l:?}"
+            );
+            assert!(
+                l.iter().any(|s| s == "abababababab…abab")
+                    && l.iter().any(|s| s == "cdcdcdcdcdcd…cdcd"),
+                "{l:?}"
+            );
+            assert!(
+                ["TRY AGAIN", "OPEN RELEASE PAGE", "CLOSE"]
+                    .iter()
+                    .all(|b| l.iter().any(|s| s == b)),
+                "{l:?}"
+            );
         }
-        let saved = Dialog::Saved { path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(), why: "/home/u/Apps is not writable".into() };
+        let saved = Dialog::Saved {
+            path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+            why: "/home/u/Apps is not writable".into(),
+        };
         let l = show(&mut app, saved, SIZES[1]);
-        assert!(l.iter().any(|s| s == "razerctl couldn't replace itself"), "{l:?}");
-        assert!(l.iter().any(|s| s == "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage"), "{l:?}");
+        assert!(
+            l.iter().any(|s| s == "razerctl couldn't replace itself"),
+            "{l:?}"
+        );
+        assert!(
+            l.iter()
+                .any(|s| s == "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage"),
+            "{l:?}"
+        );
         assert!(l.iter().any(|s| s == "COPY PATH"), "{l:?}");
         let done = Dialog::Done {
             path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
             old: Some("/home/u/Apps/razerctl-0.2.0-x86_64.AppImage.old".into()),
         };
-        let _ = Applied::Saved { path: "/x".into(), why: String::new() }; // the two outcomes map onto Done / Saved in `tick`
+        let _ = Applied::Saved {
+            path: "/x".into(),
+            why: String::new(),
+        }; // the two outcomes map onto Done / Saved in `tick`
         let l = show(&mut app, done.clone(), SIZES[0]);
-        assert!(l.iter().any(|s| s == "razerctl 0.3.0 is installed"), "{l:?}");
-        assert!(l.iter().any(|s| s == "RESTART NOW") && l.iter().any(|s| s == "LATER"), "{l:?}");
+        assert!(
+            l.iter().any(|s| s == "razerctl 0.3.0 is installed"),
+            "{l:?}"
+        );
+        assert!(
+            l.iter().any(|s| s == "RESTART NOW") && l.iter().any(|s| s == "LATER"),
+            "{l:?}"
+        );
         // with unsaved edits the safe button is the primary one and the other says what it does
         app.rows = demo::rows();
         app.rows[2].choice = 5;
         let l = show(&mut app, done, SIZES[0]);
         assert!(l.iter().any(|s| s == "You have unsaved changes"), "{l:?}");
-        assert!(l.iter().any(|s| s.starts_with("1 button edit is not saved yet")), "{l:?}");
+        assert!(
+            l.iter()
+                .any(|s| s.starts_with("1 button edit is not saved yet")),
+            "{l:?}"
+        );
         assert!(l.iter().any(|s| s == "RESTART AND DISCARD"), "{l:?}");
         assert!(!l.iter().any(|s| s == "RESTART NOW"), "{l:?}");
     }
@@ -4375,10 +4529,20 @@ mod tests {
     #[test]
     fn a_missing_remap_conf_is_not_an_unsaved_edit() {
         let app = test_app();
-        assert_eq!(app.conf_text, "# back = ctrl+c\n", "the test app has its own text");
-        assert!(app.unsaved_phrase().is_some(), "an edited editor over a missing file is unsaved");
+        assert_eq!(
+            app.conf_text, "# back = ctrl+c\n",
+            "the test app has its own text"
+        );
+        assert!(
+            app.unsaved_phrase().is_some(),
+            "an edited editor over a missing file is unsaved"
+        );
         let mut fresh = test_app();
         fresh.conf_text = DEFAULT_RULES.into();
-        assert_eq!(fresh.unsaved_phrase(), None, "the starter text over a missing file is not");
+        assert_eq!(
+            fresh.unsaved_phrase(),
+            None,
+            "the starter text over a missing file is not"
+        );
     }
 }

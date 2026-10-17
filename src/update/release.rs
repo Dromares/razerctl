@@ -92,7 +92,7 @@ pub fn sum_for(sums: &str, name: &str) -> Option<String> {
             let ok = hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit());
             (ok && file == name).then(|| hash.to_ascii_lowercase())
         })
-        .last()
+        .next_back()
 }
 
 #[cfg(test)]
@@ -109,19 +109,31 @@ mod tests {
         );
         assert_eq!(sum_for(&sums, "razerctl-0.3.0-x86_64.AppImage"), Some(h1));
         assert_eq!(sum_for(&sums, "70-razerctl.rules"), Some("b".repeat(64)));
-        assert_eq!(sum_for(&sums, "razerctl-0.3.0-x86_64"), None, "whole names only");
+        assert_eq!(
+            sum_for(&sums, "razerctl-0.3.0-x86_64"),
+            None,
+            "whole names only"
+        );
         assert_eq!(sum_for(&sums, "missing"), None);
-        assert_eq!(sum_for("abc  razerctl.AppImage\n", "razerctl.AppImage"), None, "a short hash is not a hash");
+        assert_eq!(
+            sum_for("abc  razerctl.AppImage\n", "razerctl.AppImage"),
+            None,
+            "a short hash is not a hash"
+        );
         assert_eq!(sum_for("", "x"), None);
     }
 
     #[test]
     fn a_draft_or_a_tag_that_is_not_a_version_is_not_a_release() {
-        assert_eq!(Release::parse(r#"{"tag_name":"v0.3.0","draft":true}"#), None);
+        assert_eq!(
+            Release::parse(r#"{"tag_name":"v0.3.0","draft":true}"#),
+            None
+        );
         assert_eq!(Release::parse(r#"{"tag_name":"nightly"}"#), None);
         assert_eq!(Release::parse(r#"{"name":"no tag"}"#), None);
         assert_eq!(Release::parse("<html>"), None);
-        let r = Release::parse(r#"{"tag_name":"v0.3.0","draft":false,"body":"a\r\nb\r\n"}"#).unwrap();
+        let r =
+            Release::parse(r#"{"tag_name":"v0.3.0","draft":false,"body":"a\r\nb\r\n"}"#).unwrap();
         assert_eq!(r.notes_text(), "a\nb");
         assert!(r.assets.is_empty() && r.appimage().is_none() && r.sums().is_none());
     }

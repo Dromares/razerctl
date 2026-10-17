@@ -52,24 +52,40 @@ mod tests {
             path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
         };
         let a = "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage";
-        assert_eq!(class(Some(a), "/tmp/.mount_razerckAbc/usr/bin/razerctl-gui"), want);
+        assert_eq!(
+            class(Some(a), "/tmp/.mount_razerckAbc/usr/bin/razerctl-gui"),
+            want
+        );
         assert_eq!(class(Some(a), "/usr/bin/razerctl"), want);
     }
 
     #[test]
     fn usr_is_package_managed_and_everything_else_is_a_tarball() {
         assert_eq!(class(None, "/usr/bin/razerctl-gui"), InstallType::Package);
-        assert_eq!(class(None, "/usr/lib/razerctl/razerctl"), InstallType::Package);
-        assert_eq!(class(None, "/home/u/.local/bin/razerctl"), InstallType::Tarball);
+        assert_eq!(
+            class(None, "/usr/lib/razerctl/razerctl"),
+            InstallType::Package
+        );
+        assert_eq!(
+            class(None, "/home/u/.local/bin/razerctl"),
+            InstallType::Tarball
+        );
         assert_eq!(class(None, "/opt/razerctl/razerctl"), InstallType::Tarball);
         assert_eq!(class(None, "/usr/local/bin/razerctl"), InstallType::Tarball);
-        assert_eq!(class(None, "/usrx/bin/razerctl"), InstallType::Tarball, "a prefix, not a path component");
+        assert_eq!(
+            class(None, "/usrx/bin/razerctl"),
+            InstallType::Tarball,
+            "a prefix, not a path component"
+        );
         assert_eq!(class(None, ""), InstallType::Tarball);
     }
 
     #[test]
     fn an_empty_appimage_variable_is_not_an_appimage() {
-        assert_eq!(class(Some(""), "/home/u/bin/razerctl"), InstallType::Tarball);
+        assert_eq!(
+            class(Some(""), "/home/u/bin/razerctl"),
+            InstallType::Tarball
+        );
         assert_eq!(class(Some(""), "/usr/bin/razerctl"), InstallType::Package);
     }
 

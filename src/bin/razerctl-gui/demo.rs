@@ -546,37 +546,137 @@ fn update_scenario(app: &mut App, name: &str) {
     use razerctl::update::{InstallType, Outcome, Release, Stage, State, UpdateError};
     let now = razerctl::update::now_secs();
     let home = std::env::var("HOME").unwrap_or_default();
-    let appimage = InstallType::AppImage { path: PathBuf::from(format!("{home}/Applications/razerctl-0.2.0-x86_64.AppImage")) };
+    let appimage = InstallType::AppImage {
+        path: PathBuf::from(format!(
+            "{home}/Applications/razerctl-0.2.0-x86_64.AppImage"
+        )),
+    };
     let rel = || Release::parse(DEMO_RELEASE).expect("demo release");
-    let checked = |outcome| State { last_check: Some(now - 1800), outcome: Some(outcome), dismissed: None };
+    let checked = |outcome| State {
+        last_check: Some(now - 1800),
+        outcome: Some(outcome),
+        dismissed: None,
+    };
     let state = name.trim_start_matches("update-");
     let (install, release, st, dialog, tab_app) = match state {
         "app" => (appimage, None, checked(Outcome::UpToDate), None, true),
-        "app-waiting" => (appimage, Some(rel()), State { dismissed: Some(now - 600), ..checked(Outcome::Available) }, None, true),
+        "app-waiting" => (
+            appimage,
+            Some(rel()),
+            State {
+                dismissed: Some(now - 600),
+                ..checked(Outcome::Available)
+            },
+            None,
+            true,
+        ),
         "app-off" => (appimage, None, State::default(), None, true),
-        "app-tarball" => (InstallType::Tarball, None, checked(Outcome::UpToDate), None, true),
-        "app-offline" => (InstallType::Tarball, None, checked(Outcome::Offline), None, true),
-        "app-rate" => (InstallType::Tarball, None, checked(Outcome::RateLimited), None, true),
+        "app-tarball" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::UpToDate),
+            None,
+            true,
+        ),
+        "app-offline" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::Offline),
+            None,
+            true,
+        ),
+        "app-rate" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::RateLimited),
+            None,
+            true,
+        ),
         "app-package" => (InstallType::Package, None, State::default(), None, true),
-        "banner" => (appimage, Some(rel()), checked(Outcome::Available), None, false),
-        "offer" => (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Offer), false),
-        "offer-tarball" => (InstallType::Tarball, Some(rel()), checked(Outcome::Available), Some(Dialog::Offer), false),
-        "offer-package" => (InstallType::Package, Some(rel()), checked(Outcome::Available), Some(Dialog::Offer), false),
-        "downloading" => (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Working(Stage::Downloading { done: 9_400_000, total: 14_200_000 })), false),
-        "verifying" => (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Working(Stage::Verifying)), false),
+        "banner" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            None,
+            false,
+        ),
+        "offer" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "offer-tarball" => (
+            InstallType::Tarball,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "offer-package" => (
+            InstallType::Package,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "downloading" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            })),
+            false,
+        ),
+        "verifying" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Working(Stage::Verifying)),
+            false,
+        ),
         "done" | "done-unsaved" => {
-            let path = PathBuf::from(format!("{home}/Applications/razerctl-0.2.0-x86_64.AppImage"));
-            let old = Some(PathBuf::from(format!("{home}/Applications/razerctl-0.2.0-x86_64.AppImage.old")));
-            (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Done { path, old }), false)
+            let path = PathBuf::from(format!(
+                "{home}/Applications/razerctl-0.2.0-x86_64.AppImage"
+            ));
+            let old = Some(PathBuf::from(format!(
+                "{home}/Applications/razerctl-0.2.0-x86_64.AppImage.old"
+            )));
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Done { path, old }),
+                false,
+            )
         }
         "mismatch" => {
-            let e = UpdateError::Mismatch { expected: "3f9a6c0e5b7d1c2e8a4f90d6b7e31a5c0d2f4b8e6a91c3d7e5f20b4a8c6d21b1d".into(), got: "8c1d70aa42e9f3b5d6c8a0e17f4b29d3a5c6e8f1b2d4a7c9e0f3b5d8a1c694f0".into() };
-            (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Failed(e)), false)
+            let e = UpdateError::Mismatch {
+                expected: "3f9a6c0e5b7d1c2e8a4f90d6b7e31a5c0d2f4b8e6a91c3d7e5f20b4a8c6d21b1d"
+                    .into(),
+                got: "8c1d70aa42e9f3b5d6c8a0e17f4b29d3a5c6e8f1b2d4a7c9e0f3b5d8a1c694f0".into(),
+            };
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Failed(e)),
+                false,
+            )
         }
         "saved" => {
             let path = PathBuf::from(format!("{home}/Downloads/razerctl-0.3.0-x86_64.AppImage"));
             let why = format!("{home}/Applications is not writable");
-            (appimage, Some(rel()), checked(Outcome::Available), Some(Dialog::Saved { path, why }), false)
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Saved { path, why }),
+                false,
+            )
         }
         _ => return,
     };
@@ -595,7 +695,9 @@ fn update_scenario(app: &mut App, name: &str) {
     app.update.install = install;
     app.update.stage(release, st, dialog);
     let msg = match state {
-        "mismatch" => Some("Update not installed: the download didn't match its checksum. Nothing was changed."),
+        "mismatch" => Some(
+            "Update not installed: the download didn't match its checksum. Nothing was changed.",
+        ),
         "saved" => Some("Update downloaded, but razerctl can't replace itself where it is."),
         "done" | "done-unsaved" => Some("razerctl 0.3.0 is installed. Restart to use it."),
         "app-package" => Some("Update check off. Updates come from your package manager."),

@@ -126,7 +126,10 @@ mod tests {
         assert!(v("v0.2.90-test.1") < v("v0.2.91-test.2"));
         assert!(v("v0.2.91-test.2") < v("v0.3.0"));
         assert!(v("v0.2.0") < v("v0.2.90-test.1"));
-        assert!(v("0.3.0-rc.1") < v("0.3.0"), "a pre-release is older than its release");
+        assert!(
+            v("0.3.0-rc.1") < v("0.3.0"),
+            "a pre-release is older than its release"
+        );
         assert!(v("0.3.0-rc.1") > v("0.2.99"));
     }
 
@@ -134,8 +137,14 @@ mod tests {
     fn numbers_compare_as_numbers_and_prerelease_parts_by_semver() {
         assert!(v("0.10.0") > v("0.9.0"));
         assert!(v("1.0.0-test.2") < v("1.0.0-test.10"));
-        assert!(v("1.0.0-1") < v("1.0.0-alpha"), "numeric identifiers rank below alphanumeric");
-        assert!(v("1.0.0-alpha") < v("1.0.0-alpha.1"), "a longer identifier list ranks higher");
+        assert!(
+            v("1.0.0-1") < v("1.0.0-alpha"),
+            "numeric identifiers rank below alphanumeric"
+        );
+        assert!(
+            v("1.0.0-alpha") < v("1.0.0-alpha.1"),
+            "a longer identifier list ranks higher"
+        );
         assert!(v("1.0.0-alpha") < v("1.0.0-beta"));
         assert_eq!(v("1.2.3+build.5"), v("v1.2.3"));
     }
@@ -143,13 +152,29 @@ mod tests {
     #[test]
     fn parses_only_whole_versions_and_prints_them_back() {
         for bad in [
-            "", "v", "1", "1.2", "1.2.3.4", "1.2.x", "01.2.3", "1.2.3-", "1.2.3-a..b", "1.2.3-a_b", "latest", "-1.2.3",
+            "",
+            "v",
+            "1",
+            "1.2",
+            "1.2.3.4",
+            "1.2.x",
+            "01.2.3",
+            "1.2.3-",
+            "1.2.3-a..b",
+            "1.2.3-a_b",
+            "latest",
+            "-1.2.3",
         ] {
             assert_eq!(Version::parse(bad), None, "{bad:?}");
         }
         assert_eq!(v("v0.2.91-test.2+abc").to_string(), "0.2.91-test.2");
         assert_eq!(v(" 0.3.0 ").to_string(), "0.3.0");
         assert!(v("0.3.0-rc.1").is_prerelease() && !v("0.3.0").is_prerelease());
-        assert_eq!(Version::parse(env!("CARGO_PKG_VERSION")).map(|v| v.to_string()).as_deref(), Some(env!("CARGO_PKG_VERSION")));
+        assert_eq!(
+            Version::parse(env!("CARGO_PKG_VERSION"))
+                .map(|v| v.to_string())
+                .as_deref(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
     }
 }

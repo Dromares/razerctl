@@ -25,7 +25,10 @@ pub enum UpdateError {
     /// The release has no such file (no AppImage for this version, or no `SHA256SUMS`, or no line for the AppImage in it).
     MissingAsset(String),
     /// The download does not hash to what `SHA256SUMS` says. It was deleted; nothing was changed.
-    Mismatch { expected: String, got: String },
+    Mismatch {
+        expected: String,
+        got: String,
+    },
     Io(String),
     Cancelled,
 }
@@ -158,12 +161,18 @@ pub fn apply_appimage(
     let staged = stage_dir.join(format!("{}.part", asset.name));
 
     let mut on_bytes = |done, total| progress(Stage::Downloading { done, total });
-    net::download(src, &asset.url, &staged, net::MAX_APPIMAGE, cancel, &mut on_bytes).map_err(
-        |e| match e {
-            FetchError::Cancelled => UpdateError::Cancelled,
-            e => UpdateError::Net(e),
-        },
-    )?;
+    net::download(
+        src,
+        &asset.url,
+        &staged,
+        net::MAX_APPIMAGE,
+        cancel,
+        &mut on_bytes,
+    )
+    .map_err(|e| match e {
+        FetchError::Cancelled => UpdateError::Cancelled,
+        e => UpdateError::Net(e),
+    })?;
 
     progress(Stage::Verifying);
     let got = fs::File::open(&staged)
@@ -177,7 +186,8 @@ pub fn apply_appimage(
         let _ = fs::remove_file(&staged);
         return Err(UpdateError::Cancelled);
     }
-    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|e| io_err(&staged, e))?;
+    fs::set_permissions(&staged, fs::Permissions::from_mode(0o755))
+        .map_err(|e| io_err(&staged, e))?;
 
     if in_place {
         progress(Stage::Replacing);
@@ -216,13 +226,20 @@ mod tests {
     #[test]
     fn user_dirs_names_the_download_folder() {
         let home = Path::new("/home/u");
-        let t = "# comment\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n";
-        assert_eq!(user_dirs_download(t, home), Some("/home/u/Downloads".into()));
+        let t =
+            "# comment\nXDG_DESKTOP_DIR=\"$HOME/Desktop\"\nXDG_DOWNLOAD_DIR=\"$HOME/Downloads\"\n";
+        assert_eq!(
+            user_dirs_download(t, home),
+            Some("/home/u/Downloads".into())
+        );
         assert_eq!(
             user_dirs_download("XDG_DOWNLOAD_DIR=\"/mnt/dl\"\n", home),
             Some("/mnt/dl".into())
         );
-        assert_eq!(user_dirs_download("XDG_DOWNLOAD_DIR=\"$HOME\"\n", home), Some("/home/u".into()));
+        assert_eq!(
+            user_dirs_download("XDG_DOWNLOAD_DIR=\"$HOME\"\n", home),
+            Some("/home/u".into())
+        );
         assert_eq!(user_dirs_download("XDG_DOWNLOAD_DIR=\"rel\"\n", home), None);
         assert_eq!(user_dirs_download("", home), None);
     }

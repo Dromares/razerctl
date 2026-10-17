@@ -2,7 +2,10 @@
 //! types it, makes one request, and keeps no memory of it (the 24 hour throttle belongs to the GUI's background check).
 //! `update` asks y/N before it downloads anything, and only an AppImage is ever replaced.
 
-use super::{apply_appimage, check, fallback_dir, Applied, CheckResult, InstallType, Release, Source, Stage, Version};
+use super::{
+    apply_appimage, check, fallback_dir, Applied, CheckResult, InstallType, Release, Source, Stage,
+    Version,
+};
 use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::atomic::AtomicBool;

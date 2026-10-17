@@ -66,9 +66,14 @@ impl Source {
 }
 
 fn is_loopback_http(v: &str) -> bool {
-    ["http://127.0.0.1:", "http://localhost:", "http://127.0.0.1/", "http://localhost/"]
-        .iter()
-        .any(|p| v.starts_with(p))
+    [
+        "http://127.0.0.1:",
+        "http://localhost:",
+        "http://127.0.0.1/",
+        "http://localhost/",
+    ]
+    .iter()
+    .any(|p| v.starts_with(p))
 }
 
 /// Why a fetch failed. The GUI shows `Offline`, `RateLimited`, `NotFound` and `Other` only as a line on the App tab.
@@ -112,11 +117,16 @@ fn get(
     timeout: Duration,
 ) -> Result<ureq::http::Response<ureq::Body>, FetchError> {
     if !src.allows(url) {
-        return Err(FetchError::Other(format!("refusing a non-https URL: {url}")));
+        return Err(FetchError::Other(format!(
+            "refusing a non-https URL: {url}"
+        )));
     }
     let resp = agent(timeout)
         .get(url)
-        .header("Accept", "application/vnd.github+json, application/octet-stream")
+        .header(
+            "Accept",
+            "application/vnd.github+json, application/octet-stream",
+        )
         .header("X-GitHub-Api-Version", "2022-11-28")
         .call()
         .map_err(|e| match e {
@@ -188,7 +198,9 @@ fn download_inner(
         .and_then(|v| v.parse::<u64>().ok())
         .unwrap_or(0);
     if total > max {
-        return Err(FetchError::Other(format!("the file is {total} bytes, over the {max} limit")));
+        return Err(FetchError::Other(format!(
+            "the file is {total} bytes, over the {max} limit"
+        )));
     }
     let io_err = |e: io::Error| FetchError::Other(format!("{}: {e}", dest.display()));
     let mut out = fs::File::create(dest).map_err(io_err)?;
@@ -208,13 +220,17 @@ fn download_inner(
         };
         done += n as u64;
         if done > max {
-            return Err(FetchError::Other(format!("the download passed the {max} byte limit")));
+            return Err(FetchError::Other(format!(
+                "the download passed the {max} byte limit"
+            )));
         }
         out.write_all(&buf[..n]).map_err(io_err)?;
         progress(done, total);
     }
     if total != 0 && done != total {
-        return Err(FetchError::Offline(format!("cut off after {done} of {total} bytes")));
+        return Err(FetchError::Offline(format!(
+            "cut off after {done} of {total} bytes"
+        )));
     }
     out.sync_all().map_err(io_err)
 }

@@ -6,7 +6,8 @@ use super::theme::*;
 use super::widgets::*;
 use eframe::egui::{self, vec2, Align, Color32, Frame, Layout, Margin, RichText, Stroke, Ui};
 use razerctl::update::{
-    self, Applied, CheckResult, InstallType, Outcome, Paths, Release, Source, Stage, State, UpdateError, Version,
+    self, Applied, CheckResult, InstallType, Outcome, Paths, Release, Source, Stage, State,
+    UpdateError, Version,
 };
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,9 +21,15 @@ pub enum Dialog {
     Offer,
     Working(Stage),
     /// The new file is in place (`old` is the previous one) and a restart is waiting.
-    Done { path: PathBuf, old: Option<PathBuf> },
+    Done {
+        path: PathBuf,
+        old: Option<PathBuf>,
+    },
     /// Verified, but the running file could not be replaced: saved at `path` instead.
-    Saved { path: PathBuf, why: String },
+    Saved {
+        path: PathBuf,
+        why: String,
+    },
     Failed(UpdateError),
 }
 
@@ -59,7 +66,12 @@ pub struct Updater {
 
 impl Updater {
     pub fn new() -> Updater {
-        Updater::with(Paths::default_paths(), Source::from_env(), InstallType::detect(), update::current_version())
+        Updater::with(
+            Paths::default_paths(),
+            Source::from_env(),
+            InstallType::detect(),
+            update::current_version(),
+        )
     }
 
     pub fn with(paths: Paths, src: Source, install: InstallType, current: Version) -> Updater {
@@ -99,7 +111,9 @@ impl Updater {
                     self.release = update::pending_release(&self.paths, &self.current);
                     if manual {
                         self.say = match &result {
-                            CheckResult::Available(r) => Some(format!("razerctl {} is available.", r.version)),
+                            CheckResult::Available(r) => {
+                                Some(format!("razerctl {} is available.", r.version))
+                            }
                             CheckResult::UpToDate(_) => Some("razerctl is up to date.".into()),
                             // offline and rate limited are shown on the App tab and nowhere else
                             CheckResult::Failed(_) => None,
@@ -124,7 +138,10 @@ impl Updater {
         if !self.auto || !enabled || self.checking {
             return;
         }
-        if self.last_eval.is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+        if self
+            .last_eval
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(600))
+        {
             return;
         }
         self.last_eval = Some(Instant::now());
@@ -142,7 +159,12 @@ impl Updater {
         self.checking = true;
         let (tx, rx) = channel();
         self.rx = Some(rx);
-        let (src, paths, current, ctx) = (self.src.clone(), self.paths.clone(), self.current.clone(), ctx.clone());
+        let (src, paths, current, ctx) = (
+            self.src.clone(),
+            self.paths.clone(),
+            self.current.clone(),
+            ctx.clone(),
+        );
         std::thread::spawn(move || {
             let result = update::check_and_record(&src, &paths, &current, update::now_secs());
             let _ = tx.send(Msg::Checked { manual, result });
@@ -152,7 +174,9 @@ impl Updater {
 
     /// Download, verify and swap on its own thread. Only ever called from the *Update* button (or *Try again*).
     fn start_apply(&mut self, ctx: &egui::Context) {
-        let (InstallType::AppImage { path }, Some(rel)) = (self.install.clone(), self.release.clone()) else {
+        let (InstallType::AppImage { path }, Some(rel)) =
+            (self.install.clone(), self.release.clone())
+        else {
             return;
         };
         self.cancel.store(false, Ordering::Relaxed);
@@ -165,7 +189,14 @@ impl Updater {
                 let _ = tx.send(Msg::Progress(s));
                 ctx.request_repaint();
             };
-            let r = update::apply_appimage(&src, &rel, &path, &update::fallback_dir(), &cancel, &mut progress);
+            let r = update::apply_appimage(
+                &src,
+                &rel,
+                &path,
+                &update::fallback_dir(),
+                &cancel,
+                &mut progress,
+            );
             let _ = tx.send(Msg::Applied(r));
             ctx.request_repaint();
         });
@@ -185,7 +216,8 @@ impl Updater {
     /// The banner is for a release the user has not turned down in the last day, while no dialog is open.
     pub fn banner_release(&self, enabled: bool) -> Option<&Release> {
         let r = self.release.as_ref()?;
-        (enabled && self.dialog.is_none() && self.state.banner_wanted(update::now_secs())).then_some(r)
+        (enabled && self.dialog.is_none() && self.state.banner_wanted(update::now_secs()))
+            .then_some(r)
     }
 }
 
@@ -256,7 +288,9 @@ fn local(secs: u64) -> Option<Tm> {
     })
 }
 
-const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
 
 /// "Today, 09:41", "Yesterday, 09:41", or "14 Oct, 09:41" in the local time zone.
 pub fn when(then: u64, now: u64) -> String {
@@ -278,7 +312,11 @@ pub fn when(then: u64, now: u64) -> String {
 /// `2026-10-17T15:23:45Z` as "17 Oct 2026".
 fn release_date(published: &str) -> Option<String> {
     let mut it = published.get(..10)?.split('-');
-    let (y, m, d): (&str, usize, u32) = (it.next()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?);
+    let (y, m, d): (&str, usize, u32) = (
+        it.next()?,
+        it.next()?.parse().ok()?,
+        it.next()?.parse().ok()?,
+    );
     Some(format!("{d} {} {y}", MONTHS.get(m.checked_sub(1)?)?))
 }
 
@@ -288,7 +326,10 @@ fn megabytes(bytes: u64) -> String {
 
 /// A line of release notes as plain text: heading marks and emphasis dropped.
 fn plain(line: &str) -> String {
-    line.trim_start_matches('#').trim().replace("**", "").replace('`', "")
+    line.trim_start_matches('#')
+        .trim()
+        .replace("**", "")
+        .replace('`', "")
 }
 
 // ------------------------------------------------------------------ small pieces
@@ -314,28 +355,47 @@ fn code_block(ui: &mut Ui, p: &Pal, lines: &[(&str, &str)]) {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = S3;
                     if !k.is_empty() {
-                        ui.allocate_ui_with_layout(vec2(64.0, 16.0), Layout::left_to_right(Align::Center), |ui| {
-                            ui.set_min_width(64.0);
-                            ui.label(caps(p, k));
-                        });
+                        ui.allocate_ui_with_layout(
+                            vec2(64.0, 16.0),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.set_min_width(64.0);
+                                ui.label(caps(p, k));
+                            },
+                        );
                     }
-                    ui.add(egui::Label::new(RichText::new(*v).font(mono(T_DATA)).color(p.i100())).wrap());
+                    ui.add(
+                        egui::Label::new(RichText::new(*v).font(mono(T_DATA)).color(p.i100()))
+                            .wrap(),
+                    );
                 });
             }
         });
 }
 
 fn callout(ui: &mut Ui, p: &Pal, glyph_color: Color32, glyph: &str, head: &str, text: &str) {
-    Frame::new().fill(p.i06()).stroke(Stroke::new(1.0, p.i45())).inner_margin(Margin::same(12)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = S2;
-            ui.label(RichText::new(glyph).font(mono(T_LABEL + 1.0)).color(glyph_color));
-            ui.label(RichText::new(head).font(serif(T_TITLE - 4.0)).color(p.i100()));
+    Frame::new()
+        .fill(p.i06())
+        .stroke(Stroke::new(1.0, p.i45()))
+        .inner_margin(Margin::same(12))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S2;
+                ui.label(
+                    RichText::new(glyph)
+                        .font(mono(T_LABEL + 1.0))
+                        .color(glyph_color),
+                );
+                ui.label(
+                    RichText::new(head)
+                        .font(serif(T_TITLE - 4.0))
+                        .color(p.i100()),
+                );
+            });
+            ui.add_space(2.0);
+            body(ui, p, text);
         });
-        ui.add_space(2.0);
-        body(ui, p, text);
-    });
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -358,10 +418,14 @@ fn step(ui: &mut Ui, p: &Pal, st: S, label: &str, detail: &str) {
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = S3;
-        ui.allocate_ui_with_layout(vec2(16.0, 22.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(16.0);
-            ui.label(RichText::new(g).font(mono(T_BODY)).color(gc));
-        });
+        ui.allocate_ui_with_layout(
+            vec2(16.0, 22.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_min_width(16.0);
+                ui.label(RichText::new(g).font(mono(T_BODY)).color(gc));
+            },
+        );
         ui.label(RichText::new(label).font(sans(T_BODY - 1.0)).color(tc));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(detail).font(mono(T_DATA)).color(p.i65()));
@@ -390,13 +454,21 @@ pub fn panel_ui(ui: &mut Ui, p: &Pal, u: &mut Updater, enabled: bool) -> Option<
                     ui.set_width(lw);
                     toggled = left(ui, p, u, enabled);
                 });
-                ui.allocate_ui_with_layout(vec2(total - lw - gap, 0.0), Layout::top_down(Align::Min), |ui| {
-                    ui.set_width(total - lw - gap);
-                    (check_now, view) = right(ui, p, u, enabled, now);
-                });
+                ui.allocate_ui_with_layout(
+                    vec2(total - lw - gap, 0.0),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_width(total - lw - gap);
+                        (check_now, view) = right(ui, p, u, enabled, now);
+                    },
+                );
             });
             let r = row.response.rect;
-            ui.painter().vline(r.left() + lw + gap / 2.0, r.y_range(), Stroke::new(1.0, p.i18()));
+            ui.painter().vline(
+                r.left() + lw + gap / 2.0,
+                r.y_range(),
+                Stroke::new(1.0, p.i18()),
+            );
         } else {
             toggled = left(ui, p, u, enabled);
             ui.add_space(S3);
@@ -426,13 +498,28 @@ fn left(ui: &mut Ui, p: &Pal, u: &Updater, enabled: bool) -> Option<bool> {
 /// Returns (Check now pressed, View update pressed).
 fn right(ui: &mut Ui, p: &Pal, u: &Updater, enabled: bool, now: u64) -> (bool, bool) {
     kv(ui, p, "Installed as", 112.0, |ui| {
-        ui.label(RichText::new(install_name(&u.install)).font(sans(T_BODY - 1.0)).color(p.i100()));
+        ui.label(
+            RichText::new(install_name(&u.install))
+                .font(sans(T_BODY - 1.0))
+                .color(p.i100()),
+        );
     });
     kv(ui, p, "Version", 112.0, |ui| {
-        ui.label(RichText::new(u.current.to_string()).font(mono(T_DATA + 1.0)).color(p.i100()));
+        ui.label(
+            RichText::new(u.current.to_string())
+                .font(mono(T_DATA + 1.0))
+                .color(p.i100()),
+        );
     });
     kv(ui, p, "Location", 112.0, |ui| {
-        ui.add(egui::Label::new(RichText::new(location(&u.install)).font(mono(T_DATA)).color(p.i65())).truncate());
+        ui.add(
+            egui::Label::new(
+                RichText::new(location(&u.install))
+                    .font(mono(T_DATA))
+                    .color(p.i65()),
+            )
+            .truncate(),
+        );
     });
     ui.add_space(S2);
     hair(ui, p);
@@ -449,10 +536,14 @@ fn right(ui: &mut Ui, p: &Pal, u: &Updater, enabled: bool, now: u64) -> (bool, b
     };
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = S3;
-        ui.allocate_ui_with_layout(vec2(112.0, 28.0), Layout::left_to_right(Align::Center), |ui| {
-            ui.set_min_width(112.0);
-            ui.label(caps(p, "Last check"));
-        });
+        ui.allocate_ui_with_layout(
+            vec2(112.0, 28.0),
+            Layout::left_to_right(Align::Center),
+            |ui| {
+                ui.set_min_width(112.0);
+                ui.label(caps(p, "Last check"));
+            },
+        );
         last_check_chip(ui, p, u, enabled);
         if !stack {
             ui.with_layout(Layout::right_to_left(Align::Center), &mut action);
@@ -480,23 +571,51 @@ fn last_check_chip(ui: &mut Ui, p: &Pal, u: &Updater, enabled: bool) {
     } else if u.checking {
         chip(ui, p, Some("◐"), "Checking", ChipStyle::Plain, p.i100());
     } else if let Some(r) = &u.release {
-        chip(ui, p, Some("▲"), &format!("{} available", r.version), ChipStyle::Outline, p.warn);
+        chip(
+            ui,
+            p,
+            Some("▲"),
+            &format!("{} available", r.version),
+            ChipStyle::Outline,
+            p.warn,
+        );
     } else {
         match u.state.outcome {
             Some(Outcome::UpToDate | Outcome::Available) => {
                 chip(ui, p, Some("●"), "Up to date", ChipStyle::Plain, p.ok);
             }
             Some(Outcome::Offline) => {
-                chip(ui, p, Some("○"), "Couldn't connect", ChipStyle::Plain, p.i65());
+                chip(
+                    ui,
+                    p,
+                    Some("○"),
+                    "Couldn't connect",
+                    ChipStyle::Plain,
+                    p.i65(),
+                );
             }
             Some(Outcome::RateLimited) => {
                 chip(ui, p, Some("○"), "Rate limited", ChipStyle::Plain, p.i65());
             }
             Some(Outcome::Failed) => {
-                chip(ui, p, Some("○"), "Couldn't check", ChipStyle::Plain, p.i65());
+                chip(
+                    ui,
+                    p,
+                    Some("○"),
+                    "Couldn't check",
+                    ChipStyle::Plain,
+                    p.i65(),
+                );
             }
             None => {
-                chip(ui, p, Some("○"), "Not checked yet", ChipStyle::Plain, p.i65());
+                chip(
+                    ui,
+                    p,
+                    Some("○"),
+                    "Not checked yet",
+                    ChipStyle::Plain,
+                    p.i65(),
+                );
             }
         }
     }
@@ -536,20 +655,27 @@ pub fn banner_ui(ui: &mut Ui, p: &Pal, u: &mut Updater, enabled: bool) {
     let Some(rel) = u.banner_release(enabled) else {
         return;
     };
-    let text = format!("razerctl {} is available. You have {}.", rel.version, u.current);
+    let text = format!(
+        "razerctl {} is available. You have {}.",
+        rel.version, u.current
+    );
     let (mut see, mut later) = (false, false);
-    Frame::new().fill(p.i06()).stroke(Stroke::new(1.0, p.i28())).inner_margin(Margin::symmetric(12, 6)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = S3;
-            chip(ui, p, Some("▲"), "Update", ChipStyle::Plain, p.warn);
-            ui.label(RichText::new(text).font(sans(T_BODY - 1.0)).color(p.i100()));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                later = btn(ui, p, "Not now", Kind::Secondary, true).clicked();
-                see = btn(ui, p, "See what's new", Kind::Secondary, true).clicked();
+    Frame::new()
+        .fill(p.i06())
+        .stroke(Stroke::new(1.0, p.i28()))
+        .inner_margin(Margin::symmetric(12, 6))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = S3;
+                chip(ui, p, Some("▲"), "Update", ChipStyle::Plain, p.warn);
+                ui.label(RichText::new(text).font(sans(T_BODY - 1.0)).color(p.i100()));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    later = btn(ui, p, "Not now", Kind::Secondary, true).clicked();
+                    see = btn(ui, p, "See what's new", Kind::Secondary, true).clicked();
+                });
             });
         });
-    });
     ui.add_space(S2);
     if see {
         u.dialog = Some(Dialog::Offer);
@@ -569,7 +695,12 @@ fn compact(ctx: &egui::Context) -> bool {
 }
 
 /// `unsaved` is a phrase naming the edits a restart would throw away, if there are any.
-pub fn dialog_ui(ctx: &egui::Context, p: &Pal, u: &mut Updater, unsaved: Option<&str>) -> Option<Action> {
+pub fn dialog_ui(
+    ctx: &egui::Context,
+    p: &Pal,
+    u: &mut Updater,
+    unsaved: Option<&str>,
+) -> Option<Action> {
     let dialog = u.dialog.clone()?;
     let rel = u.release.clone()?;
     let screen = ctx.content_rect();
@@ -582,14 +713,21 @@ pub fn dialog_ui(ctx: &egui::Context, p: &Pal, u: &mut Updater, unsaved: Option<
     // the changelog box takes what is left, so the dialog fits a 560 px high window
     let log_h = (screen.height() - 480.0).clamp(96.0, 200.0);
     let mut out = Out::default();
-    let frame = Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.i45())).inner_margin(Margin::same(24));
+    let frame = Frame::new()
+        .fill(p.raised)
+        .stroke(Stroke::new(1.0, p.i45()))
+        .inner_margin(Margin::same(24));
     let content = |ui: &mut Ui| {
         ui.set_width(W);
         dialog_body(ui, p, u, &rel, &dialog, unsaved, log_h, compact, &mut out);
     };
-    let modal = egui::Modal::new(egui::Id::new("update-dialog")).backdrop_color(scrim).frame(frame).show(ctx, content);
+    let modal = egui::Modal::new(egui::Id::new("update-dialog"))
+        .backdrop_color(scrim)
+        .frame(frame)
+        .show(ctx, content);
     // Esc is Not now / Close / Cancel / Later; a click on the scrim is not, so a stray click never dismisses it
-    let esc = modal.is_top_modal && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+    let esc = modal.is_top_modal
+        && ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
     if esc {
         out.esc = true;
     }
@@ -609,7 +747,13 @@ struct Out {
     esc: bool,
 }
 
-fn finish(ctx: &egui::Context, u: &mut Updater, rel: &Release, dialog: &Dialog, o: Out) -> Option<Action> {
+fn finish(
+    ctx: &egui::Context,
+    u: &mut Updater,
+    rel: &Release,
+    dialog: &Dialog,
+    o: Out,
+) -> Option<Action> {
     let appimage = matches!(u.install, InstallType::AppImage { .. });
     if let Some(t) = o.copy {
         ctx.copy_text(t);
@@ -658,20 +802,39 @@ fn head(ui: &mut Ui, p: &Pal, label: &str, install: &InstallType, title_text: &s
     ui.horizontal(|ui| {
         ui.label(caps(p, label));
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            chip(ui, p, None, install_name(install), ChipStyle::Outline, p.i65());
+            chip(
+                ui,
+                p,
+                None,
+                install_name(install),
+                ChipStyle::Outline,
+                p.i65(),
+            );
         });
     });
     ui.add_space(S1);
-    ui.label(RichText::new(title_text).font(serif(T_TITLE + 4.0)).color(p.i100()));
+    ui.label(
+        RichText::new(title_text)
+            .font(serif(T_TITLE + 4.0))
+            .color(p.i100()),
+    );
     ui.add_space(S2);
 }
 
 fn version_row(ui: &mut Ui, p: &Pal, from: &Version, to: &Version, right: &str) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = S3;
-        ui.label(RichText::new(from.to_string()).font(mono(T_BODY)).color(p.i65()));
+        ui.label(
+            RichText::new(from.to_string())
+                .font(mono(T_BODY))
+                .color(p.i65()),
+        );
         ui.label(RichText::new("→").font(mono(T_BODY)).color(p.i65()));
-        ui.label(RichText::new(to.to_string()).font(mono_med(T_BODY)).color(p.i100()));
+        ui.label(
+            RichText::new(to.to_string())
+                .font(mono_med(T_BODY))
+                .color(p.i100()),
+        );
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             ui.label(RichText::new(right).font(mono(T_DATA)).color(p.i65()));
         });
@@ -682,40 +845,66 @@ fn changelog_box(ui: &mut Ui, p: &Pal, rel: &Release, h: f32) {
     ui.label(caps(p, &format!("What's new in {}", rel.version)));
     ui.add_space(S1);
     let notes = rel.notes_text();
-    Frame::new().fill(p.sunken).stroke(Stroke::new(1.0, p.i28())).inner_margin(Margin::symmetric(12, 8)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
-        ui.style_mut().spacing.scroll.bar_width = 8.0;
-        ui.style_mut().spacing.scroll.foreground_color = false;
-        ui.style_mut().visuals.widgets.inactive.bg_fill = p.i65(); // scrollbar handle, as the macro list (3:1+ against the track)
-        egui::ScrollArea::vertical()
-            .max_height(h)
-            .auto_shrink([false, false])
-            .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
-            .show(ui, |ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
-                if notes.is_empty() {
-                    ui.add(egui::Label::new(
-                        RichText::new("No release notes were published for this version.").font(sans(T_SMALL)).color(p.i65()),
-                    ));
-                }
-                for line in notes.lines() {
-                    if line.trim().is_empty() {
-                        ui.add_space(2.0);
-                    } else if let Some(t) = line.trim_start().strip_prefix("- ").or_else(|| line.trim_start().strip_prefix("* ")) {
-                        ui.horizontal_top(|ui| {
-                            ui.spacing_mut().item_spacing.x = S2;
-                            ui.label(RichText::new("–").font(mono(T_DATA)).color(p.i65()));
-                            ui.add(egui::Label::new(RichText::new(plain(t)).font(sans(T_SMALL)).color(p.i100())).wrap());
-                        });
-                    } else {
-                        ui.add(egui::Label::new(RichText::new(plain(line)).font(sans(T_SMALL)).color(p.i100())).wrap());
+    Frame::new()
+        .fill(p.sunken)
+        .stroke(Stroke::new(1.0, p.i28()))
+        .inner_margin(Margin::symmetric(12, 8))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.style_mut().spacing.scroll = egui::style::ScrollStyle::solid();
+            ui.style_mut().spacing.scroll.bar_width = 8.0;
+            ui.style_mut().spacing.scroll.foreground_color = false;
+            ui.style_mut().visuals.widgets.inactive.bg_fill = p.i65(); // scrollbar handle, as the macro list (3:1+ against the track)
+            egui::ScrollArea::vertical()
+                .max_height(h)
+                .auto_shrink([false, false])
+                .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
+                .show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 6.0;
+                    if notes.is_empty() {
+                        ui.add(egui::Label::new(
+                            RichText::new("No release notes were published for this version.")
+                                .font(sans(T_SMALL))
+                                .color(p.i65()),
+                        ));
                     }
-                }
-            });
-    });
+                    for line in notes.lines() {
+                        if line.trim().is_empty() {
+                            ui.add_space(2.0);
+                        } else if let Some(t) = line
+                            .trim_start()
+                            .strip_prefix("- ")
+                            .or_else(|| line.trim_start().strip_prefix("* "))
+                        {
+                            ui.horizontal_top(|ui| {
+                                ui.spacing_mut().item_spacing.x = S2;
+                                ui.label(RichText::new("–").font(mono(T_DATA)).color(p.i65()));
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(plain(t)).font(sans(T_SMALL)).color(p.i100()),
+                                    )
+                                    .wrap(),
+                                );
+                            });
+                        } else {
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(plain(line))
+                                        .font(sans(T_SMALL))
+                                        .color(p.i100()),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    }
+                });
+        });
     ui.add_space(S1);
-    ui.label(RichText::new("Plain text from this release's notes.").font(mono(T_MICRO)).color(p.i65()));
+    ui.label(
+        RichText::new("Plain text from this release's notes.")
+            .font(mono(T_MICRO))
+            .color(p.i65()),
+    );
 }
 
 /// Fixed-height stand-in for the changelog while the dialog is working, so the dialog does not change size under the cursor.
@@ -724,11 +913,15 @@ fn steps_box(ui: &mut Ui, p: &Pal, h: f32, add: impl FnOnce(&mut Ui)) {
         add(ui); // compact: no recap box, so the callout is not boxed twice
         return;
     }
-    Frame::new().fill(p.raised).stroke(Stroke::new(1.0, p.i28())).inner_margin(Margin::symmetric(12, 10)).show(ui, |ui| {
-        ui.set_width(ui.available_width());
-        ui.set_min_height(h);
-        add(ui);
-    });
+    Frame::new()
+        .fill(p.raised)
+        .stroke(Stroke::new(1.0, p.i28()))
+        .inner_margin(Margin::symmetric(12, 10))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.set_min_height(h);
+            add(ui);
+        });
 }
 
 fn footer(ui: &mut Ui, p: &Pal, buttons: impl FnOnce(&mut Ui), note: &str) {
@@ -769,7 +962,10 @@ fn dialog_body(
     let (cur, new) = (&u.current, &rel.version);
     let file_new = rel.appimage_name();
     let file_old = match inst {
-        InstallType::AppImage { path } => path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+        InstallType::AppImage { path } => path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default(),
         _ => String::new(),
     };
     let size = rel.appimage().map(|a| a.size).unwrap_or(0);
@@ -781,8 +977,16 @@ fn dialog_body(
     };
     match dialog {
         Dialog::Offer => {
-            head(ui, p, "Update available", inst, &format!("razerctl {new} is available"));
-            let mut right = release_date(&rel.published).map(|d| format!("Released {d}")).unwrap_or_default();
+            head(
+                ui,
+                p,
+                "Update available",
+                inst,
+                &format!("razerctl {new} is available"),
+            );
+            let mut right = release_date(&rel.published)
+                .map(|d| format!("Released {d}"))
+                .unwrap_or_default();
             if matches!(inst, InstallType::AppImage { .. }) && size > 0 {
                 right = format!("{right} · {}", megabytes(size));
             }
@@ -810,34 +1014,63 @@ fn dialog_body(
                         o.not_now = btn(ui, p, "Not now", Kind::Secondary, true).clicked();
                     }
                     InstallType::Tarball => {
-                        o.open_page = btn(ui, p, "Open release page", Kind::Primary, true).clicked();
+                        o.open_page =
+                            btn(ui, p, "Open release page", Kind::Primary, true).clicked();
                         o.not_now = btn(ui, p, "Not now", Kind::Secondary, true).clicked();
                     }
-                    InstallType::Package => o.close = btn(ui, p, "Close", Kind::Primary, true).clicked(),
+                    InstallType::Package => {
+                        o.close = btn(ui, p, "Close", Kind::Primary, true).clicked()
+                    }
                 },
                 "razerctl asks once a day. Turn this off on the App tab.",
             );
         }
         Dialog::Working(stage) => {
             let (title, done, total) = match *stage {
-                Stage::Downloading { done, total } => (format!("Downloading razerctl {new}"), done, if total > 0 { total } else { size }),
-                Stage::Verifying | Stage::Replacing => (format!("Checking razerctl {new}"), size, size),
+                Stage::Downloading { done, total } => (
+                    format!("Downloading razerctl {new}"),
+                    done,
+                    if total > 0 { total } else { size },
+                ),
+                Stage::Verifying | Stage::Replacing => {
+                    (format!("Checking razerctl {new}"), size, size)
+                }
             };
             head(ui, p, "Updating", inst, &title);
             version_row(ui, p, cur, new, &megabytes(size));
             ui.add_space(S3);
             ui.label(caps(p, "Progress"));
             ui.add_space(S1);
-            let frac = if total > 0 { (done as f32 / total as f32).clamp(0.0, 1.0) } else { 0.0 };
+            let frac = if total > 0 {
+                (done as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
             let downloading = matches!(stage, Stage::Downloading { .. });
             steps_box(ui, p, log_h + 22.0, |ui| {
-                let detail = format!("{} of {}", megabytes(done).trim_end_matches(" MB"), megabytes(total));
-                step(ui, p, if downloading { S::Now } else { S::Done }, "Download", &detail);
+                let detail = format!(
+                    "{} of {}",
+                    megabytes(done).trim_end_matches(" MB"),
+                    megabytes(total)
+                );
+                step(
+                    ui,
+                    p,
+                    if downloading { S::Now } else { S::Done },
+                    "Download",
+                    &detail,
+                );
                 ui.add_space(S1);
                 let w = ui.available_width();
                 meter(ui, p, w, 14.0, frac, 48);
                 ui.add_space(S3);
-                step(ui, p, if downloading { S::Wait } else { S::Now }, "Check against SHA256SUMS", if downloading { "" } else { "sha256" });
+                step(
+                    ui,
+                    p,
+                    if downloading { S::Wait } else { S::Now },
+                    "Check against SHA256SUMS",
+                    if downloading { "" } else { "sha256" },
+                );
                 step(ui, p, S::Wait, "Replace the AppImage", "keeps .old");
                 step(ui, p, S::Wait, "Restart razerctl", "");
                 ui.add_space(S3);
@@ -851,13 +1084,27 @@ fn dialog_body(
                     },
                 );
             });
-            footer(ui, p, |ui| o.cancel = btn(ui, p, "Cancel", Kind::Secondary, true).clicked(), "");
+            footer(
+                ui,
+                p,
+                |ui| o.cancel = btn(ui, p, "Cancel", Kind::Secondary, true).clicked(),
+                "",
+            );
         }
         Dialog::Done { old, .. } => {
-            head(ui, p, "Updated", inst, &format!("razerctl {new} is installed"));
+            head(
+                ui,
+                p,
+                "Updated",
+                inst,
+                &format!("razerctl {new} is installed"),
+            );
             version_row(ui, p, cur, new, "");
             ui.add_space(S3);
-            let kept = old.as_ref().map(|_| format!("{file_old}.old kept")).unwrap_or_default();
+            let kept = old
+                .as_ref()
+                .map(|_| format!("{file_old}.old kept"))
+                .unwrap_or_default();
             steps_box(ui, p, recap_h, |ui| {
                 cstep(ui, S::Done, "Download", &megabytes(size));
                 cstep(ui, S::Done, "Check against SHA256SUMS", "matches");
@@ -882,7 +1129,8 @@ fn dialog_body(
                     p,
                     |ui| {
                         o.later = btn(ui, p, "Later", Kind::Primary, true).clicked();
-                        o.restart = btn(ui, p, "Restart and discard", Kind::Secondary, true).clicked();
+                        o.restart =
+                            btn(ui, p, "Restart and discard", Kind::Secondary, true).clicked();
                     },
                     "Later keeps this window open.",
                 );
@@ -899,7 +1147,13 @@ fn dialog_body(
             }
         }
         Dialog::Saved { path, why } => {
-            head(ui, p, "Update downloaded", inst, "razerctl couldn't replace itself");
+            head(
+                ui,
+                p,
+                "Update downloaded",
+                inst,
+                "razerctl couldn't replace itself",
+            );
             version_row(ui, p, cur, new, "downloaded, not installed");
             ui.add_space(S3);
             let shown = path.display().to_string();
@@ -927,7 +1181,17 @@ fn dialog_body(
         }
         Dialog::Failed(e) => {
             let mismatch = matches!(e, UpdateError::Mismatch { .. });
-            head(ui, p, "Update failed", inst, if mismatch { "The download didn't match" } else { "The update didn't finish" });
+            head(
+                ui,
+                p,
+                "Update failed",
+                inst,
+                if mismatch {
+                    "The download didn't match"
+                } else {
+                    "The update didn't finish"
+                },
+            );
             version_row(ui, p, cur, new, "not installed");
             ui.add_space(S3);
             steps_box(ui, p, recap_h, |ui| {
@@ -968,7 +1232,14 @@ fn dialog_body(
                 }
                 if let UpdateError::Mismatch { expected, got } = e {
                     ui.add_space(S2);
-                    code_block(ui, p, &[("Expected", &short_hash(expected)), ("Got", &short_hash(got))]);
+                    code_block(
+                        ui,
+                        p,
+                        &[
+                            ("Expected", &short_hash(expected)),
+                            ("Got", &short_hash(got)),
+                        ],
+                    );
                 }
             });
             footer(
@@ -1004,7 +1275,12 @@ pub fn restart(path: &std::path::Path) -> std::io::Error {
     for var in ["APPDIR", "APPIMAGE", "ARGV0", "OWD"] {
         cmd.env_remove(var);
     }
-    for var in ["PATH", "LD_LIBRARY_PATH", "XDG_DATA_DIRS", "GSETTINGS_SCHEMA_DIR"] {
+    for var in [
+        "PATH",
+        "LD_LIBRARY_PATH",
+        "XDG_DATA_DIRS",
+        "GSETTINGS_SCHEMA_DIR",
+    ] {
         if let Ok(v) = std::env::var(var) {
             cmd.env(var, without_dir(&v, &appdir));
         }
@@ -1019,7 +1295,10 @@ fn without_dir(list: &str, dir: &str) -> String {
         return list.to_string();
     }
     let under = |e: &str| std::path::Path::new(e).starts_with(dir);
-    list.split(':').filter(|e| !under(e)).collect::<Vec<_>>().join(":")
+    list.split(':')
+        .filter(|e| !under(e))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 pub fn take_restart() -> Option<PathBuf> {
@@ -1032,13 +1311,245 @@ mod tests {
 
     #[test]
     fn dates_and_sizes_read_the_way_the_dialog_prints_them() {
-        assert_eq!(release_date("2026-10-17T15:23:45Z").as_deref(), Some("17 Oct 2026"));
+        assert_eq!(
+            release_date("2026-10-17T15:23:45Z").as_deref(),
+            Some("17 Oct 2026")
+        );
         assert_eq!(release_date("2026-01-02").as_deref(), Some("2 Jan 2026"));
         assert_eq!(release_date("bad"), None);
         assert_eq!(release_date("2026-13-01"), None);
         assert_eq!(megabytes(14_200_000), "14.2 MB");
         assert_eq!(plain("## **Fixed** `remap`"), "Fixed remap");
-        assert_eq!(short_hash(&format!("{}{}", "3f9a6c0e5b7d", "0".repeat(48) + "b21d")), "3f9a6c0e5b7d…b21d");
+        assert_eq!(
+            short_hash(&format!("{}{}", "3f9a6c0e5b7d", "0".repeat(48) + "b21d")),
+            "3f9a6c0e5b7d…b21d"
+        );
+    }
+
+    fn release() -> Release {
+        Release::parse(
+            r#"{"tag_name":"v0.3.0","draft":false,"html_url":"https://x/r","body":"n",
+                "assets":[{"name":"razerctl-0.3.0-x86_64.AppImage","size":10,"browser_download_url":"http://127.0.0.1:9/a"},
+                {"name":"SHA256SUMS","size":10,"browser_download_url":"http://127.0.0.1:9/s"}]}"#,
+        )
+        .unwrap()
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("razerctl-updater-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// An updater whose "GitHub" is a port nothing listens on, with its files in `dir`.
+    fn updater(dir: &std::path::Path, install: InstallType) -> Updater {
+        let mut u = Updater::with(
+            Paths::in_dir(dir),
+            Source::loopback("http://127.0.0.1:9"),
+            install,
+            Version::parse("0.2.0").unwrap(),
+        );
+        u.stage(Some(release()), State::default(), Some(Dialog::Offer));
+        u
+    }
+
+    fn appimage(dir: &std::path::Path) -> InstallType {
+        InstallType::AppImage {
+            path: dir.join("razerctl-0.2.0-x86_64.AppImage"),
+        }
+    }
+
+    #[test]
+    fn not_now_and_esc_dismiss_for_a_day_and_close_the_dialog() {
+        let ctx = egui::Context::default();
+        for how in ["not_now", "esc"] {
+            let dir = tmp(how);
+            let mut u = updater(&dir, appimage(&dir));
+            let out = Out {
+                not_now: how == "not_now",
+                esc: how == "esc",
+                ..Out::default()
+            };
+            assert_eq!(finish(&ctx, &mut u, &release(), &Dialog::Offer, out), None);
+            assert_eq!(u.dialog, None, "{how}");
+            assert!(u.state.dismissed.is_some(), "{how}: remembered");
+            assert!(
+                !u.state.banner_wanted(update::now_secs()),
+                "{how}: the banner stays away today"
+            );
+            assert!(u.banner_release(true).is_none());
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn only_an_appimage_install_can_start_an_update() {
+        let ctx = egui::Context::default();
+        for install in [InstallType::Tarball, InstallType::Package] {
+            let dir = tmp("noapply");
+            let mut u = updater(&dir, install.clone());
+            finish(
+                &ctx,
+                &mut u,
+                &release(),
+                &Dialog::Offer,
+                Out {
+                    update: true,
+                    ..Out::default()
+                },
+            );
+            assert!(
+                u.dialog != Some(Dialog::Working(Stage::Downloading { done: 0, total: 0 })),
+                "{install:?}"
+            );
+            assert!(u.rx.is_none(), "{install:?}: no thread was started");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    #[test]
+    fn nothing_downloads_until_update_is_pressed() {
+        let ctx = egui::Context::default();
+        let dir = tmp("press");
+        let mut u = updater(&dir, appimage(&dir));
+        u.auto = true;
+        u.tick(&ctx, true); // the automatic check runs, but it is a check, never a download
+        assert!(u.rx.is_some() && u.dialog == Some(Dialog::Offer));
+        finish(
+            &ctx,
+            &mut u,
+            &release(),
+            &Dialog::Offer,
+            Out {
+                update: true,
+                ..Out::default()
+            },
+        );
+        assert!(
+            matches!(u.dialog, Some(Dialog::Working(_))),
+            "now it is working"
+        );
+        // the fixture port is closed: the download fails, and the failure is shown, with nothing written
+        let t = Instant::now();
+        while !matches!(u.dialog, Some(Dialog::Failed(_))) && t.elapsed() < Duration::from_secs(20)
+        {
+            u.tick(&ctx, true);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            matches!(u.dialog, Some(Dialog::Failed(UpdateError::Net(_)))),
+            "{:?}",
+            u.dialog
+        );
+        assert_eq!(
+            std::fs::read_dir(&dir)
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".part"))
+                .count(),
+            0
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_while_working_cancels_the_download_and_done_offers_restart_or_later() {
+        let ctx = egui::Context::default();
+        let dir = tmp("esc");
+        let mut u = updater(&dir, appimage(&dir));
+        let working = Dialog::Working(Stage::Verifying);
+        finish(
+            &ctx,
+            &mut u,
+            &release(),
+            &working,
+            Out {
+                esc: true,
+                ..Out::default()
+            },
+        );
+        assert!(u.cancel.load(Ordering::Relaxed));
+        let done = Dialog::Done {
+            path: dir.join("new"),
+            old: None,
+        };
+        u.dialog = Some(done.clone());
+        assert_eq!(
+            finish(
+                &ctx,
+                &mut u,
+                &release(),
+                &done,
+                Out {
+                    restart: true,
+                    ..Out::default()
+                }
+            ),
+            Some(Action::Restart {
+                path: dir.join("new")
+            })
+        );
+        assert_eq!(
+            finish(
+                &ctx,
+                &mut u,
+                &release(),
+                &done,
+                Out {
+                    later: true,
+                    ..Out::default()
+                }
+            ),
+            None
+        );
+        assert_eq!(
+            u.dialog, None,
+            "Later keeps the window and closes only the dialog"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The automatic check: not when the switch is off, not when `auto` is off (tests, hooks), not twice in 24 hours; offline
+    /// is silent (no status line to say, the outcome recorded for the App tab).
+    #[test]
+    fn the_background_check_respects_the_switch_the_throttle_and_stays_silent_offline() {
+        let ctx = egui::Context::default();
+        let dir = tmp("auto");
+        let mut u = updater(&dir, appimage(&dir));
+        u.stage(None, State::default(), None);
+        u.tick(&ctx, true);
+        assert!(u.rx.is_none(), "auto is off: no thread");
+        u.auto = true;
+        u.tick(&ctx, false);
+        assert!(u.rx.is_none(), "the switch is off: no thread");
+        u.tick(&ctx, true);
+        assert!(u.rx.is_some() && u.checking, "due and on: one check");
+        let t = Instant::now();
+        while u.checking && t.elapsed() < Duration::from_secs(20) {
+            u.tick(&ctx, true);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!u.checking);
+        assert_eq!(u.state.outcome, Some(Outcome::Offline));
+        assert_eq!(u.say, None, "offline says nothing");
+        assert_eq!(u.dialog, None);
+        assert!(u.banner_release(true).is_none());
+        // used up for the day, even though it failed
+        u.last_eval = None;
+        u.tick(&ctx, true);
+        assert!(
+            !u.checking,
+            "a second automatic check inside 24 hours is not made"
+        );
+        // Check now ignores the throttle, and tells an up-to-date answer only because the user asked
+        u.start_check(&ctx, true);
+        assert!(u.checking);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1047,7 +1558,11 @@ mod tests {
         let list = format!("{mount}/usr/bin:/usr/bin:{mount}/usr/lib:/home/u/bin");
         assert_eq!(without_dir(&list, mount), "/usr/bin:/home/u/bin");
         assert_eq!(without_dir(&list, ""), list, "no APPDIR: nothing to drop");
-        assert_eq!(without_dir("/tmp/.mount_razerckAbcd/x:/a", mount), "/tmp/.mount_razerckAbcd/x:/a", "whole components only");
+        assert_eq!(
+            without_dir("/tmp/.mount_razerckAbcd/x:/a", mount),
+            "/tmp/.mount_razerckAbcd/x:/a",
+            "whole components only"
+        );
     }
 
     #[test]
