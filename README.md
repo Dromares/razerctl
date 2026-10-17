@@ -305,7 +305,7 @@ What an update does depends on how razerctl was installed:
 
 | Installed as | Default | Update |
 | --- | --- | --- |
-| AppImage (`$APPIMAGE` is set) | check on | *Update* downloads the new `.AppImage` and `SHA256SUMS`, verifies it, replaces the file in place and keeps the old one as `<name>.old`, then asks you to restart. A checksum mismatch refuses and changes nothing; a folder razerctl cannot write to ends with "downloaded to …" (`$XDG_DOWNLOAD_DIR`, else `~/Downloads`'s equivalent, else `$HOME`). |
+| AppImage (`$APPIMAGE` is set) | check on | *Update* downloads the new `.AppImage` and `SHA256SUMS`, verifies it, replaces the file in place and keeps the old one as `<name>.old`, then asks you to restart. A checksum mismatch refuses and changes nothing; a folder razerctl cannot write to ends with "downloaded to …" (the `XDG_DOWNLOAD_DIR` folder, else `$HOME`). |
 | Binary under `/usr/` (a package) | check **off** | Notify only, if you turn it on. razerctl never replaces files under `/usr`; update with your package manager. |
 | Anything else (tarball, `./install.sh`) | check on | Notify only, with a link to the release page. |
 
