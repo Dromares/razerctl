@@ -13,10 +13,10 @@ const K: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
-fn compress(h: &mut [u32; 8], block: &[u8]) {
+fn compress(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (i, c) in block.chunks_exact(4).enumerate() {
-        w[i] = u32::from_be_bytes([c[0], c[1], c[2], c[3]]);
+    for (i, c) in block.as_chunks::<4>().0.iter().enumerate() {
+        w[i] = u32::from_be_bytes(*c);
     }
     for i in 16..64 {
         let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
@@ -71,7 +71,7 @@ pub fn hex_digest(mut r: impl Read) -> std::io::Result<String> {
         total += n as u64;
         pending.extend_from_slice(&buf[..n]);
         let whole = pending.len() / 64 * 64;
-        for block in pending[..whole].chunks_exact(64) {
+        for block in pending[..whole].as_chunks::<64>().0 {
             compress(&mut h, block);
         }
         pending.drain(..whole);
@@ -81,7 +81,7 @@ pub fn hex_digest(mut r: impl Read) -> std::io::Result<String> {
         pending.push(0);
     }
     pending.extend_from_slice(&(total * 8).to_be_bytes());
-    for block in pending.chunks_exact(64) {
+    for block in pending.as_chunks::<64>().0 {
         compress(&mut h, block);
     }
     Ok(h.iter().map(|x| format!("{x:08x}")).collect())
