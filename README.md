@@ -8,14 +8,91 @@
 
 ## Install
 
+Pick one format. Every one needs the [udev rule](#the-udev-rule) once, because only root can install it.
+
+> **Release downloads are not live yet.** The links below point at the GitHub releases of
+> `github.com/Dromares/razerctl`, which stay unreachable until the owner makes the repository public. Until then, build
+> from source.
+
+### Arch / CachyOS (AUR)
+
+```
+yay -S razerctl-bin          # or: paru -S razerctl-bin
+```
+
+Installs the prebuilt release to `/usr/bin` and the udev rule to `/usr/lib/udev/rules.d/`. It conflicts with, and
+provides, `razerctl`. The package's install message repeats the replug step below. (Package recipe:
+[packaging/aur/razerctl-bin](packaging/aur/razerctl-bin); the AUR page goes live when the owner submits it.)
+
+### AppImage
+
+Download `razerctl-X.Y.Z-x86_64.AppImage` from the [latest release](https://github.com/Dromares/razerctl/releases/latest), then:
+
+```
+chmod +x razerctl-X.Y.Z-x86_64.AppImage && ./razerctl-X.Y.Z-x86_64.AppImage
+sudo curl -fLo /etc/udev/rules.d/70-razerctl.rules https://github.com/Dromares/razerctl/releases/latest/download/70-razerctl.rules && sudo udevadm control --reload && sudo udevadm trigger
+```
+
+The second line is the udev rule (see below); an AppImage cannot install it by itself. It needs glibc 2.35 or newer and
+carries only the GUI and CLI binaries, not the systemd units. Details and the build recipe are under
+[AppImage details](#appimage-details-and-building).
+
+### Tarball
+
+Download `razerctl-X.Y.Z-x86_64-linux.tar.gz` from the same release page (it needs glibc 2.35 or newer, plus the
+Wayland/X11, xkbcommon, OpenGL and libnotify libraries from your distro):
+
+```
+tar xzf razerctl-X.Y.Z-x86_64-linux.tar.gz && cd razerctl-X.Y.Z-x86_64-linux
+sudo install -Dm755 razerctl razerctl-gui -t /usr/local/bin
+sudo install -Dm644 70-razerctl.rules /etc/udev/rules.d/70-razerctl.rules
+sudo install -Dm644 razerctl.desktop -t /usr/local/share/applications
+sudo install -Dm644 razerctl.svg -t /usr/local/share/icons/hicolor/scalable/apps
+sudo install -Dm644 icons/razerctl-*symbolic.svg -t /usr/local/share/icons/hicolor/symbolic/apps
+sudo udevadm control --reload && sudo udevadm trigger
+```
+
+The optional remap and low-battery services are in `systemd/`; they point at `~/.local/bin`, so copy them into
+`~/.config/systemd/user/` after changing that path to `/usr/local/bin`.
+
+### From source
+
 ```
 ./install.sh                 # builds, installs CLI + GUI + app-menu entry to ~/.local, udev rule via sudo
 ./install.sh --uninstall
-# or, as an Arch/CachyOS package:
+# or, as a local Arch/CachyOS package built from this checkout:
 cd packaging && makepkg -si
 ```
 
-Then open **razerctl** from the app menu (or run `razerctl-gui`).
+### The udev rule
+
+razerctl reads and writes the mouse through `hidraw` and `/dev/input`, which only root can open by default.
+`udev/70-razerctl.rules` grants the logged-in user access to Razer (USB vendor `1532`) devices. Each format installs it
+as shown above (the AUR package, `install.sh` and the tarball steps put it in place; the AppImage needs the one `sudo`
+line). udev applies a rule when a device is plugged in, so after installing it **unplug and replug the mouse**; that
+is the fallback that always works. `sudo udevadm control --reload && sudo udevadm trigger` should apply it without a
+replug, but that has not been tested on every desktop, so replug if the GUI still reports no access.
+
+### Updating
+
+| Installed with | How it updates |
+|---|---|
+| AUR `razerctl-bin` | `yay -Syu` / `paru -Syu`, with the rest of the system. |
+| AppImage | The in-app update check shows the new version and its changelog and only updates after you confirm. [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate), Gear Lever and AppImageLauncher also work, using the release's `.zsync` file. |
+| Tarball / `install.sh` | The in-app check only tells you a newer release exists; repeat the install steps with the new tarball (for `install.sh`, `git pull` and run it again). |
+
+Nothing updates silently. The in-app check can be turned off in the GUI settings.
+
+### Integrity of downloads
+
+Each release has a `SHA256SUMS` file; check a download with `sha256sum -c SHA256SUMS --ignore-missing`. The in-app
+updater does the same before it replaces anything. This catches a corrupted or truncated download. It does **not**
+protect against someone taking over the GitHub account or the release: the checksums come from the same place as the
+files. Releases are not signed.
+
+### What you get
+
+Open **razerctl** from the app menu (or run `razerctl-gui`).
 
 * **Buttons** tab: remaps saved *into the mouse* (onboard memory, profile 1). They keep working
   with no software running, on any computer. Left click is locked so you can't lose clicking.
@@ -30,18 +107,14 @@ Then open **razerctl** from the app menu (or run `razerctl-gui`).
 CLI equivalent: `razerctl --backend hidraw onboard` / `onboard set BUTTON ACTION`.
 Protocol details: [docs/onboard-button-protocol.md](docs/onboard-button-protocol.md).
 
-### AppImage
+### AppImage details and building
 
 A release carries `razerctl-X.Y.Z-x86_64.AppImage`: the GUI as one file, built in an Ubuntu 22.04 root filesystem. It
 **needs glibc 2.35 or newer** (the GUI binary's highest symbol is `GLIBC_2.35`): Ubuntu 22.04, Debian 12 and Fedora 36
 or newer are fine; RHEL, Rocky and Alma 9 (glibc 2.34), Ubuntu 20.04 and Debian 11 refuse to start with
 `GLIBC_2.35 not found`. It bundles no graphics libraries: Wayland, X11, xkbcommon and OpenGL come from the host. It
-does **not** install the udev rule, so the mouse stays unreachable until you do:
-
-```
-chmod +x razerctl-0.2.0-x86_64.AppImage && ./razerctl-0.2.0-x86_64.AppImage
-sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
-```
+does **not** install the udev rule, so the mouse stays unreachable until you install it (see
+[Install, AppImage](#appimage)).
 
 The command-line tool is inside it too (`--appimage-extract`, then `squashfs-root/usr/bin/razerctl`). The
 systemd units are not packaged; use `./install.sh` if you want the remap service or the low-battery notifier.

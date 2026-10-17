@@ -1,0 +1,23 @@
+pkgbase = razerctl-bin
+	pkgdesc = Razer mouse control for Linux: onboard button remapping, DPI, polling rate (Synapse rewrite in Rust), prebuilt release
+	pkgver = 0.3.0
+	pkgrel = 1
+	url = https://github.com/Dromares/razerctl
+	install = razerctl-bin.install
+	arch = x86_64
+	license = MIT
+	depends = gcc-libs
+	depends = glibc
+	depends = hicolor-icon-theme
+	depends = libxkbcommon
+	depends = wayland
+	depends = libglvnd
+	depends = libnotify
+	optdepends = openrazer-daemon: battery/DPI via the kernel driver
+	optdepends = gnome-shell-extension-appindicator: a system tray on GNOME (razerctl-gui quits on close without one)
+	provides = razerctl
+	conflicts = razerctl
+	source = razerctl-0.3.0-x86_64-linux.tar.gz::https://github.com/Dromares/razerctl/releases/download/v0.3.0/razerctl-0.3.0-x86_64-linux.tar.gz
+	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+
+pkgname = razerctl-bin
