@@ -20,8 +20,8 @@ procedure to settle it is at the end.
   - `rzDevice30.e14f762cc06dc394861d.js`: Protocol 30 layer, used only as a
     cross-check (it defines a *different* class-0x04 macro command set).
   - `main.d7eb85f9d4db42cb11f5.js`: the product config for this device.
-- **macOS installer**, `/home/beeizebubs/Downloads/RazerSynapseInstaller.pkg`,
-  payloads extracted read-only into `/home/beeizebubs/work/worktrees/DAN-1416-pkg/`:
+- **macOS installer**, `RazerSynapseInstaller.pkg`,
+  payloads extracted read-only into a scratch directory:
   `EngineInstall.pkg` (Razer.app 4.4.25, build 4.4.25.194; Razer Synapse.app 0.8.11),
   `SynapseInstall.pkg`, `ChromaInstall.pkg`. `app.asar` extracted with
   `@electron/asar`.
