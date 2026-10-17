@@ -2,7 +2,7 @@
 //!
 //! See README.md for what was reverse engineered and what was intentionally left out.
 
-use razerctl::{battery, device, hidraw, macros, onboard, protocol, remap};
+use razerctl::{battery, device, hidraw, macros, onboard, protocol, remap, update};
 
 use device::{Backend, Prefer};
 use std::path::{Path, PathBuf};
@@ -48,6 +48,9 @@ COMMANDS:
     macros play NAME --dry-run
                              Print the exact frames and sleeps a press would send
                              (live playback only via remap; no device is opened)
+    update [--check]         Ask GitHub whether a newer release exists (only when you run this).
+                             Without --check: show what is new, then ask y/N before replacing an
+                             AppImage; other installs get the release link or the package command
 
 OPTIONS:
     --backend   auto (default): use OpenRazer sysfs when its driver is bound, else hidraw
@@ -280,6 +283,19 @@ fn run() -> Result<(), Fail> {
 
     if command == "macros" {
         return macros_cmd(rest).map_err(Fail::from);
+    }
+
+    if command == "update" {
+        let stdin = std::io::stdin();
+        return update::cli::run(
+            rest,
+            &update::Source::from_env(),
+            &update::current_version(),
+            &update::InstallType::detect(),
+            &mut stdin.lock(),
+            &mut std::io::stdout(),
+        )
+        .map_err(Fail::from);
     }
 
     if command == "battery-watch" {

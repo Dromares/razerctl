@@ -34,6 +34,8 @@ pub struct Settings {
     pub close_to_tray: bool,
     /// The one-time "razerctl is still running" notice has been shown.
     pub notified: bool,
+    /// `check_updates = false` turns the update check off; unset follows the install type (off for a system package).
+    pub check_updates: Option<bool>,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Default for Settings {
         Settings {
             close_to_tray: true,
             notified: false,
+            check_updates: None,
         }
     }
 }
@@ -57,10 +60,19 @@ pub fn parse_settings(text: &str) -> Settings {
         let Some((k, v)) = line.split_once('=') else {
             continue;
         };
-        let v = matches!(v.trim(), "true" | "yes" | "1" | "on");
+        let raw = v.trim();
+        let v = matches!(raw, "true" | "yes" | "1" | "on");
         match k.trim() {
             "close_to_tray" => s.close_to_tray = v,
             "tray_notice_shown" => s.notified = v,
+            // only a clear yes or no counts: a typo leaves the install type's default in charge
+            "check_updates" => {
+                s.check_updates = match raw {
+                    "false" | "no" | "0" | "off" => Some(false),
+                    _ if v => Some(true),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }
@@ -68,10 +80,14 @@ pub fn parse_settings(text: &str) -> Settings {
 }
 
 pub fn format_settings(s: &Settings) -> String {
-    format!(
+    let mut out = format!(
         "# razerctl-gui settings\nclose_to_tray = {}\ntray_notice_shown = {}\n",
         s.close_to_tray, s.notified
-    )
+    );
+    if let Some(on) = s.check_updates {
+        out += &format!("check_updates = {on}\n");
+    }
+    out
 }
 
 pub fn load_settings(path: &Path) -> Settings {
@@ -958,13 +974,15 @@ mod tests {
         let s = Settings {
             close_to_tray: false,
             notified: true,
+            check_updates: Some(false),
         };
         assert_eq!(parse_settings(&format_settings(&s)), s);
         assert_eq!(
             parse_settings("garbage\nclose_to_tray = maybe"),
             Settings {
                 close_to_tray: false,
-                notified: false
+                notified: false,
+                check_updates: None
             }
         );
         assert_eq!(parse_settings(""), Settings::default());

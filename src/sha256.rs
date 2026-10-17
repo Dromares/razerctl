@@ -1,4 +1,5 @@
-//! SHA-256 (FIPS 180-4) over a reader, in `std` only. Checked against the NIST vectors in `tests/appimage_tools.rs`.
+//! SHA-256 (FIPS 180-4) over a reader, in `std` only. Checked against the NIST vectors in `tests/appimage_tools.rs`. Shared by
+//! the update check (`update`) and `examples/fetch_appimage_tools`, so no hashing crate is needed (DAN-1669).
 
 use std::io::Read;
 

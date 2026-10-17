@@ -24,6 +24,8 @@ mod service;
 mod theme;
 #[path = "razerctl-gui/tray.rs"]
 mod tray;
+#[path = "razerctl-gui/updater.rs"]
+mod updater;
 #[path = "razerctl-gui/widgets.rs"]
 mod widgets;
 
@@ -141,6 +143,10 @@ impl Tab {
     }
 }
 
+/// What the rules editor shows when there is no `remap.conf` yet. Not an edit, so a restart does not lose anything.
+const DEFAULT_RULES: &str =
+    "# One rule per line:  BUTTON = ACTION\n# back = ctrl+c\n# forward = KEY_F13\n# middle = disable\n";
+
 struct App {
     tab: Tab,
     status: String,
@@ -185,6 +191,8 @@ struct App {
     tray: Option<tray::Host>,
     /// Last time the App tab looked for a StatusNotifier host (it asks again every few seconds while it is open).
     tray_probed: Option<std::time::Instant>,
+    /// The update check: its state, its two background threads, the panel, the banner and the dialog (`updater.rs`).
+    update: updater::Updater,
 }
 
 fn open_hidraw() -> Result<Hidraw, String> {
@@ -237,9 +245,8 @@ fn sleep_hint(e: impl ToString) -> String {
 impl App {
     fn new(tray: Option<tray::Host>) -> Self {
         let conf_path = remap::config_path();
-        let conf_text = std::fs::read_to_string(&conf_path).unwrap_or_else(|_| {
-            "# One rule per line:  BUTTON = ACTION\n# back = ctrl+c\n# forward = KEY_F13\n# middle = disable\n".into()
-        });
+        let conf_text =
+            std::fs::read_to_string(&conf_path).unwrap_or_else(|_| DEFAULT_RULES.into());
         let macros_path = razerctl::macros::macros_path();
         let mac = MacroUi::load(&macros_path);
         let mut app = App {
@@ -275,6 +282,7 @@ impl App {
             settings_path: tray::config_path(),
             tray,
             tray_probed: None,
+            update: updater::Updater::new(),
         };
         app.refresh_all();
         app.refresh_service();
@@ -1663,6 +1671,8 @@ impl App {
             ui.add_space(S2);
             section(ui, &p, "02", "Background services");
             self.services_panel(ui);
+            ui.add_space(S2);
+            self.updates_section(ui);
             return;
         }
         let right_w = (total * 0.40).clamp(320.0, 480.0);
@@ -1688,6 +1698,79 @@ impl App {
                 },
             );
         });
+        ui.add_space(S2);
+        self.updates_section(ui);
+    }
+
+    /// Whether the update check runs: `check_updates` in `gui.conf`, else the install type's default (off for a package).
+    fn updates_enabled(&self) -> bool {
+        self.settings
+            .check_updates
+            .unwrap_or_else(|| self.update.install.check_by_default())
+    }
+
+    /// 03 // UPDATES, full width under the other two. The switch applies at once, like the rest of this tab.
+    fn updates_section(&mut self, ui: &mut egui::Ui) {
+        let p = self.pal;
+        section(ui, &p, "03", "Updates");
+        let enabled = self.updates_enabled();
+        if let Some(on) = updater::panel_ui(ui, &p, &mut self.update, enabled) {
+            self.settings.check_updates = Some(on);
+            match tray::save_settings(&self.settings_path, &self.settings) {
+                Ok(()) if on => self.ok("Update check on."),
+                Ok(()) => self.ok("Update check off."),
+                Err(e) => self.err(format!("couldn't save the setting: {e}")),
+            }
+        }
+    }
+
+    /// What a restart would throw away, as a phrase that ends before its verb ("2 button edits are"), if anything.
+    fn unsaved_phrase(&self) -> Option<String> {
+        let c = self.carry_snapshot();
+        let n = c.buttons.len();
+        let mut parts = Vec::new();
+        if n > 0 {
+            parts.push(format!("{n} button edit{}", if n == 1 { "" } else { "s" }));
+        }
+        if c.rules.is_some() && !(self.conf_text == DEFAULT_RULES && !self.conf_path.exists()) {
+            parts.push("rule edits".to_string());
+        }
+        if c.macros.is_some() {
+            parts.push("macro edits".to_string());
+        }
+        if c.dpi.is_some() || c.poll.is_some() {
+            parts.push("device settings".to_string());
+        }
+        let verb = if parts.len() == 1 && n == 1 {
+            "is"
+        } else {
+            "are"
+        };
+        (!parts.is_empty()).then(|| format!("{} {verb}", parts.join(" and ")))
+    }
+
+    /// The update dialog, over whatever tab is showing. *Restart now* quits; `main` then starts the new file.
+    /// What the updater wants said in the status bar: the answer to Check now, or why an update was not installed.
+    fn take_update_say(&mut self) {
+        if let Some(s) = self.update.say.take() {
+            self.ok(s);
+        }
+        if let Some(s) = self.update.say_err.take() {
+            self.err(s);
+        }
+    }
+
+    fn update_dialog(&mut self, ctx: &egui::Context) {
+        let p = self.pal;
+        let unsaved = matches!(self.update.dialog, Some(updater::Dialog::Done { .. }))
+            .then(|| self.unsaved_phrase())
+            .flatten();
+        if let Some(updater::Action::Restart { path }) =
+            updater::dialog_ui(ctx, &p, &mut self.update, unsaved.as_deref())
+        {
+            updater::request_restart(path);
+            self.quit(ctx);
+        }
     }
 
     /// 01 // WINDOW: what closing does (applies at once), whether there is a tray to hide to, and the way out.
@@ -2236,6 +2319,9 @@ impl eframe::App for App {
         self.handle_tray(&ctx);
         self.poll_service(&ctx);
         self.start_watch(&ctx);
+        let updates_on = self.updates_enabled();
+        self.update.tick(&ctx, updates_on);
+        self.take_update_say();
         let mode = self
             .demo
             .theme
@@ -2298,6 +2384,14 @@ impl eframe::App for App {
                 bottom: 12,
             }))
             .show(ui, |ui| self.header(ui));
+        if self.update.banner_release(updates_on).is_some() {
+            egui::Panel::top("update-banner")
+                .show_separator_line(false)
+                .frame(Frame::new().inner_margin(Margin::symmetric(24, 0)))
+                .show(ui, |ui| {
+                    updater::banner_ui(ui, &p, &mut self.update, updates_on)
+                });
+        }
         egui::Panel::top("strip")
             .show_separator_line(false)
             .frame(Frame::new().inner_margin(Margin {
@@ -2319,6 +2413,7 @@ impl eframe::App for App {
                         Tab::App => self.ui_app(ui),
                     });
             });
+        self.update_dialog(&ctx);
     }
 
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
@@ -2344,9 +2439,21 @@ fn main() -> eframe::Result {
         options,
         Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new(for_app)))
+            let mut app = App::new(for_app);
+            // background checks only in a real launch: the visual-review hooks and the tests never reach the network
+            app.update.auto = !demo::hooks_active();
+            Ok(Box::new(app))
         }),
     )?;
+    // "Restart now" after an update: the window is gone, so replace this process with the new file
+    if let Some(path) = updater::take_restart() {
+        eprintln!(
+            "razerctl-gui: could not start the updated {}: {}",
+            path.display(),
+            updater::restart(&path)
+        );
+        return Ok(());
+    }
     // The window is gone. Unless closing it meant "hide to the tray", that is the end; otherwise this process stays
     // as the tray until the user wants the window back or quits from the menu.
     if let Some(host) = host.filter(|h| h.outcome() == Some(CloseAction::Hide)) {
@@ -2425,6 +2532,12 @@ mod tests {
             settings_path: std::env::temp_dir().join("razerctl-gui-test-never-written/gui.conf"),
             tray: None,
             tray_probed: None,
+            update: updater::Updater::with(
+                razerctl::update::Paths::in_dir("/nonexistent/razerctl"),
+                razerctl::update::Source::github(),
+                razerctl::update::InstallType::Tarball,
+                razerctl::update::Version::parse("0.2.0").unwrap(),
+            ),
         }
     }
 
@@ -2483,6 +2596,10 @@ mod tests {
                     Tab::Software => app.ui_software(ui),
                     Tab::App => app.ui_app(ui),
                 }
+                let (p, on) = (app.pal, app.updates_enabled());
+                updater::banner_ui(ui, &p, &mut app.update, on);
+                let ctx = ui.ctx().clone();
+                app.update_dialog(&ctx);
             });
             texts.clear();
             for cs in &out.shapes {
@@ -3287,7 +3404,8 @@ mod tests {
             tray::load_settings(&app.settings_path),
             tray::Settings {
                 close_to_tray: false,
-                notified: false
+                notified: false,
+                ..Default::default()
             }
         );
         app.set_close_to_tray(true, false);
@@ -3327,6 +3445,7 @@ mod tests {
         let mut shown = tray::Settings {
             close_to_tray: true,
             notified: true,
+            ..Default::default()
         };
         tray::first_close_notice(&path, &mut shown);
         assert!(shown.notified && !path.exists());
@@ -4064,5 +4183,497 @@ mod tests {
         old.tray = Some(tray::Host::fake(true));
         old.decide_close(Some(CloseAction::Quit));
         assert_eq!(old.tray.as_ref().unwrap().take_carry(), None);
+    }
+
+    // ---- DAN-1669: the update check in the window
+
+    fn release() -> razerctl::update::Release {
+        razerctl::update::Release::parse(
+            r#"{"tag_name":"v0.3.0","draft":false,"html_url":"https://github.com/Dromares/razerctl/releases/tag/v0.3.0",
+                "published_at":"2026-10-14T09:00:00Z","body":"Fixed a thing.\n\n- one\n- two",
+                "assets":[{"name":"razerctl-0.3.0-x86_64.AppImage","size":14200000,"browser_download_url":"http://x/a"}]}"#,
+        )
+        .unwrap()
+    }
+
+    fn state(
+        outcome: razerctl::update::Outcome,
+        dismissed: Option<u64>,
+    ) -> razerctl::update::State {
+        let now = razerctl::update::now_secs();
+        razerctl::update::State {
+            last_check: Some(now - 60),
+            outcome: Some(outcome),
+            dismissed,
+        }
+    }
+
+    fn appimage() -> razerctl::update::InstallType {
+        razerctl::update::InstallType::AppImage {
+            path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
+        }
+    }
+
+    #[test]
+    fn the_off_switch_is_gui_conf_and_a_system_package_starts_with_it_off() {
+        use razerctl::update::InstallType;
+        let mut app = test_app();
+        for (install, setting, want) in [
+            (appimage(), None, true),
+            (InstallType::Tarball, None, true),
+            (InstallType::Package, None, false),
+            (appimage(), Some(false), false),
+            (InstallType::Package, Some(true), true),
+        ] {
+            app.update.install = install.clone();
+            app.settings.check_updates = setting;
+            assert_eq!(app.updates_enabled(), want, "{install:?} {setting:?}");
+        }
+        let text = "close_to_tray = true\ncheck_updates = false\n";
+        assert_eq!(tray::parse_settings(text).check_updates, Some(false));
+        assert_eq!(
+            tray::parse_settings("check_updates = true").check_updates,
+            Some(true)
+        );
+        assert_eq!(
+            tray::parse_settings("check_updates = whatever").check_updates,
+            None,
+            "a typo leaves the install type's default in charge"
+        );
+    }
+
+    #[test]
+    fn the_panel_names_each_state_and_offline_or_rate_limited_say_nothing_else() {
+        use razerctl::update::Outcome::*;
+        let mut app = test_app();
+        app.update.install = appimage();
+        for (outcome, chip, line) in [
+            (UpToDate, "UP TO DATE", "Next check in about 24 hours."),
+            (
+                Offline,
+                "COULDN'T CONNECT",
+                "No answer from api.github.com.",
+            ),
+            (
+                RateLimited,
+                "RATE LIMITED",
+                "GitHub asked razerctl to wait.",
+            ),
+        ] {
+            app.update.stage(None, state(outcome, None), None);
+            let l = lines_of(&mut app, Tab::App, SIZES[0]);
+            assert!(l.iter().any(|s| s.contains(chip)), "{chip}: {l:?}");
+            assert!(l.iter().any(|s| s.contains(line)), "{line}: {l:?}");
+            assert!(l.iter().any(|s| s.contains("CHECK NOW")), "{l:?}");
+            assert!(
+                !l.iter()
+                    .any(|s| s.contains("is available") || s.contains("UPDATE AVAILABLE")),
+                "no banner, no dialog: {l:?}"
+            );
+            assert_eq!(app.status, "", "no status message either");
+        }
+        // an update waiting: the chip names it, the button becomes View update, and Not now is remembered in the line
+        app.update.stage(
+            Some(release()),
+            state(Available, Some(razerctl::update::now_secs())),
+            None,
+        );
+        let l = lines_of(&mut app, Tab::App, SIZES[0]);
+        assert!(l.iter().any(|s| s.contains("0.3.0 AVAILABLE")), "{l:?}");
+        assert!(l.iter().any(|s| s.contains("VIEW UPDATE")), "{l:?}");
+        assert!(
+            l.iter()
+                .any(|s| s.contains("You chose Not now; razerctl will ask again tomorrow.")),
+            "{l:?}"
+        );
+        // switched off: no check, and Check now is disabled
+        app.settings.check_updates = Some(false);
+        let t = render_texts(&mut app, Tab::App, Mode::Dark, SIZES[0]);
+        assert!(t.iter().any(|(s, ..)| s.contains("NOT CHECKING")));
+        let check = t
+            .iter()
+            .find(|(s, ..)| s.contains("CHECK NOW"))
+            .expect("button stays, disabled");
+        let enabled = t
+            .iter()
+            .find(|(s, ..)| s == "OFF" || s.contains("RESET"))
+            .and_then(|(_, _, c)| *c);
+        assert_ne!(
+            check.2, enabled,
+            "a disabled button paints its label in another colour"
+        );
+    }
+
+    #[test]
+    fn the_panel_stacks_and_the_install_type_changes_the_words() {
+        use razerctl::update::{InstallType, Outcome};
+        let mut app = test_app();
+        app.update.install = InstallType::Package;
+        app.update.stage(None, state(Outcome::UpToDate, None), None);
+        for size in [SIZES[0], (SIZES[1].0, TALL)] {
+            let l = lines_of(&mut app, Tab::App, size);
+            assert!(
+                l.iter()
+                    .any(|s| s == "03 // UPDATES" || s.ends_with("UPDATES")),
+                "{size:?}: {l:?}"
+            );
+            assert!(l.iter().any(|s| s.contains("System package")), "{l:?}");
+            assert!(
+                l.iter()
+                    .any(|s| s == "Tell me when a new version is released"),
+                "{l:?}"
+            );
+            assert!(
+                l.iter()
+                    .any(|s| s.starts_with("Updates come from your system package manager")),
+                "{l:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_banner_shows_only_for_a_waiting_release_nobody_turned_down_today() {
+        use razerctl::update::Outcome::Available;
+        let now = razerctl::update::now_secs();
+        let mut app = test_app();
+        app.update.install = appimage();
+        app.update
+            .stage(Some(release()), state(Available, None), None);
+        let l = lines_of(&mut app, Tab::Buttons, SIZES[0]);
+        assert!(
+            l.iter()
+                .any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."),
+            "{l:?}"
+        );
+        assert!(
+            l.iter().any(|s| s.contains("SEE WHAT'S NEW"))
+                && l.iter().any(|s| s.contains("NOT NOW")),
+            "{l:?}"
+        );
+        // turned down an hour ago: gone for the day; a day and a bit later: back
+        app.update
+            .stage(Some(release()), state(Available, Some(now - 3600)), None);
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
+        app.update.stage(
+            Some(release()),
+            state(Available, Some(now - 25 * 3600)),
+            None,
+        );
+        assert!(lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
+        // the switch is off: nothing, whatever the cache says
+        app.settings.check_updates = Some(false);
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s.contains("is available")));
+        // while the dialog is open the banner steps aside
+        app.settings.check_updates = None;
+        app.update.stage(
+            Some(release()),
+            state(Available, None),
+            Some(updater::Dialog::Offer),
+        );
+        assert!(!lines_of(&mut app, Tab::Buttons, SIZES[0])
+            .iter()
+            .any(|s| s == "razerctl 0.3.0 is available. You have 0.2.0."));
+    }
+
+    #[test]
+    fn each_install_type_gets_its_own_offer_and_only_an_appimage_can_press_update() {
+        use razerctl::update::{InstallType, Outcome::Available};
+        let mut app = test_app();
+        for (install, want, absent) in [
+            (
+                appimage(),
+                vec!["UPDATE", "NOT NOW"],
+                vec!["OPEN RELEASE PAGE", "CLOSE"],
+            ),
+            (
+                InstallType::Tarball,
+                vec!["OPEN RELEASE PAGE", "NOT NOW"],
+                vec!["UPDATE", "CLOSE"],
+            ),
+            (
+                InstallType::Package,
+                vec!["CLOSE", "yay -Syu", "paru -Syu"],
+                vec!["UPDATE", "NOT NOW", "OPEN RELEASE PAGE"],
+            ),
+        ] {
+            app.update.install = install.clone();
+            app.update.stage(
+                Some(release()),
+                state(Available, None),
+                Some(updater::Dialog::Offer),
+            );
+            for size in SIZES {
+                let l = lines_of(&mut app, Tab::Buttons, size);
+                for w in &want {
+                    assert!(
+                        l.iter().any(|s| s == w),
+                        "{install:?} {size:?}: {w} missing in {l:?}"
+                    );
+                }
+                for w in &absent {
+                    assert!(
+                        !l.iter().any(|s| s == w),
+                        "{install:?} {size:?}: {w} must not be offered"
+                    );
+                }
+                assert!(
+                    l.iter().any(|s| s == "razerctl 0.3.0 is available"),
+                    "{l:?}"
+                );
+                assert!(
+                    l.iter().any(|s| s.starts_with("Released 14 Oct 2026")),
+                    "{l:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_working_and_failed_states_say_what_happened_and_what_was_left_alone() {
+        use razerctl::update::{Applied, Outcome::Available, Stage, UpdateError};
+        use updater::Dialog;
+        let mut app = test_app();
+        app.conf_text = DEFAULT_RULES.into(); // nothing unsaved until a test says so
+        app.update.install = appimage();
+        let show = |app: &mut App, d: Dialog, size| {
+            app.update
+                .stage(Some(release()), state(Available, None), Some(d));
+            lines_of(app, Tab::Buttons, size)
+        };
+        let l = show(
+            &mut app,
+            Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            }),
+            SIZES[0],
+        );
+        assert!(l.iter().any(|s| s == "Downloading razerctl 0.3.0"), "{l:?}");
+        assert!(l.iter().any(|s| s == "9.4 of 14.2 MB"), "{l:?}");
+        let l = show(&mut app, Dialog::Working(Stage::Verifying), SIZES[0]);
+        assert!(
+            l.iter().any(|s| s == "Checking razerctl 0.3.0")
+                && l.iter()
+                    .any(|s| s.contains("Nothing has been replaced yet.")),
+            "{l:?}"
+        );
+        let mismatch = UpdateError::Mismatch {
+            expected: "ab".repeat(32),
+            got: "cd".repeat(32),
+        };
+        for size in SIZES {
+            let l = show(&mut app, Dialog::Failed(mismatch.clone()), size);
+            assert!(l.iter().any(|s| s == "The download didn't match"), "{l:?}");
+            assert!(l.iter().any(|s| s == "Nothing was changed"), "{l:?}");
+            assert!(
+                l.iter()
+                    .any(|s| s.contains("razerctl-0.2.0-x86_64.AppImage is exactly as it was")),
+                "{l:?}"
+            );
+            assert!(
+                l.iter().any(|s| s == "abababababab…abab")
+                    && l.iter().any(|s| s == "cdcdcdcdcdcd…cdcd"),
+                "{l:?}"
+            );
+            assert!(
+                ["TRY AGAIN", "OPEN RELEASE PAGE", "CLOSE"]
+                    .iter()
+                    .all(|b| l.iter().any(|s| s == b)),
+                "{l:?}"
+            );
+        }
+        let saved = Dialog::Saved {
+            path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+            why: "/home/u/Apps is not writable".into(),
+        };
+        let l = show(&mut app, saved, SIZES[1]);
+        assert!(
+            l.iter().any(|s| s == "razerctl couldn't replace itself"),
+            "{l:?}"
+        );
+        assert!(
+            l.iter()
+                .any(|s| s == "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage"),
+            "{l:?}"
+        );
+        assert!(l.iter().any(|s| s == "COPY PATH"), "{l:?}");
+        let done = Dialog::Done {
+            path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
+            old: Some("/home/u/Apps/razerctl-0.2.0-x86_64.AppImage.old".into()),
+        };
+        let _ = Applied::Saved {
+            path: "/x".into(),
+            why: String::new(),
+        }; // the two outcomes map onto Done / Saved in `tick`
+        let l = show(&mut app, done.clone(), SIZES[0]);
+        assert!(
+            l.iter().any(|s| s == "razerctl 0.3.0 is installed"),
+            "{l:?}"
+        );
+        assert!(
+            l.iter().any(|s| s == "RESTART NOW") && l.iter().any(|s| s == "LATER"),
+            "{l:?}"
+        );
+        // with unsaved edits the safe button is the primary one and the other says what it does
+        app.rows = demo::rows();
+        app.rows[2].choice = 5;
+        let l = show(&mut app, done, SIZES[0]);
+        assert!(l.iter().any(|s| s == "You have unsaved changes"), "{l:?}");
+        assert!(
+            l.iter()
+                .any(|s| s.starts_with("1 button edit is not saved yet")),
+            "{l:?}"
+        );
+        assert!(l.iter().any(|s| s == "RESTART AND DISCARD"), "{l:?}");
+        assert!(!l.iter().any(|s| s == "RESTART NOW"), "{l:?}");
+    }
+
+    #[test]
+    fn a_missing_remap_conf_is_not_an_unsaved_edit() {
+        let app = test_app();
+        assert_eq!(
+            app.conf_text, "# back = ctrl+c\n",
+            "the test app has its own text"
+        );
+        assert!(
+            app.unsaved_phrase().is_some(),
+            "an edited editor over a missing file is unsaved"
+        );
+        let mut fresh = test_app();
+        fresh.conf_text = DEFAULT_RULES.into();
+        assert_eq!(
+            fresh.unsaved_phrase(),
+            None,
+            "the starter text over a missing file is not"
+        );
+    }
+
+    /// The window's status line after `Msg::Applied` was delivered the way a download thread delivers it, and one frame.
+    fn status_after_applied(
+        r: Result<razerctl::update::Applied, razerctl::update::UpdateError>,
+    ) -> (String, bool) {
+        let mut app = test_app();
+        app.update.install = appimage();
+        app.update.stage(
+            Some(release()),
+            state(razerctl::update::Outcome::Available, None),
+            None,
+        );
+        app.update.deliver_applied(r);
+        let ctx = egui::Context::default();
+        app.update.tick(&ctx, false);
+        app.take_update_say();
+        (app.status.clone(), app.status_is_error)
+    }
+
+    /// DAN-1680 item 5: a failed update speaks in the status bar too, in the error colour, in the mockup's words.
+    #[test]
+    fn a_failed_update_puts_an_error_line_in_the_status_bar() {
+        use razerctl::update::{Applied, UpdateError};
+        let (s, err) = status_after_applied(Err(UpdateError::Mismatch {
+            expected: "aa".into(),
+            got: "bb".into(),
+        }));
+        assert!(err, "{s}");
+        assert_eq!(
+            s,
+            "Update not installed: the download didn't match its checksum. Nothing was changed."
+        );
+        let (s, err) = status_after_applied(Ok(Applied::Saved {
+            path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+            why: "not writable".into(),
+        }));
+        assert!(err, "{s}");
+        assert_eq!(
+            s,
+            "Update downloaded to /home/u/Downloads, but razerctl can't write to /home/u/Apps."
+        );
+        let (s, err) = status_after_applied(Err(UpdateError::MissingAsset("SHA256SUMS".into())));
+        assert!(err, "{s}");
+        assert_eq!(s, "Update not installed: the release has no SHA256SUMS.");
+        // a cancelled download is the user's own doing: nothing in the error colour
+        let (s, err) = status_after_applied(Err(UpdateError::Cancelled));
+        assert!(!err && s.is_empty(), "{s}");
+    }
+
+    /// DAN-1680 item 6: whatever the dialog shows, in a 780x560 window its box is inside the window.
+    #[test]
+    fn every_update_dialog_fits_a_780_by_560_window() {
+        use razerctl::update::{FetchError, InstallType, Stage, UpdateError};
+        use updater::Dialog;
+        let appimage_states = [
+            Dialog::Offer,
+            Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            }),
+            Dialog::Working(Stage::Verifying),
+            Dialog::Done {
+                path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
+                old: Some("/home/u/Apps/razerctl-0.2.0-x86_64.AppImage.old".into()),
+            },
+            Dialog::Saved {
+                path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+                why: "/home/u/Apps is not writable".into(),
+            },
+            Dialog::Failed(UpdateError::Mismatch {
+                expected: "3f9a6c0e5b7d1c2e8a4f90d6b7e31a5c0d2f4b8e6a91c3d7e5f20b4a8c6d21b1d"
+                    .into(),
+                got: "8c1d70aa42e9f3b5d6c8a0e17f4b29d3a5c6e8f1b2d4a7c9e0f3b5d8a1c694f0".into(),
+            }),
+            Dialog::Failed(UpdateError::Net(FetchError::Offline("no route".into()))),
+        ];
+        // (install type, dialog, with unsaved edits behind it): the unsaved callout makes the restart dialog taller
+        let mut cases: Vec<(InstallType, Dialog, bool)> = Vec::new();
+        for d in appimage_states {
+            for unsaved in [true, false] {
+                cases.push((appimage(), d.clone(), unsaved));
+            }
+        }
+        cases.push((InstallType::Tarball, Dialog::Offer, false));
+        cases.push((InstallType::Package, Dialog::Offer, false));
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(780.0, 560.0));
+        for mode in [Mode::Dark, Mode::Light] {
+            for (install, dialog, unsaved) in &cases {
+                let mut app = test_app();
+                if !unsaved {
+                    app.conf_text = DEFAULT_RULES.into();
+                }
+                app.update.install = install.clone();
+                app.update.stage(
+                    Some(release()),
+                    state(razerctl::update::Outcome::Available, None),
+                    Some(dialog.clone()),
+                );
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                app.pal = Pal::new(mode);
+                apply_style(&ctx, &app.pal);
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let mut got = None;
+                for _ in 0..3 {
+                    let mut out = ctx.run_ui(input.clone(), |ui| {
+                        let ctx = ui.ctx().clone();
+                        app.update_dialog(&ctx);
+                    });
+                    got = ctx.memory(|m| m.area_rect(egui::Id::new("update-dialog")));
+                    out.textures_delta.clear();
+                }
+                let r = got.expect("the dialog was drawn");
+                assert!(
+                    screen.contains_rect(r),
+                    "{install:?} {dialog:?} unsaved={unsaved} {mode:?}: dialog box {r:?} is outside the window {screen:?}"
+                );
+            }
+        }
     }
 }

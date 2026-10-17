@@ -291,3 +291,24 @@ says so.
   *AppIndicator and KStatusNotifierItem Support* extension. With no host, closing the window quits (the App tab says
   so and keeps your choice; the host is looked for again each time you close the window). A second `razerctl-gui`
   started while one is hidden in the tray is a second instance with its own icon.
+
+## Updates
+
+`razerctl-gui` asks GitHub once a day whether a newer release exists (one `GET /repos/Dromares/razerctl/releases/latest`,
+made in the background; the time of the last check is kept in `~/.config/razerctl/update.state`). It is **never silent
+and never automatic**: a newer release shows a banner under the header, *See what's new* opens the release notes, and
+nothing is downloaded until you press *Update*. Offline, rate limited or a 404 say nothing but the *Last check* line on
+the **App** tab, which also has the switch and a *Check now* button (a manual check skips the 24 hour limit). To turn the
+check off without the GUI, put `check_updates = false` in `~/.config/razerctl/gui.conf`.
+
+What an update does depends on how razerctl was installed:
+
+| Installed as | Default | Update |
+| --- | --- | --- |
+| AppImage (`$APPIMAGE` is set) | check on | *Update* downloads the new `.AppImage` and `SHA256SUMS`, verifies it, replaces the file in place and keeps the old one as `<name>.old`, then asks you to restart. A checksum mismatch refuses and changes nothing; a folder razerctl cannot write to ends with "downloaded to …" (the `XDG_DOWNLOAD_DIR` folder, else `$HOME`). |
+| Binary under `/usr/` (a package) | check **off** | Notify only, if you turn it on. razerctl never replaces files under `/usr`; update with your package manager. |
+| Anything else (tarball, `./install.sh`) | check on | Notify only, with a link to the release page. |
+
+The checksums come from the same GitHub release as the file, so the check catches a corrupt or truncated download, not a
+hijacked account. CLI: `razerctl update --check` makes one check and prints the answer; `razerctl update` shows what is
+new and, on an AppImage, asks `[y/N]` before it downloads anything. The CLI never checks on its own.

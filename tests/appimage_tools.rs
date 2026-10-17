@@ -1,8 +1,7 @@
 //! The AppImage tool pins (DAN-1627, DAN-1634): `examples/fetch_appimage_tools` is the only code that downloads them, so the
 //! hash check itself is tested here, and the README table must hold the same four values as the code.
 
-#[path = "../examples/fetch_appimage_tools/sha256.rs"]
-mod sha256;
+use razerctl::sha256;
 #[path = "../examples/fetch_appimage_tools/tools.rs"]
 mod tools;
 

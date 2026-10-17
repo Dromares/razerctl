@@ -217,6 +217,7 @@ pub fn apply(app: &mut App) {
             app.systemctl(&["restart", SERVICE]); // real systemctl --user call
         }
         n if n.starts_with("macro-") => macro_scenario(app, n),
+        n if n.starts_with("update-") => update_scenario(app, n),
         // the App tab of DAN-1452: tray found / no host / Quit selected; battery.conf and gui.conf are not touched
         n if n.starts_with("app") => {
             app.tab = Tab::App;
@@ -224,6 +225,7 @@ pub fn apply(app: &mut App) {
             app.settings = super::tray::Settings {
                 close_to_tray: n != "app-quit",
                 notified: true,
+                ..Default::default()
             };
             app.tray = Some(super::tray::Host::fake(n != "app-notray"));
             app.watching = true;
@@ -522,4 +524,191 @@ fn save_png(path: &std::path::Path, img: &egui::ColorImage) -> std::io::Result<(
     chunk(&mut out, b"IDAT", &z);
     chunk(&mut out, b"IEND", &[]);
     std::fs::write(path, out)
+}
+
+/// Synthetic release data for the update scenarios (DAN-1669). Nothing here is fetched, and no request is made: the
+/// updater is staged directly, with a path under `$HOME` so the panel prints it as `~/Applications/...`.
+const DEMO_RELEASE: &str = r#"{
+  "tag_name": "v0.3.0", "name": "razerctl v0.3.0", "draft": false, "prerelease": false,
+  "html_url": "https://github.com/Dromares/razerctl/releases/tag/v0.3.0",
+  "published_at": "2026-10-14T09:00:00Z",
+  "assets": [
+    {"name": "razerctl-0.3.0-x86_64.AppImage", "size": 14200000, "browser_download_url": "https://example.invalid/a"},
+    {"name": "SHA256SUMS", "size": 200, "browser_download_url": "https://example.invalid/s"}
+  ],
+  "body": "razerctl can now tell you when a new version is out.\n\n- Update check: the GUI asks GitHub once a day for the latest release. The switch is on the App tab, and check_updates = false in the config does the same.\n- AppImage: Update downloads the new file, checks it against SHA256SUMS and replaces the old one, which it keeps as .old.\n- CLI: razerctl update --check, and razerctl update (asks y/N first).\n- Release pages now carry an AppImage, a tarball, the udev rule on its own and SHA256SUMS.\n- Fixed: the Buttons tab no longer shows an old assignment after a failed save.\n- Fixed: Software remap kept the previous rules open after Revert.\n- Docs: install and update steps for the AUR package and the tarball.\n\nUpgrading from 0.2.0 needs no changes to remap.conf or macros.conf."
+}"#;
+
+/// `update-<state>` scenarios: the App tab in each state of the Updates panel, the banner, and each state of the dialog.
+/// Dialog and banner states sit over the Buttons tab with two unsaved edits behind them.
+fn update_scenario(app: &mut App, name: &str) {
+    use super::updater::Dialog;
+    use razerctl::update::{InstallType, Outcome, Release, Stage, State, UpdateError};
+    let now = razerctl::update::now_secs();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let appimage = InstallType::AppImage {
+        path: PathBuf::from(format!(
+            "{home}/Applications/razerctl-0.2.0-x86_64.AppImage"
+        )),
+    };
+    let rel = || Release::parse(DEMO_RELEASE).expect("demo release");
+    let checked = |outcome| State {
+        last_check: Some(now - 1800),
+        outcome: Some(outcome),
+        dismissed: None,
+    };
+    let state = name.trim_start_matches("update-");
+    let (install, release, st, dialog, tab_app) = match state {
+        "app" => (appimage, None, checked(Outcome::UpToDate), None, true),
+        "app-waiting" => (
+            appimage,
+            Some(rel()),
+            State {
+                dismissed: Some(now - 600),
+                ..checked(Outcome::Available)
+            },
+            None,
+            true,
+        ),
+        "app-off" => (appimage, None, State::default(), None, true),
+        "app-tarball" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::UpToDate),
+            None,
+            true,
+        ),
+        "app-offline" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::Offline),
+            None,
+            true,
+        ),
+        "app-rate" => (
+            InstallType::Tarball,
+            None,
+            checked(Outcome::RateLimited),
+            None,
+            true,
+        ),
+        "app-package" => (InstallType::Package, None, State::default(), None, true),
+        "banner" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            None,
+            false,
+        ),
+        "offer" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "offer-tarball" => (
+            InstallType::Tarball,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "offer-package" => (
+            InstallType::Package,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Offer),
+            false,
+        ),
+        "downloading" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            })),
+            false,
+        ),
+        "verifying" => (
+            appimage,
+            Some(rel()),
+            checked(Outcome::Available),
+            Some(Dialog::Working(Stage::Verifying)),
+            false,
+        ),
+        "done" | "done-unsaved" => {
+            let path = PathBuf::from(format!(
+                "{home}/Applications/razerctl-0.2.0-x86_64.AppImage"
+            ));
+            let old = Some(PathBuf::from(format!(
+                "{home}/Applications/razerctl-0.2.0-x86_64.AppImage.old"
+            )));
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Done { path, old }),
+                false,
+            )
+        }
+        "mismatch" => {
+            let e = UpdateError::Mismatch {
+                expected: "3f9a6c0e5b7d1c2e8a4f90d6b7e31a5c0d2f4b8e6a91c3d7e5f20b4a8c6d21b1d"
+                    .into(),
+                got: "8c1d70aa42e9f3b5d6c8a0e17f4b29d3a5c6e8f1b2d4a7c9e0f3b5d8a1c694f0".into(),
+            };
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Failed(e)),
+                false,
+            )
+        }
+        "saved" => {
+            let path = PathBuf::from(format!("{home}/Downloads/razerctl-0.3.0-x86_64.AppImage"));
+            let why = format!("{home}/Applications is not writable");
+            (
+                appimage,
+                Some(rel()),
+                checked(Outcome::Available),
+                Some(Dialog::Saved { path, why }),
+                false,
+            )
+        }
+        _ => return,
+    };
+    app.tab = if tab_app { Tab::App } else { Tab::Buttons };
+    app.service_state = "active".into();
+    // dialog and banner sit over the Buttons tab, with two unsaved edits behind them (not for `done`: its restart is clean)
+    if !tab_app && state != "done" && app.rows.len() > 5 {
+        app.rows[2].choice = choice("Double click");
+        app.rows[5].choice = choice("DPI cycle down");
+    }
+    app.settings.check_updates = match state {
+        "app-off" => Some(false),
+        _ => None,
+    };
+    app.settings.notified = true;
+    // no device here: without this, `start_watch` rewrites the status bar with "No Razer input devices found" every frame
+    app.watching = true;
+    // a failed update speaks through the same path as a real one: the line the updater would hand to the status bar
+    let outcome = match &dialog {
+        Some(Dialog::Failed(e)) => Some(Err(e.clone())),
+        Some(Dialog::Saved { path, why }) => Some(Ok(razerctl::update::Applied::Saved {
+            path: path.clone(),
+            why: why.clone(),
+        })),
+        _ => None,
+    };
+    app.update.say_err = outcome.and_then(|r| super::updater::applied_error_line(&install, &r));
+    app.update.install = install;
+    app.update.stage(release, st, dialog);
+    match state {
+        "done" | "done-unsaved" => app.ok("razerctl 0.3.0 is installed. Restart to use it."),
+        "app-package" => app.ok("Update check off. Updates come from your package manager."),
+        _ => {}
+    }
 }

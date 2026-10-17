@@ -1,6 +1,6 @@
 //! The pinned AppImage build tools and the fetch-check-place step (DAN-1627, DAN-1634).
 
-use super::sha256;
+use razerctl::sha256;
 use std::fs;
 use std::io;
 use std::os::unix::fs::PermissionsExt;
