@@ -14,6 +14,7 @@
 //! no serde. Every function takes its server as a [`Source`], so tests run against a local fixture.
 
 mod apply;
+pub mod cli;
 mod install;
 mod json;
 mod net;

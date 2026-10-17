@@ -7,7 +7,7 @@
 use razerctl::sha256;
 use razerctl::update::{
     apply_appimage, check, check_and_record, check_if_due, dismiss, pending_release, Applied, CheckResult, FetchError,
-    Outcome, Paths, Source, Stage, UpdateError, Version, INTERVAL_SECS,
+    InstallType, Outcome, Paths, Source, Stage, UpdateError, Version, INTERVAL_SECS,
 };
 use std::collections::HashMap;
 use std::io::{Read, Write};
@@ -461,4 +461,105 @@ fn asset_urls_must_be_https_unless_the_source_is_the_loopback_fixture() {
     let r = apply_appimage(&Source::github(), &rel, &target, &dir.path("dl"), &AtomicBool::new(false), &mut |_| {});
     assert!(matches!(&r, Err(UpdateError::Net(FetchError::Other(m))) if m.contains("non-https")), "{r:?}");
     assert_eq!(std::fs::read(&target).unwrap(), OLD);
+}
+
+// ------------------------------------------------------------------------------------------------ the CLI
+
+fn cli(fx: &Fixture, args: &[&str], install: &InstallType, answer: &str) -> (Result<(), String>, String) {
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let mut out = Vec::new();
+    let r = razerctl::update::cli::run(&args, &fx.src(), &v("0.2.0"), install, &mut answer.as_bytes(), &mut out);
+    (r, String::from_utf8(out).unwrap())
+}
+
+fn appimage_install(dir: &Dir) -> (InstallType, PathBuf) {
+    std::fs::create_dir_all(dir.path("apps")).unwrap();
+    let target = dir.path("apps/razerctl-0.2.0-x86_64.AppImage");
+    std::fs::write(&target, OLD).unwrap();
+    (InstallType::AppImage { path: target.clone() }, target)
+}
+
+#[test]
+fn update_check_makes_one_request_and_changes_nothing() {
+    let dir = Dir::new("cli-check");
+    let fx = Fixture::start();
+    fx.publish("v0.3.0", NEW, NEW);
+    let (install, target) = appimage_install(&dir);
+    let (res, out) = cli(&fx, &["--check"], &install, "y\n");
+    assert_eq!(res, Ok(()));
+    assert!(out.contains("razerctl 0.3.0 is available"), "{out}");
+    assert!(!out.contains("[y/N]"), "--check never asks");
+    assert_eq!(fx.requests(), [LATEST]);
+    assert_eq!(std::fs::read(&target).unwrap(), OLD);
+}
+
+#[test]
+fn update_asks_before_doing_anything_and_n_changes_nothing() {
+    let dir = Dir::new("cli-no");
+    let fx = Fixture::start();
+    fx.publish("v0.3.0", NEW, NEW);
+    let (install, target) = appimage_install(&dir);
+    for answer in ["n\n", "\n", "", "later\n"] {
+        let (res, out) = cli(&fx, &[], &install, answer);
+        assert_eq!(res, Ok(()));
+        assert!(out.contains("[y/N]") && out.contains("Nothing was changed."), "{out}");
+        assert!(out.contains("- fixed a thing"), "the notes come before the question");
+        assert_eq!(std::fs::read(&target).unwrap(), OLD, "answer {answer:?}");
+    }
+    assert!(
+        fx.requests().iter().all(|h| h == LATEST),
+        "nothing was downloaded without a yes: {:?}",
+        fx.requests()
+    );
+}
+
+#[test]
+fn update_with_a_yes_downloads_verifies_and_replaces() {
+    let dir = Dir::new("cli-yes");
+    let fx = Fixture::start();
+    fx.publish("v0.3.0", NEW, NEW);
+    let (install, target) = appimage_install(&dir);
+    let (res, out) = cli(&fx, &[], &install, "y\n");
+    assert_eq!(res, Ok(()));
+    assert!(out.contains("is installed at") && out.contains("Restart razerctl"), "{out}");
+    assert_eq!(std::fs::read(&target).unwrap(), NEW);
+    assert_eq!(std::fs::read(dir.path("apps/razerctl-0.2.0-x86_64.AppImage.old")).unwrap(), OLD);
+}
+
+#[test]
+fn update_with_a_yes_and_a_bad_checksum_fails_and_keeps_the_file() {
+    let dir = Dir::new("cli-bad");
+    let fx = Fixture::start();
+    fx.publish("v0.3.0", NEW, b"some other file");
+    let (install, target) = appimage_install(&dir);
+    let (res, _) = cli(&fx, &[], &install, "y\n");
+    assert!(res.unwrap_err().contains("does not match SHA256SUMS"));
+    assert_eq!(std::fs::read(&target).unwrap(), OLD);
+    assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"]);
+}
+
+#[test]
+fn package_and_tarball_installs_are_told_where_and_never_asked() {
+    let fx = Fixture::start();
+    fx.publish("v0.3.0", NEW, NEW);
+    let (res, out) = cli(&fx, &[], &InstallType::Package, "y\n");
+    assert_eq!(res, Ok(()));
+    assert!(out.contains("package manager") && !out.contains("[y/N]"), "{out}");
+    let (res, out) = cli(&fx, &[], &InstallType::Tarball, "y\n");
+    assert_eq!(res, Ok(()));
+    assert!(out.contains("releases/tag/v0.3.0") && !out.contains("[y/N]"), "{out}");
+    assert!(fx.requests().iter().all(|h| h == LATEST), "neither downloads: {:?}", fx.requests());
+}
+
+#[test]
+fn update_says_when_it_is_current_and_why_a_check_failed() {
+    let fx = Fixture::start();
+    fx.publish("v0.2.0", NEW, NEW);
+    let (res, out) = cli(&fx, &["--check"], &InstallType::Tarball, "");
+    assert_eq!(res, Ok(()));
+    assert!(out.contains("up to date"), "{out}");
+    let down = Fixture::start();
+    let (res, _) = cli(&down, &["--check"], &InstallType::Tarball, "");
+    assert!(res.unwrap_err().contains("couldn't check for updates"), "an explicit check does say why");
+    assert!(cli(&fx, &["--bogus"], &InstallType::Tarball, "").0.is_err());
 }
