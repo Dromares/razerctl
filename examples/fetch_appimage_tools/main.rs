@@ -11,7 +11,6 @@
 //! source and gets a `.zsync`, DAN-1668) and then replaces itself with the given command. On a mismatch it prints the expected
 //! and the received hash, deletes the part file and exits 1 before anything is built. Dev-time only, like `gen_icons`.
 
-mod sha256;
 mod tools;
 
 use std::os::unix::process::CommandExt;
