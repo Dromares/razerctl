@@ -15,3 +15,33 @@ ksni = { version = "0.3", default-features = false, features = ["async-io", "blo
 [profile.release]
 lto = true
 strip = true
+
+# AppImage: `cargo install cargo-packager --locked`, then `cargo build --release --locked && cargo packager --release --formats appimage`
+# (see README, "AppImage"). razerctl-gui is the entry point; the CLI rides along in usr/bin.
+[package.metadata.packager]
+product-name = "razerctl"
+identifier = "io.github.dromares.razerctl"
+version = "0.2.0"
+description = "Razer mouse control for Linux: onboard button remapping, DPI, polling rate and battery"
+authors = ["Dromares"]
+license-file = "LICENSE"
+category = "Utility"
+homepage = "https://github.com/Dromares/razerctl"
+out-dir = "target/packager"
+binaries-dir = "target/release"
+binaries = [
+    { path = "razerctl-gui", main = true },
+    { path = "razerctl" },
+]
+icons = ["packaging/razerctl.png"]
+formats = ["appimage"]
+
+# The desktop entry is packaging/razerctl.desktop verbatim (the packager would otherwise generate one named
+# after the main binary, with Icon=razerctl-gui). Its Icon=razerctl is satisfied by the two icon files below.
+[package.metadata.packager.linux]
+generate-desktop-entry = false
+
+[package.metadata.packager.appimage]
+files = { "packaging/razerctl.desktop" = "usr/share/applications/razerctl-gui.desktop", "packaging/razerctl.png" = "usr/share/icons/hicolor/256x256/apps/razerctl.png", "packaging/razerctl.svg" = "usr/share/icons/hicolor/scalable/apps/razerctl.svg" }
+# razerctl-gui loads these at run time (dlopen). They must come from the host's drivers, never from the build base.
+excluded-libraries = ["libGL*", "libGLX*", "libGLdispatch*", "libOpenGL*", "libEGL*", "libGLESv2*", "libgbm*", "libdrm*", "libvulkan*", "libwayland-*", "libX11*", "libXcursor*", "libXi*", "libXrandr*", "libxcb*", "libxkbcommon*"]
