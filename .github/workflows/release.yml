@@ -1,0 +1,65 @@
+name: Release
+
+# Builds the five release assets from a `v*` tag and uploads them to a DRAFT release; a person reviews and publishes it.
+# Never runs on a pull request. `workflow_dispatch` is for re-running a tag that failed part-way: pick the tag as the ref.
+# Not exercised on hosted runners yet (DAN-1668); the steps were run by hand in an Ubuntu 22.04 root filesystem.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # gh release create
+
+jobs:
+  release:
+    # Pinned: the AppImage needs glibc 2.35 or newer, and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19.
+    runs-on: ubuntu-22.04
+    env:
+      TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: System libraries (GUI build and AppImage tools)
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libudev-dev patchelf file desktop-file-utils squashfs-tools zsync
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Release notes (fails unless the tag is v + the Cargo.toml version)
+        run: |
+          mkdir -p dist
+          cargo run --release --locked --example release_notes -- "$TAG" > target/release-notes.md
+      - name: Build, lint, test
+        run: |
+          cargo build --release --locked
+          cargo clippy --release --locked
+          cargo test --release --locked
+      - name: AppImage and .zsync
+        run: |
+          VER=${TAG#v}
+          cargo install cargo-packager --locked --version 0.11.8
+          cargo run --release --locked --example fetch_appimage_tools -- cargo packager --release --formats appimage
+          cp "target/packager/razerctl-gui_${VER}_x86_64.AppImage" "dist/razerctl-${VER}-x86_64.AppImage"
+          # appimagetool -u embedded the update info and left a .zsync beside the build, but that one names the packager's
+          # razerctl-gui_<ver>_x86_64.AppImage and the asset is renamed, so make the .zsync again for the name it is published under.
+          cd dist
+          zsyncmake -u "razerctl-${VER}-x86_64.AppImage" -o "razerctl-${VER}-x86_64.AppImage.zsync" "razerctl-${VER}-x86_64.AppImage"
+      - name: Tarball, udev rule, SHA256SUMS
+        run: |
+          VER=${TAG#v}
+          DIR="razerctl-${VER}-x86_64-linux"
+          mkdir -p "target/tarball/$DIR/icons" "target/tarball/$DIR/systemd"
+          install -m755 target/release/razerctl target/release/razerctl-gui "target/tarball/$DIR/"
+          install -m644 udev/70-razerctl.rules packaging/razerctl.desktop packaging/razerctl.svg packaging/razerctl.png LICENSE README.md "target/tarball/$DIR/"
+          install -m644 packaging/icons/razerctl-*symbolic.svg "target/tarball/$DIR/icons/"
+          install -m644 systemd/razerctl-remap.service systemd/razerctl-battery.service "target/tarball/$DIR/systemd/"
+          tar --sort=name --owner=0 --group=0 --numeric-owner -C target/tarball -czf "dist/$DIR.tar.gz" "$DIR"
+          cp udev/70-razerctl.rules dist/
+          cd dist
+          sha256sum "razerctl-${VER}-x86_64.AppImage" "razerctl-${VER}-x86_64.AppImage.zsync" "$DIR.tar.gz" 70-razerctl.rules > SHA256SUMS
+          sha256sum -c SHA256SUMS
+      - name: Draft release
+        run: |
+          case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
+          gh release create "$TAG" dist/* --draft --verify-tag $PRE --title "razerctl ${TAG#v}" --notes-file target/release-notes.md
