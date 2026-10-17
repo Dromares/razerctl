@@ -28,7 +28,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Release notes (fails unless the tag is v + the Cargo.toml version)
         run: |
-          mkdir -p dist
+          mkdir -p dist target
           cargo run --release --locked --example release_notes -- "$TAG" > target/release-notes.md
       - name: Build, lint, test
         run: |
