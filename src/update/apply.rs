@@ -173,6 +173,10 @@ pub fn apply_appimage(
         let _ = fs::remove_file(&staged);
         return Err(UpdateError::Mismatch { expected, got });
     }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = fs::remove_file(&staged);
+        return Err(UpdateError::Cancelled);
+    }
     fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(|e| io_err(&staged, e))?;
 
     if in_place {

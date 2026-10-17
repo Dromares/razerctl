@@ -563,3 +563,18 @@ fn update_says_when_it_is_current_and_why_a_check_failed() {
     assert!(res.unwrap_err().contains("couldn't check for updates"), "an explicit check does say why");
     assert!(cli(&fx, &["--bogus"], &InstallType::Tarball, "").0.is_err());
 }
+
+#[test]
+fn cancel_while_verifying_deletes_the_download_and_replaces_nothing() {
+    let dir = Dir::new("cancel-verify");
+    let (fx, rel, target) = setup(NEW, &dir);
+    let cancel = AtomicBool::new(false);
+    let r = apply_appimage(&fx.src(), &rel, &target, &dir.path("dl"), &cancel, &mut |s| {
+        if s == Stage::Verifying {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+    assert_eq!(r, Err(UpdateError::Cancelled));
+    assert_eq!(dir.names("apps"), ["razerctl-0.2.0-x86_64.AppImage"], "no .part, no .old");
+    assert_eq!(std::fs::read(&target).unwrap(), OLD);
+}
