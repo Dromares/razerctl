@@ -7,7 +7,8 @@
 //! `${XDG_CACHE_HOME:-~/.cache}/.cargo-packager/AppImage/` only when they are missing, and never checks them. The plugin runs
 //! appimagetool, which downloads type2-runtime `continuous` unless `LDAI_RUNTIME_FILE` names one. This downloads each file to a
 //! `.part`, checks its sha256, moves it into place only on a match, copies the packager's three into its tools directory, sets
-//! `LDAI_RUNTIME_FILE` to the checked runtime and then replaces itself with the given command. On a mismatch it prints the expected
+//! `LDAI_RUNTIME_FILE` to the checked runtime, `LDAI_UPDATE_INFORMATION` to `tools::UPDATE_INFO` (the image embeds its update
+//! source and gets a `.zsync`, DAN-1668) and then replaces itself with the given command. On a mismatch it prints the expected
 //! and the received hash, deletes the part file and exits 1 before anything is built. Dev-time only, like `gen_icons`.
 
 mod sha256;
@@ -46,6 +47,7 @@ fn main() {
         let err = Command::new(&prog)
             .args(cmd)
             .env("LDAI_RUNTIME_FILE", &runtime)
+            .env("LDAI_UPDATE_INFORMATION", tools::UPDATE_INFO)
             .exec();
         eprintln!(
             "fetch_appimage_tools: cannot run {}: {err}",

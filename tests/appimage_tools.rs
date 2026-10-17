@@ -163,3 +163,31 @@ fn every_pinned_url_is_the_x86_64_file() {
         assert_eq!(pin.sha256.len(), 64, "{}", pin.name);
     }
 }
+
+#[test]
+fn update_info_points_at_this_repos_zsync_asset() {
+    // appimagetool `-u` takes `gh-releases-zsync|owner|repo|release|asset-glob`; the release workflow publishes
+    // `razerctl-<version>-x86_64.AppImage.zsync` (DAN-1668), and owner and repo must be the ones in Cargo.toml.
+    let cargo =
+        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml")).unwrap();
+    let repo = cargo
+        .lines()
+        .find_map(|l| l.strip_prefix("repository = \"https://github.com/"))
+        .and_then(|r| r.strip_suffix('"'))
+        .expect("repository in Cargo.toml");
+    let (owner, name) = repo.split_once('/').unwrap();
+    assert_eq!(
+        tools::UPDATE_INFO,
+        format!("gh-releases-zsync|{owner}|{name}|latest|razerctl-*-x86_64.AppImage.zsync")
+    );
+}
+
+#[test]
+fn the_example_hands_the_update_info_to_the_command_it_runs() {
+    // The constant alone embeds nothing: appimagetool reads it from the environment of the command `main` execs.
+    let main = std::fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/fetch_appimage_tools/main.rs"),
+    )
+    .unwrap();
+    assert!(main.contains(r#".env("LDAI_UPDATE_INFORMATION", tools::UPDATE_INFO)"#));
+}
