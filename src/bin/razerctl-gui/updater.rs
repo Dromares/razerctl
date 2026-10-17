@@ -62,6 +62,8 @@ pub struct Updater {
     cancel: Arc<AtomicBool>,
     /// Set by the Check now button: the answer is told in the status bar (an automatic check says nothing).
     pub say: Option<String>,
+    /// A failed update, told in the status bar in the error colour as well as in the dialog (DAN-1680).
+    pub say_err: Option<String>,
 }
 
 impl Updater {
@@ -91,7 +93,16 @@ impl Updater {
             last_eval: None,
             cancel: Arc::new(AtomicBool::new(false)),
             say: None,
+            say_err: None,
         }
+    }
+
+    /// Test hook: hand over what a download thread would send when it finishes.
+    #[cfg(test)]
+    pub fn deliver_applied(&mut self, r: Result<Applied, UpdateError>) {
+        let (tx, rx) = channel();
+        tx.send(Msg::Applied(r)).unwrap();
+        self.rx = Some(rx);
     }
 
     /// Demo and test hook: put the updater in a given state without any request.
@@ -126,6 +137,7 @@ impl Updater {
                     }
                 }
                 Msg::Applied(r) => {
+                    self.say_err = applied_error_line(&self.install, &r);
                     self.dialog = Some(match r {
                         Ok(Applied::Replaced { path, old }) => Dialog::Done { path, old },
                         Ok(Applied::Saved { path, why }) => Dialog::Saved { path, why },
@@ -231,16 +243,50 @@ fn install_name(i: &InstallType) -> &'static str {
     }
 }
 
-/// Where this copy lives, as the user would type it: `$HOME` shown as `~`.
-fn location(install: &InstallType) -> String {
-    let path = match install {
-        InstallType::AppImage { path } => path.clone(),
-        _ => std::env::current_exe().unwrap_or_default(),
-    };
+/// A path as the user would type it: `$HOME` shown as `~`.
+fn tilde(path: &std::path::Path) -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix(&home) {
         Ok(rest) if !home.is_empty() => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
+    }
+}
+
+/// Where this copy lives, as the user would type it.
+fn location(install: &InstallType) -> String {
+    tilde(&match install {
+        InstallType::AppImage { path } => path.clone(),
+        _ => std::env::current_exe().unwrap_or_default(),
+    })
+}
+
+/// The status-bar line for an update that did not end in a replaced file, in the words of the DAN-1667 mockup. A
+/// cancelled download is the user's own doing and says nothing.
+pub fn applied_error_line(
+    install: &InstallType,
+    r: &Result<Applied, UpdateError>,
+) -> Option<String> {
+    let dir = |p: &std::path::Path| tilde(p.parent().unwrap_or(p));
+    match r {
+        Ok(Applied::Replaced { .. }) | Err(UpdateError::Cancelled) => None,
+        Ok(Applied::Saved { path, .. }) => {
+            let target = match install {
+                InstallType::AppImage { path } => dir(path),
+                _ => "where it is".into(),
+            };
+            Some(format!(
+                "Update downloaded to {}, but razerctl can't write to {target}.",
+                dir(path)
+            ))
+        }
+        Err(UpdateError::Mismatch { .. }) => Some(
+            "Update not installed: the download didn't match its checksum. Nothing was changed."
+                .into(),
+        ),
+        Err(e) => Some(format!(
+            "Update not installed: {}.",
+            e.to_string().trim_end_matches('.')
+        )),
     }
 }
 
@@ -873,7 +919,7 @@ fn version_row(ui: &mut Ui, p: &Pal, from: &Version, to: &Version, right: &str) 
     });
 }
 
-fn changelog_box(ui: &mut Ui, p: &Pal, rel: &Release, h: f32) {
+fn changelog_box(ui: &mut Ui, p: &Pal, rel: &Release, h: f32, source_line: bool) {
     ui.label(caps(p, &format!("What's new in {}", rel.version)));
     ui.add_space(S1);
     let notes = rel.notes_text();
@@ -929,12 +975,14 @@ fn changelog_box(ui: &mut Ui, p: &Pal, rel: &Release, h: f32) {
                     }
                 });
         });
-    ui.add_space(S1);
-    ui.label(
-        RichText::new("Plain text from the CHANGELOG.md section for this release.")
-            .font(mono(T_MICRO))
-            .color(p.i65()),
-    );
+    if source_line {
+        ui.add_space(S1);
+        ui.label(
+            RichText::new("Plain text from the CHANGELOG.md section for this release.")
+                .font(mono(T_MICRO))
+                .color(p.i65()),
+        );
+    }
 }
 
 /// Fixed-height stand-in for the changelog while the dialog is working, so the dialog does not change size under the cursor.
@@ -1022,7 +1070,9 @@ fn dialog_body(
             }
             version_row(ui, p, cur, new, &right);
             ui.add_space(S3);
-            changelog_box(ui, p, rel, log_h);
+            // the package offer is the tallest: in a short window it drops the source line and the footer note
+            let slim = compact && matches!(inst, InstallType::Package);
+            changelog_box(ui, p, rel, if slim { log_h - 16.0 } else { log_h }, !slim);
             ui.add_space(S3);
             match inst {
                 InstallType::AppImage { .. } => small(ui, p, &format!(
@@ -1031,7 +1081,7 @@ fn dialog_body(
                 InstallType::Tarball => small(ui, p, "razerctl was installed from a tarball or with install.sh, so you update it by hand. The release page has the new files and the install steps."),
                 InstallType::Package => {
                     small(ui, p, &format!("razerctl was installed by your package manager, so it is updated there, not here. If the package still shows {cur}, the release has not reached it yet: try again in a day."));
-                    ui.add_space(S2);
+                    ui.add_space(if slim { S1 } else { S2 });
                     code_block(ui, p, &[("", "yay -Syu"), ("", "paru -Syu")]);
                 }
             }
@@ -1052,7 +1102,11 @@ fn dialog_body(
                         o.close = btn(ui, p, "Close", Kind::Primary, true).clicked()
                     }
                 },
-                "razerctl asks once a day. Turn this off on the App tab.",
+                if slim {
+                    ""
+                } else {
+                    "razerctl asks once a day. Turn this off on the App tab."
+                },
             );
         }
         Dialog::Working(stage) => {
@@ -1109,6 +1163,8 @@ fn dialog_body(
                     p,
                     if downloading {
                         "The window stays usable while this runs. Cancel deletes the partial download."
+                    } else if compact {
+                        "Nothing has been replaced yet."
                     } else {
                         "The window stays usable while razerctl checks the file. Nothing has been replaced yet."
                     },

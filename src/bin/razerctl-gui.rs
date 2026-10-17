@@ -1750,6 +1750,16 @@ impl App {
     }
 
     /// The update dialog, over whatever tab is showing. *Restart now* quits; `main` then starts the new file.
+    /// What the updater wants said in the status bar: the answer to Check now, or why an update was not installed.
+    fn take_update_say(&mut self) {
+        if let Some(s) = self.update.say.take() {
+            self.ok(s);
+        }
+        if let Some(s) = self.update.say_err.take() {
+            self.err(s);
+        }
+    }
+
     fn update_dialog(&mut self, ctx: &egui::Context) {
         let p = self.pal;
         let unsaved = matches!(self.update.dialog, Some(updater::Dialog::Done { .. }))
@@ -2311,9 +2321,7 @@ impl eframe::App for App {
         self.start_watch(&ctx);
         let updates_on = self.updates_enabled();
         self.update.tick(&ctx, updates_on);
-        if let Some(s) = self.update.say.take() {
-            self.ok(s);
-        }
+        self.take_update_say();
         let mode = self
             .demo
             .theme
@@ -4544,5 +4552,128 @@ mod tests {
             None,
             "the starter text over a missing file is not"
         );
+    }
+
+    /// The window's status line after `Msg::Applied` was delivered the way a download thread delivers it, and one frame.
+    fn status_after_applied(
+        r: Result<razerctl::update::Applied, razerctl::update::UpdateError>,
+    ) -> (String, bool) {
+        let mut app = test_app();
+        app.update.install = appimage();
+        app.update.stage(
+            Some(release()),
+            state(razerctl::update::Outcome::Available, None),
+            None,
+        );
+        app.update.deliver_applied(r);
+        let ctx = egui::Context::default();
+        app.update.tick(&ctx, false);
+        app.take_update_say();
+        (app.status.clone(), app.status_is_error)
+    }
+
+    /// DAN-1680 item 5: a failed update speaks in the status bar too, in the error colour, in the mockup's words.
+    #[test]
+    fn a_failed_update_puts_an_error_line_in_the_status_bar() {
+        use razerctl::update::{Applied, UpdateError};
+        let (s, err) = status_after_applied(Err(UpdateError::Mismatch {
+            expected: "aa".into(),
+            got: "bb".into(),
+        }));
+        assert!(err, "{s}");
+        assert_eq!(
+            s,
+            "Update not installed: the download didn't match its checksum. Nothing was changed."
+        );
+        let (s, err) = status_after_applied(Ok(Applied::Saved {
+            path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+            why: "not writable".into(),
+        }));
+        assert!(err, "{s}");
+        assert_eq!(
+            s,
+            "Update downloaded to /home/u/Downloads, but razerctl can't write to /home/u/Apps."
+        );
+        let (s, err) = status_after_applied(Err(UpdateError::MissingAsset("SHA256SUMS".into())));
+        assert!(err, "{s}");
+        assert_eq!(s, "Update not installed: the release has no SHA256SUMS.");
+        // a cancelled download is the user's own doing: nothing in the error colour
+        let (s, err) = status_after_applied(Err(UpdateError::Cancelled));
+        assert!(!err && s.is_empty(), "{s}");
+    }
+
+    /// DAN-1680 item 6: whatever the dialog shows, in a 780x560 window its box is inside the window.
+    #[test]
+    fn every_update_dialog_fits_a_780_by_560_window() {
+        use razerctl::update::{FetchError, InstallType, Stage, UpdateError};
+        use updater::Dialog;
+        let appimage_states = [
+            Dialog::Offer,
+            Dialog::Working(Stage::Downloading {
+                done: 9_400_000,
+                total: 14_200_000,
+            }),
+            Dialog::Working(Stage::Verifying),
+            Dialog::Done {
+                path: "/home/u/Apps/razerctl-0.2.0-x86_64.AppImage".into(),
+                old: Some("/home/u/Apps/razerctl-0.2.0-x86_64.AppImage.old".into()),
+            },
+            Dialog::Saved {
+                path: "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage".into(),
+                why: "/home/u/Apps is not writable".into(),
+            },
+            Dialog::Failed(UpdateError::Mismatch {
+                expected: "3f9a6c0e5b7d1c2e8a4f90d6b7e31a5c0d2f4b8e6a91c3d7e5f20b4a8c6d21b1d"
+                    .into(),
+                got: "8c1d70aa42e9f3b5d6c8a0e17f4b29d3a5c6e8f1b2d4a7c9e0f3b5d8a1c694f0".into(),
+            }),
+            Dialog::Failed(UpdateError::Net(FetchError::Offline("no route".into()))),
+        ];
+        // (install type, dialog, with unsaved edits behind it): the unsaved callout makes the restart dialog taller
+        let mut cases: Vec<(InstallType, Dialog, bool)> = Vec::new();
+        for d in appimage_states {
+            for unsaved in [true, false] {
+                cases.push((appimage(), d.clone(), unsaved));
+            }
+        }
+        cases.push((InstallType::Tarball, Dialog::Offer, false));
+        cases.push((InstallType::Package, Dialog::Offer, false));
+        let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(780.0, 560.0));
+        for mode in [Mode::Dark, Mode::Light] {
+            for (install, dialog, unsaved) in &cases {
+                let mut app = test_app();
+                if !unsaved {
+                    app.conf_text = DEFAULT_RULES.into();
+                }
+                app.update.install = install.clone();
+                app.update.stage(
+                    Some(release()),
+                    state(razerctl::update::Outcome::Available, None),
+                    Some(dialog.clone()),
+                );
+                let ctx = egui::Context::default();
+                install_fonts(&ctx);
+                app.pal = Pal::new(mode);
+                apply_style(&ctx, &app.pal);
+                let input = egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                };
+                let mut got = None;
+                for _ in 0..3 {
+                    let mut out = ctx.run_ui(input.clone(), |ui| {
+                        let ctx = ui.ctx().clone();
+                        app.update_dialog(&ctx);
+                    });
+                    got = ctx.memory(|m| m.area_rect(egui::Id::new("update-dialog")));
+                    out.textures_delta.clear();
+                }
+                let r = got.expect("the dialog was drawn");
+                assert!(
+                    screen.contains_rect(r),
+                    "{install:?} {dialog:?} unsaved={unsaved} {mode:?}: dialog box {r:?} is outside the window {screen:?}"
+                );
+            }
+        }
     }
 }

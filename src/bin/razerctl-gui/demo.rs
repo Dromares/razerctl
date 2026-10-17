@@ -692,20 +692,21 @@ fn update_scenario(app: &mut App, name: &str) {
         _ => None,
     };
     app.settings.notified = true;
-    app.update.install = install;
-    app.update.stage(release, st, dialog);
-    let msg = match state {
-        "mismatch" => Some(
-            "Update not installed: the download didn't match its checksum. Nothing was changed.",
-        ),
-        "saved" => Some("Update downloaded, but razerctl can't replace itself where it is."),
-        "done" | "done-unsaved" => Some("razerctl 0.3.0 is installed. Restart to use it."),
-        "app-package" => Some("Update check off. Updates come from your package manager."),
+    // a failed update speaks through the same path as a real one: the line the updater would hand to the status bar
+    let outcome = match &dialog {
+        Some(Dialog::Failed(e)) => Some(Err(e.clone())),
+        Some(Dialog::Saved { path, why }) => Some(Ok(razerctl::update::Applied::Saved {
+            path: path.clone(),
+            why: why.clone(),
+        })),
         _ => None,
     };
-    match msg {
-        Some(m) if matches!(state, "mismatch" | "saved") => app.err(m),
-        Some(m) => app.ok(m),
-        None => {}
+    app.update.say_err = outcome.and_then(|r| super::updater::applied_error_line(&install, &r));
+    app.update.install = install;
+    app.update.stage(release, st, dialog);
+    match state {
+        "done" | "done-unsaved" => app.ok("razerctl 0.3.0 is installed. Restart to use it."),
+        "app-package" => app.ok("Update check off. Updates come from your package manager."),
+        _ => {}
     }
 }
