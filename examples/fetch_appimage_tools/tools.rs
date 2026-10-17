@@ -79,14 +79,14 @@ pub fn fetch_verified(url: &str, dest: &Path, want: &str) -> Result<(), String> 
         .status()
         .map_err(|e| format!("cannot run curl: {e}"))?;
     let result = if !curl.success() {
-        Err(format!("curl failed for {url} ({curl})"))
+        Err(format!("{name}: curl failed for {url} ({curl})"))
     } else {
         match sha256_of(&part) {
             Ok(got) if got == want => Ok(()),
             Ok(got) => Err(format!(
                 "{name} does not match the pinned sha256\n  expected {want}\n  got      {got}"
             )),
-            Err(e) => Err(format!("cannot read {}: {e}", part.display())),
+            Err(e) => Err(format!("{name}: cannot read {}: {e}", part.display())),
         }
     };
     match result {
@@ -105,7 +105,7 @@ pub fn prepare(pins: &[Pin], dl: &Path, tools: &Path) -> Result<std::path::PathB
     fs::create_dir_all(tools).map_err(|e| format!("{}: {e}", tools.display()))?;
     for pin in pins {
         let path = dl.join(pin.name);
-        fetch_verified(pin.url, &path, pin.sha256).map_err(|e| format!("{}: {e}", pin.name))?;
+        fetch_verified(pin.url, &path, pin.sha256)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
