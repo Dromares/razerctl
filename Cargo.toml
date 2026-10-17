@@ -16,12 +16,13 @@ ksni = { version = "0.3", default-features = false, features = ["async-io", "blo
 lto = true
 strip = true
 
-# AppImage: `cargo install cargo-packager --locked`, then `cargo build --release --locked && cargo packager --release --formats appimage`
-# (see README, "AppImage"). razerctl-gui is the entry point; the CLI rides along in usr/bin.
+# AppImage: `cargo install cargo-packager --locked --version 0.11.8`, then
+# `cargo build --release --locked && packaging/fetch-appimage-tools.sh cargo packager --release --formats appimage` (see README,
+# "AppImage"). razerctl-gui is the entry point; the CLI rides along in usr/bin. The version is [package].version: the packager
+# fills it in when omitted (cargo-packager src/cli/config.rs), so it is not repeated here.
 [package.metadata.packager]
 product-name = "razerctl"
 identifier = "io.github.dromares.razerctl"
-version = "0.2.0"
 description = "Razer mouse control for Linux: onboard button remapping, DPI, polling rate and battery"
 authors = ["Dromares"]
 license-file = "LICENSE"
