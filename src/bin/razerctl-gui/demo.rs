@@ -692,6 +692,8 @@ fn update_scenario(app: &mut App, name: &str) {
         _ => None,
     };
     app.settings.notified = true;
+    // no device here: without this, `start_watch` rewrites the status bar with "No Razer input devices found" every frame
+    app.watching = true;
     // a failed update speaks through the same path as a real one: the line the updater would hand to the status bar
     let outcome = match &dialog {
         Some(Dialog::Failed(e)) => Some(Err(e.clone())),
