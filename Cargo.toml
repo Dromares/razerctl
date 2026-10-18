@@ -1,6 +1,6 @@
 [package]
 name = "razerctl"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "Linux rewrite of the Razer Synapse device-control core (Protocol25 over hidraw / OpenRazer sysfs)"
 license = "MIT"
