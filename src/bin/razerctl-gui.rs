@@ -4424,13 +4424,7 @@ mod tests {
             (
                 InstallType::Package,
                 vec!["CLOSE"],
-                vec![
-                    "UPDATE",
-                    "NOT NOW",
-                    "OPEN RELEASE PAGE",
-                    "yay -Syu",
-                    "paru -Syu",
-                ],
+                vec!["UPDATE", "NOT NOW", "OPEN RELEASE PAGE"],
             ),
         ] {
             app.update.install = install.clone();

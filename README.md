@@ -12,18 +12,6 @@ Pick one format. Every one needs the [udev rule](#the-udev-rule) once, because o
 
 Prebuilt downloads are on the [releases page](https://github.com/Dromares/razerctl/releases/latest); building from source is optional.
 
-### Arch / CachyOS (AUR)
-
-```
-yay -S razerctl-bin          # or: paru -S razerctl-bin
-```
-
-`razerctl-bin` is **not on the AUR yet**, so this command will not work until the package is published; use the AppImage or tarball below meanwhile.
-
-Installs the prebuilt release to `/usr/bin` and the udev rule to `/usr/lib/udev/rules.d/`. It conflicts with, and
-provides, `razerctl`. The package's install message repeats the replug step below. (Package recipe:
-[packaging/aur/razerctl-bin](packaging/aur/razerctl-bin); the AUR page goes live when the owner submits it.)
-
 ### AppImage
 
 Download `razerctl-X.Y.Z-x86_64.AppImage` from the [latest release](https://github.com/Dromares/razerctl/releases/latest), then:
@@ -68,7 +56,7 @@ cd packaging && makepkg -si
 
 razerctl reads and writes the mouse through `hidraw` and `/dev/input`, which only root can open by default.
 `udev/70-razerctl.rules` grants the logged-in user access to Razer (USB vendor `1532`) devices. Each format installs it
-as shown above (the AUR package, `install.sh` and the tarball steps put it in place; the AppImage needs the one `sudo`
+as shown above (`install.sh`, the `packaging/PKGBUILD` build and the tarball steps put it in place; the AppImage needs the one `sudo`
 line). udev applies a rule when a device is plugged in, so after installing it **unplug and replug the mouse**; that
 is the fallback that always works. `sudo udevadm control --reload && sudo udevadm trigger` should apply it without a
 replug, but that has not been tested on every desktop, so replug if the GUI still reports no access.
@@ -77,7 +65,7 @@ replug, but that has not been tested on every desktop, so replug if the GUI stil
 
 | Installed with | How it updates |
 |---|---|
-| Package (files under `/usr/`) | Through the package manager that installed it. Once the board has pushed the `razerctl-bin` recipe to the AUR, that is `yay -Syu` / `paru -Syu`, with the rest of the system. The recipe in [packaging/aur/razerctl-bin](packaging/aur/razerctl-bin) is **not on the AUR yet**, so for now there is nothing to update this way. |
+| Package (files under `/usr/`) | Through the package manager that installed it, with the rest of the system. For the local build from `packaging/PKGBUILD` (`makepkg -si`), rebuild and reinstall the package from a newer checkout. razerctl never replaces files under `/usr`. |
 | AppImage | The in-app update check shows the new version and its changelog and only updates after you confirm. [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate), Gear Lever and AppImageLauncher also work, using the release's `.zsync` file. |
 | Tarball / `install.sh` | The in-app check only tells you a newer release exists; repeat the install steps with the new tarball (for `install.sh`, `git pull` and run it again). |
 
