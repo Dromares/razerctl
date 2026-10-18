@@ -18,6 +18,6 @@ pkgbase = razerctl-bin
 	provides = razerctl
 	conflicts = razerctl
 	source = razerctl-0.3.0-x86_64-linux.tar.gz::https://github.com/Dromares/razerctl/releases/download/v0.3.0/razerctl-0.3.0-x86_64-linux.tar.gz
-	sha256sums = 0000000000000000000000000000000000000000000000000000000000000000
+	sha256sums = 62062302d92d6e8eb25cbdd9b9e14bbc0d840c027b96055dd03dd928b70dd473
 
 pkgname = razerctl-bin
