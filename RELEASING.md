@@ -106,9 +106,11 @@ extra-x86_64-build                              # builds in a clean chroot; run 
 namcap PKGBUILD razerctl-bin-X.Y.Z-1-x86_64.pkg.tar.zst
 ```
 
-namcap currently reports only "dependency included, but may not be needed" for `gcc-libs`, `libxkbcommon`, `wayland`,
-`libglvnd` and `libnotify`. They are loaded at run time (the GUI `dlopen`s the display libraries, the battery alert runs
-`notify-send`), so ldd cannot see them; leave them. Anything else is new: read it.
+namcap currently prints six lines. Five are "dependency included, but may not be needed" for `gcc-libs`,
+`libxkbcommon`, `wayland`, `libglvnd` and `libnotify`. They are loaded at run time (the GUI `dlopen`s the display
+libraries, the battery alert runs `notify-send`), so ldd cannot see them; leave them. The sixth is "Dependency libgcc
+detected and implicitly satisfied": the binaries need `libgcc_s.so.1`, and `libnotify` depends on `gcc-libs`, so it is
+covered transitively. Leave that too. Anything else is new: read it.
 
 Commit the bump through a PR to `main` like any other change, so the repository copy matches what the AUR has.
 
