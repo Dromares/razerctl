@@ -125,3 +125,103 @@ fn every_redirect_target_directory_exists_by_the_time_the_step_writes_it() {
     );
     assert!(missing.is_empty(), "{}", missing.join("\n"));
 }
+
+/// The steps of the workflow, each as its raw lines (a step starts at a `      - ` line, six spaces deep).
+fn steps(yml: &str) -> Vec<Vec<&str>> {
+    let mut steps: Vec<Vec<&str>> = Vec::new();
+    for line in yml.lines() {
+        if line.starts_with("      - ") {
+            steps.push(vec![line]);
+        } else if let Some(cur) = steps.last_mut() {
+            cur.push(line);
+        }
+    }
+    steps
+}
+
+fn creates_edits_or_uploads_a_release(step: &str) -> bool {
+    [
+        "gh release",
+        "gh api",
+        "upload-artifact",
+        "action-gh-release",
+        "git push",
+        "git tag",
+    ]
+    .iter()
+    .any(|needle| step.contains(needle))
+}
+
+/// DAN-1735: a `workflow_dispatch` dry run builds, packages and checksums but publishes nothing. The input must exist,
+/// default to the safe value, and guard every step that creates, edits or uploads a release.
+#[test]
+fn dispatch_dry_run_input_exists_and_defaults_to_dry() {
+    let yml = read(".github/workflows/release.yml");
+    let at = yml
+        .find("workflow_dispatch:")
+        .expect("release.yml has no workflow_dispatch trigger");
+    let trigger = yml[at..].split("\npermissions:").next().unwrap();
+    assert!(
+        trigger.contains("dry_run:"),
+        "workflow_dispatch has no `dry_run` input:\n{trigger}"
+    );
+    assert!(
+        trigger.contains("type: boolean") && trigger.contains("default: true"),
+        "`dry_run` must be a boolean that defaults to true, so a bare dispatch publishes nothing:\n{trigger}"
+    );
+}
+
+#[test]
+fn every_step_that_publishes_is_guarded_by_dry_run() {
+    let yml = read(".github/workflows/release.yml");
+    let mut publish_steps = 0;
+    let mut unguarded = Vec::new();
+    for step in steps(&yml) {
+        // comment lines may mention `gh release`; only executable text counts
+        let text = step
+            .iter()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !creates_edits_or_uploads_a_release(&text) {
+            continue;
+        }
+        publish_steps += 1;
+        let guard = text
+            .lines()
+            .find(|l| l.trim_start().trim_start_matches("- ").starts_with("if:"));
+        let ok = guard.is_some_and(|g| {
+            g.contains("inputs.dry_run") && g.contains("github.event_name == 'push'")
+        });
+        if !ok {
+            unguarded.push(text.lines().next().unwrap_or_default().trim().to_string());
+        }
+    }
+    assert!(
+        publish_steps > 0,
+        "found no step that creates a release; the publish detector no longer sees the draft-release step"
+    );
+    assert!(
+        unguarded.is_empty(),
+        "these steps can publish on a dry run (need `if:` naming inputs.dry_run and the push event): {unguarded:?}"
+    );
+}
+
+/// The job must not hold a release-capable token for the dry run: `GH_TOKEN` belongs to the guarded step only.
+#[test]
+fn release_token_is_not_set_at_job_level() {
+    let yml = read(".github/workflows/release.yml");
+    let job_env = yml
+        .split("\n    steps:")
+        .next()
+        .unwrap()
+        .lines()
+        .filter(|l| !l.trim_start().starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !job_env.contains("GH_TOKEN") && !job_env.contains("github.token"),
+        "GH_TOKEN is set for every step, dry run included:\n{job_env}"
+    );
+}

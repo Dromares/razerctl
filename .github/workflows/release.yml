@@ -1,12 +1,21 @@
 name: Release
 
 # Builds the five release assets from a `v*` tag and uploads them to a DRAFT release; a person reviews and publishes it.
-# Never runs on a pull request. `workflow_dispatch` is for re-running a tag that failed part-way: pick the tag as the ref.
-# Not exercised on hosted runners yet (DAN-1668); the steps were run by hand in an Ubuntu 22.04 root filesystem.
+# Never runs on a pull request. `workflow_dispatch` runs it by hand from any ref (DAN-1735):
+#   dry_run: true (the default)  builds, packages and checksums, then stops; creates, edits and uploads nothing, and the
+#                                job holds no GH_TOKEN. The tag is taken to be v + the Cargo.toml version. Run it on a
+#                                PR branch before merging a change to this file.
+#   dry_run: false               re-runs a tag that failed part-way: pick the tag as the ref. Makes the draft release.
+# The one step that publishes is `Draft release`, and its `if:` is the only thing that lets it run on a dispatch.
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build and checksum only; publish nothing"
+        type: boolean
+        default: true
 
 permissions:
   contents: write # gh release create
@@ -15,11 +24,22 @@ jobs:
   release:
     # Pinned: the AppImage needs glibc 2.35 or newer, and `ubuntu-latest` moves to Ubuntu 26 on 2026-10-19.
     runs-on: ubuntu-22.04
-    env:
-      TAG: ${{ github.ref_name }}
-      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false # nothing after this pushes; the draft step authenticates through GH_TOKEN
+      - name: Tag (the pushed tag; on a dry run, v + the Cargo.toml version)
+        env:
+          REF_NAME: ${{ github.ref_name }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            TAG="v$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          else
+            TAG="$REF_NAME"
+          fi
+          echo "dry_run=$DRY_RUN tag=$TAG"
+          echo "TAG=$TAG" >> "$GITHUB_ENV"
       - name: System libraries (GUI build and AppImage tools)
         run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libgl1-mesa-dev libudev-dev patchelf file desktop-file-utils squashfs-tools zsync
       - uses: dtolnay/rust-toolchain@stable
@@ -59,7 +79,16 @@ jobs:
           cd dist
           sha256sum "razerctl-${VER}-x86_64.AppImage" "razerctl-${VER}-x86_64.AppImage.zsync" "$DIR.tar.gz" 70-razerctl.rules > SHA256SUMS
           sha256sum -c SHA256SUMS
+      - name: Dry run result (nothing was published)
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "dry run for $TAG: no release, draft, tag or upload was made"
+          ls -l dist
+          cat dist/SHA256SUMS
       - name: Draft release
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && !inputs.dry_run)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           case "$TAG" in *-*) PRE=--prerelease ;; *) PRE= ;; esac
           gh release create "$TAG" dist/* --draft --verify-tag $PRE --title "razerctl ${TAG#v}" --notes-file target/release-notes.md
