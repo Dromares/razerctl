@@ -1,9 +1,0 @@
-post_install() {
-    cat <<'MSG'
-razerctl installed a udev rule (/usr/lib/udev/rules.d/70-razerctl.rules) so it can reach the mouse without root.
-The rule only applies to a mouse that is plugged in after the rule is loaded, so either:
-  - unplug and replug the mouse (the fallback that always works), or
-  - run: sudo udevadm control --reload && sudo udevadm trigger
-Then open razerctl from the app menu, or run razerctl-gui.
-MSG
-}

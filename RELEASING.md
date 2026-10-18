@@ -1,19 +1,18 @@
 # Releasing razerctl
 
-How a release goes from `main` to a published GitHub release and the AUR package. Everything here is a command you run
-by hand, in order. Nothing publishes itself: the workflow only ever creates a **draft** release, and the AUR is pushed
-by the owner.
+How a release goes from `main` to a published GitHub release. Everything here is a command you run
+by hand, in order. Nothing publishes itself: the workflow only ever creates a **draft** release.
 
 The release workflow is `.github/workflows/release.yml`; it is the source of truth for how the assets are built. The
 "Without hosted Actions" section below repeats its steps by hand.
 
-Assets of a release `vX.Y.Z` (names are fixed; the in-app updater and the AUR package depend on them):
+Assets of a release `vX.Y.Z` (names are fixed; the in-app updater depends on them):
 
 | Asset | Used by |
 |---|---|
 | `razerctl-X.Y.Z-x86_64.AppImage` | AppImage users, in-app updater |
 | `razerctl-X.Y.Z-x86_64.AppImage.zsync` | AppImageUpdate, Gear Lever, AppImageLauncher |
-| `razerctl-X.Y.Z-x86_64-linux.tar.gz` | AUR `razerctl-bin`, manual installs |
+| `razerctl-X.Y.Z-x86_64-linux.tar.gz` | manual installs |
 | `70-razerctl.rules` | the AppImage `sudo curl` line in the README |
 | `SHA256SUMS` | everyone; the in-app updater checks downloads against it |
 
@@ -28,7 +27,8 @@ cargo build --release --locked        # must pass: the workflow builds with --lo
 ```
 
 Add a `## vX.Y.Z` section at the top of `CHANGELOG.md` (above the previous release). The workflow cuts exactly that
-section out as the release notes and fails if it is missing, so write it for users: what changed, what to do.
+section out as the release notes and fails if it is missing, so write it for users: what changed, what to do. Fold any
+`## Unreleased` notes into it; that heading is never cut out for a release.
 
 ## 2. Tag and push
 
@@ -82,52 +82,6 @@ curl -fsS https://api.github.com/repos/Dromares/razerctl/releases/latest | grep 
 ```
 
 Publishing is the point of no return: the in-app updater and `/releases/latest/download/...` links see it immediately.
-
-## 5. Bump the AUR package
-
-Needs the published release, because the checksum comes from it. In a checkout of `main`:
-
-```sh
-cd packaging/aur/razerctl-bin
-# in PKGBUILD: pkgver=X.Y.Z, pkgrel=1, and sha256sums=('<hash>') where <hash> is the tarball's line in SHA256SUMS:
-curl -fL https://github.com/Dromares/razerctl/releases/download/vX.Y.Z/SHA256SUMS | grep -- '-x86_64-linux.tar.gz$'
-makepkg --printsrcinfo > .SRCINFO
-```
-
-A `pkgver` cannot contain a hyphen, so a pre-release tag (`v0.4.0-rc.1`) is not packaged; the AUR only gets final
-versions. Re-releasing the same `pkgver` with the same files is a `pkgrel` bump (`pkgrel=2`), and `.SRCINFO` is
-regenerated every time.
-
-Build the package once before pushing it, in a clean chroot (`devtools`), and read namcap's output:
-
-```sh
-makepkg --printsrcinfo | diff - .SRCINFO        # empty: .SRCINFO matches PKGBUILD
-extra-x86_64-build                              # builds in a clean chroot; run in packaging/aur/razerctl-bin
-namcap PKGBUILD razerctl-bin-X.Y.Z-1-x86_64.pkg.tar.zst
-```
-
-namcap currently prints six lines. Five are "dependency included, but may not be needed" for `gcc-libs`,
-`libxkbcommon`, `wayland`, `libglvnd` and `libnotify`. They are loaded at run time (the GUI `dlopen`s the display
-libraries, the battery alert runs `notify-send`), so ldd cannot see them; leave them. The sixth is "Dependency libgcc
-detected and implicitly satisfied": the binaries need `libgcc_s.so.1`, and `libnotify` depends on `gcc-libs`, so it is
-covered transitively. Leave that too. Anything else is new: read it.
-
-Commit the bump through a PR to `main` like any other change, so the repository copy matches what the AUR has.
-
-## 6. Push to the AUR (the owner does this)
-
-An agent never pushes to the AUR; it needs the owner's AUR account and SSH key.
-
-```sh
-git clone ssh://aur@aur.archlinux.org/razerctl-bin.git /tmp/aur-razerctl-bin     # the first time, this clones an empty repo
-cd /tmp/aur-razerctl-bin
-cp <checkout>/packaging/aur/razerctl-bin/{PKGBUILD,.SRCINFO,razerctl-bin.install} .
-git add PKGBUILD .SRCINFO razerctl-bin.install
-git commit -m "razerctl-bin X.Y.Z"
-git push
-```
-
-Then check `yay -Si razerctl-bin` (or the AUR page) shows `X.Y.Z`.
 
 ## Without hosted Actions
 

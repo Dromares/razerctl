@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+The `razerctl-bin` recipe is removed and razerctl will not be published to the AUR. Arch and CachyOS users install the
+AppImage or the tarball, or build the package from a checkout with `makepkg -si` in `packaging/`. Nothing about how the
+mouse is driven changed.
+
 ## v0.3.0
 
 razerctl now tells you when a newer release exists, can update an AppImage for you after you say yes, and every release
