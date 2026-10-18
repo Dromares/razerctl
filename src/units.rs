@@ -1,9 +1,11 @@
-//! The low-battery notifier's user unit for an AppImage (DAN-1746, DAN-1747).
+//! The user units an AppImage writes for itself (DAN-1746, DAN-1747, DAN-1750): the low-battery notifier and the remap service.
 //!
-//! `install.sh` and the PKGBUILD put `systemd/razerctl-battery.service` in place; the AppImage installs nothing, and the
-//! shipped unit runs `~/.local/bin/razerctl`, which an AppImage user does not have. So when the GUI runs as an AppImage
-//! and the user turns the notifier on, it writes its own copy of the unit with `ExecStart=` pointing at the AppImage file
-//! (`razerctl-gui battery-watch`; the GUI binary answers that argument, see `razerctl-gui.rs`).
+//! `install.sh` and the PKGBUILD put `systemd/razerctl-battery.service` and `systemd/razerctl-remap.service` in place; the
+//! AppImage installs nothing, and the shipped units run `~/.local/bin/razerctl`, which an AppImage user does not have. So when
+//! the GUI runs as an AppImage and the user turns one of them on, it writes its own copy of the unit with `ExecStart=` pointing
+//! at the AppImage file (`razerctl-gui battery-watch`, `razerctl-gui remap`; the GUI binary answers those arguments, see
+//! `razerctl-gui.rs` and [`crate::cli`]). The path is `$APPIMAGE`, the file, never the `/tmp/.mount_*` mount, which changes
+//! on every launch.
 //!
 //! The decisions are pure ([`plan_enable`], [`plan_disable`]) and take what is on disk as arguments. Only a unit that
 //! carries [`MARKER`] on its first line is ours to rewrite or remove; a unit from `install.sh`, a package, or a person is
@@ -14,11 +16,34 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::battery;
 use crate::update::InstallType;
 
-/// The shipped unit. The AppImage copy is this text with the `ExecStart=` line swapped, so the two cannot drift apart.
-const TEMPLATE: &str = include_str!("../systemd/razerctl-battery.service");
+/// One of the units the GUI manages.
+#[derive(Clone, Copy, Debug)]
+pub struct Unit {
+    /// `razerctl-remap.service`
+    pub name: &'static str,
+    /// The shipped unit. The AppImage copy is this text with the `ExecStart=` line swapped, so the two cannot drift apart.
+    template: &'static str,
+    /// What the AppImage's `ExecStart=` passes to the GUI binary.
+    subcommand: &'static str,
+    /// Second line of the AppImage copy, after the marker.
+    note: &'static str,
+}
+
+pub const BATTERY: Unit = Unit {
+    name: crate::battery::SERVICE,
+    template: include_str!("../systemd/razerctl-battery.service"),
+    subcommand: "battery-watch",
+    note: "# Turning the notifier off in razerctl removes this file.",
+};
+
+pub const REMAP: Unit = Unit {
+    name: "razerctl-remap.service",
+    template: include_str!("../systemd/razerctl-remap.service"),
+    subcommand: "remap",
+    note: "# Disabling the remap service in razerctl removes this file.",
+};
 
 /// First line of a unit this module wrote. Its presence is what makes a unit ours.
 pub const MARKER: &str = "# razerctl-appimage-unit: written by the razerctl AppImage";
@@ -107,8 +132,8 @@ fn exec_word(s: &str) -> String {
 }
 
 /// The unit text for an AppImage at `appimage`: the shipped unit with the marker on top and `ExecStart=` running the
-/// AppImage's `battery-watch`.
-pub fn appimage_unit_text(appimage: &Path) -> Result<String, UnitError> {
+/// AppImage's `unit.subcommand`.
+pub fn appimage_unit_text(unit: &Unit, appimage: &Path) -> Result<String, UnitError> {
     let s = appimage.to_string_lossy();
     if s.chars().any(char::is_control) {
         return Err(UnitError::BadPath(appimage.to_path_buf()));
@@ -116,9 +141,9 @@ pub fn appimage_unit_text(appimage: &Path) -> Result<String, UnitError> {
     if !appimage.is_absolute() {
         return Err(UnitError::RelativePath(appimage.to_path_buf()));
     }
-    let exec = format!("ExecStart={} battery-watch", exec_word(&s));
-    let mut out = format!("{MARKER}\n# Turning the notifier off in razerctl removes this file.\n");
-    for line in TEMPLATE.lines() {
+    let exec = format!("ExecStart={} {}", exec_word(&s), unit.subcommand);
+    let mut out = format!("{MARKER}\n{}\n", unit.note);
+    for line in unit.template.lines() {
         out.push_str(if line.starts_with("ExecStart=") {
             &exec
         } else {
@@ -133,9 +158,10 @@ fn is_ours(existing: &str) -> bool {
     existing.lines().next().is_some_and(|l| l == MARKER)
 }
 
-/// Before `enable --now`. `existing` is `~/.config/systemd/user/razerctl-battery.service` if it is there; `packaged` says
+/// Before `enable --now`. `existing` is `~/.config/systemd/user/<unit>` if it is there; `packaged` says
 /// whether a system directory has the unit.
 pub fn plan_enable(
+    unit: &Unit,
     install: &InstallType,
     existing: Option<&str>,
     packaged: bool,
@@ -147,7 +173,7 @@ pub fn plan_enable(
         Some(old) if !is_ours(old) => Plan::LeaveAlone(Owner::Unmarked),
         None if packaged => Plan::LeaveAlone(Owner::Packaged),
         old => {
-            let text = appimage_unit_text(path)?;
+            let text = appimage_unit_text(unit, path)?;
             match old {
                 Some(old) if old == text => Plan::UpToDate,
                 old => Plan::Write {
@@ -197,32 +223,32 @@ impl Site {
         }
     }
 
-    pub fn unit_path(&self) -> PathBuf {
-        self.user_dir.join(battery::SERVICE)
+    pub fn unit_path(&self, unit: &Unit) -> PathBuf {
+        self.user_dir.join(unit.name)
     }
 
     /// The user unit's text, if there is one.
-    pub fn existing(&self) -> Option<String> {
-        std::fs::read_to_string(self.unit_path()).ok()
+    pub fn existing(&self, unit: &Unit) -> Option<String> {
+        std::fs::read_to_string(self.unit_path(unit)).ok()
     }
 
-    pub fn packaged(&self) -> bool {
+    pub fn packaged(&self, unit: &Unit) -> bool {
         self.packaged_dirs
             .iter()
-            .any(|d| d.join(battery::SERVICE).exists())
+            .any(|d| d.join(unit.name).exists())
     }
 
     /// Write `text` as the unit, through a temporary file so a reader never sees half of it.
-    pub fn write(&self, text: &str) -> io::Result<()> {
+    pub fn write(&self, unit: &Unit, text: &str) -> io::Result<()> {
         std::fs::create_dir_all(&self.user_dir)?;
-        let path = self.unit_path();
+        let path = self.unit_path(unit);
         let tmp = path.with_extension("service.tmp");
         std::fs::write(&tmp, text)?;
         std::fs::rename(&tmp, &path)
     }
 
-    pub fn remove(&self) -> io::Result<()> {
-        match std::fs::remove_file(self.unit_path()) {
+    pub fn remove(&self, unit: &Unit) -> io::Result<()> {
+        match std::fs::remove_file(self.unit_path(unit)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
         }
@@ -234,6 +260,7 @@ mod tests {
     use super::*;
 
     const APPIMAGE: &str = "/home/u/Apps/razerctl-0.3.0-x86_64.AppImage";
+    const TEMPLATE: &str = BATTERY.template;
 
     fn appimage(p: &str) -> InstallType {
         InstallType::AppImage { path: p.into() }
@@ -248,7 +275,7 @@ mod tests {
     #[test]
     fn the_appimage_unit_runs_battery_watch_from_the_appimage_and_keeps_the_rest_of_the_shipped_unit(
     ) {
-        let text = appimage_unit_text(Path::new(APPIMAGE)).unwrap();
+        let text = appimage_unit_text(&BATTERY, Path::new(APPIMAGE)).unwrap();
         assert_eq!(
             exec_line(&text),
             format!("ExecStart={APPIMAGE} battery-watch")
@@ -273,7 +300,8 @@ mod tests {
 
     #[test]
     fn paths_with_spaces_and_systemd_specials_are_quoted() {
-        let text = appimage_unit_text(Path::new("/home/u/My Apps/100%/a$b\"c.AppImage")).unwrap();
+        let text = appimage_unit_text(&BATTERY, Path::new("/home/u/My Apps/100%/a$b\"c.AppImage"))
+            .unwrap();
         assert_eq!(
             exec_line(&text),
             r#"ExecStart="/home/u/My Apps/100%%/a$$b\"c.AppImage" battery-watch"#
@@ -283,21 +311,21 @@ mod tests {
     #[test]
     fn a_relative_or_control_character_path_is_an_error_not_a_unit() {
         assert_eq!(
-            appimage_unit_text(Path::new("razerctl.AppImage")),
+            appimage_unit_text(&BATTERY, Path::new("razerctl.AppImage")),
             Err(UnitError::RelativePath("razerctl.AppImage".into()))
         );
         assert!(matches!(
-            appimage_unit_text(Path::new("/tmp/a\nExecStop=/bin/true")),
+            appimage_unit_text(&BATTERY, Path::new("/tmp/a\nExecStop=/bin/true")),
             Err(UnitError::BadPath(_))
         ));
-        assert!(plan_enable(&appimage("rel.AppImage"), None, false).is_err());
+        assert!(plan_enable(&BATTERY, &appimage("rel.AppImage"), None, false).is_err());
     }
 
     #[test]
     fn a_fresh_appimage_gets_the_unit_written() {
-        let want = appimage_unit_text(Path::new(APPIMAGE)).unwrap();
+        let want = appimage_unit_text(&BATTERY, Path::new(APPIMAGE)).unwrap();
         assert_eq!(
-            plan_enable(&appimage(APPIMAGE), None, false),
+            plan_enable(&BATTERY, &appimage(APPIMAGE), None, false),
             Ok(Plan::Write {
                 text: want,
                 replaces: false
@@ -307,18 +335,19 @@ mod tests {
 
     #[test]
     fn the_same_path_is_up_to_date_so_updates_in_place_do_not_rewrite_it() {
-        let have = appimage_unit_text(Path::new(APPIMAGE)).unwrap();
+        let have = appimage_unit_text(&BATTERY, Path::new(APPIMAGE)).unwrap();
         assert_eq!(
-            plan_enable(&appimage(APPIMAGE), Some(&have), false),
+            plan_enable(&BATTERY, &appimage(APPIMAGE), Some(&have), false),
             Ok(Plan::UpToDate)
         );
     }
 
     #[test]
     fn a_moved_appimage_rewrites_our_unit_to_the_new_path() {
-        let old = appimage_unit_text(Path::new(APPIMAGE)).unwrap();
+        let old = appimage_unit_text(&BATTERY, Path::new(APPIMAGE)).unwrap();
         let moved = "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage";
-        let Ok(Plan::Write { text, replaces }) = plan_enable(&appimage(moved), Some(&old), false)
+        let Ok(Plan::Write { text, replaces }) =
+            plan_enable(&BATTERY, &appimage(moved), Some(&old), false)
         else {
             panic!("a moved AppImage must rewrite the unit");
         };
@@ -333,14 +362,14 @@ mod tests {
         let usr = TEMPLATE.replace("%h/.local/bin/razerctl", "/usr/bin/razerctl");
         for existing in [tarball, usr.as_str(), "[Service]\nExecStart=/opt/x\n", ""] {
             assert_eq!(
-                plan_enable(&appimage(APPIMAGE), Some(existing), false),
+                plan_enable(&BATTERY, &appimage(APPIMAGE), Some(existing), false),
                 Ok(Plan::LeaveAlone(Owner::Unmarked)),
                 "{existing:?}"
             );
         }
         // a unit under /usr/lib/systemd/user with nothing in ~/.config
         assert_eq!(
-            plan_enable(&appimage(APPIMAGE), None, true),
+            plan_enable(&BATTERY, &appimage(APPIMAGE), None, true),
             Ok(Plan::LeaveAlone(Owner::Packaged))
         );
     }
@@ -348,7 +377,10 @@ mod tests {
     #[test]
     fn other_install_types_keep_todays_behaviour() {
         for install in [InstallType::Tarball, InstallType::Package] {
-            assert_eq!(plan_enable(&install, None, false), Ok(Plan::NotApplicable));
+            assert_eq!(
+                plan_enable(&BATTERY, &install, None, false),
+                Ok(Plan::NotApplicable)
+            );
             assert_eq!(
                 plan_disable(&install, Some(TEMPLATE), false),
                 DisablePlan::NotApplicable
@@ -358,7 +390,7 @@ mod tests {
 
     #[test]
     fn turning_it_off_removes_only_our_unit() {
-        let ours = appimage_unit_text(Path::new(APPIMAGE)).unwrap();
+        let ours = appimage_unit_text(&BATTERY, Path::new(APPIMAGE)).unwrap();
         let ai = appimage(APPIMAGE);
         assert_eq!(plan_disable(&ai, Some(&ours), false), DisablePlan::Remove);
         assert_eq!(
@@ -382,18 +414,127 @@ mod tests {
             user_dir: dir.join("systemd/user"),
             packaged_dirs: vec![dir.join("usr-lib")],
         };
-        assert_eq!(site.existing(), None);
-        assert!(!site.packaged());
-        site.write("one\n").unwrap();
-        site.write("two\n").unwrap();
-        assert_eq!(site.existing().as_deref(), Some("two\n"));
+        assert_eq!(site.existing(&BATTERY), None);
+        assert!(!site.packaged(&BATTERY));
+        site.write(&BATTERY, "one\n").unwrap();
+        site.write(&BATTERY, "two\n").unwrap();
+        assert_eq!(site.existing(&BATTERY).as_deref(), Some("two\n"));
         assert!(!site.user_dir.join("razerctl-battery.service.tmp").exists());
-        site.remove().unwrap();
-        site.remove().unwrap(); // already gone is fine
-        assert_eq!(site.existing(), None);
+        site.remove(&BATTERY).unwrap();
+        site.remove(&BATTERY).unwrap(); // already gone is fine
+        assert_eq!(site.existing(&BATTERY), None);
         std::fs::create_dir_all(dir.join("usr-lib")).unwrap();
         std::fs::write(dir.join("usr-lib/razerctl-battery.service"), "x").unwrap();
-        assert!(site.packaged());
+        assert!(site.packaged(&BATTERY));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- DAN-1750: the remap unit
+
+    #[test]
+    fn the_appimage_remap_unit_runs_remap_from_the_appimage_and_keeps_the_restart_policy_byte_identical(
+    ) {
+        let text = appimage_unit_text(&REMAP, Path::new(APPIMAGE)).unwrap();
+        assert_eq!(exec_line(&text), format!("ExecStart={APPIMAGE} remap"));
+        assert_eq!(text.lines().next(), Some(MARKER));
+        assert!(!text.contains(".local/bin"), "{text}");
+        assert!(!text.contains(".mount_"), "never the mount path:\n{text}");
+        // after the marker and its note, the shipped unit line for line, with only ExecStart= swapped
+        let shipped: Vec<String> = REMAP
+            .template
+            .lines()
+            .map(|l| {
+                if l.starts_with("ExecStart=") {
+                    format!("ExecStart={APPIMAGE} remap")
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect();
+        let ours: Vec<String> = text.lines().skip(2).map(String::from).collect();
+        assert_eq!(ours, shipped);
+        for line in [
+            "Restart=on-failure",
+            "RestartSec=2",
+            "RestartPreventExitStatus=78",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line} missing:\n{text}");
+        }
+        assert_eq!(REMAP.template.matches("ExecStart=").count(), 1);
+    }
+
+    #[test]
+    fn the_remap_unit_is_written_rewritten_left_alone_and_removed_by_the_same_rules_as_the_notifier(
+    ) {
+        let ai = appimage(APPIMAGE);
+        let want = appimage_unit_text(&REMAP, Path::new(APPIMAGE)).unwrap();
+        assert_eq!(
+            plan_enable(&REMAP, &ai, None, false),
+            Ok(Plan::Write {
+                text: want.clone(),
+                replaces: false
+            })
+        );
+        assert_eq!(
+            plan_enable(&REMAP, &ai, Some(&want), false),
+            Ok(Plan::UpToDate)
+        );
+        // the AppImage moved
+        let moved = "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage";
+        let Ok(Plan::Write { text, replaces }) =
+            plan_enable(&REMAP, &appimage(moved), Some(&want), false)
+        else {
+            panic!("a moved AppImage must rewrite the unit");
+        };
+        assert!(replaces && exec_line(&text) == format!("ExecStart={moved} remap"));
+        // install.sh's copy (no marker) and a package's are never touched
+        for existing in [REMAP.template, "[Service]\nExecStart=/opt/x\n"] {
+            assert_eq!(
+                plan_enable(&REMAP, &ai, Some(existing), false),
+                Ok(Plan::LeaveAlone(Owner::Unmarked))
+            );
+            assert_eq!(
+                plan_disable(&ai, Some(existing), false),
+                DisablePlan::LeaveAlone(Owner::Unmarked)
+            );
+        }
+        assert_eq!(
+            plan_enable(&REMAP, &ai, None, true),
+            Ok(Plan::LeaveAlone(Owner::Packaged))
+        );
+        assert_eq!(plan_disable(&ai, Some(&want), false), DisablePlan::Remove);
+        // the other install types keep the unit they have
+        assert_eq!(
+            plan_enable(&REMAP, &InstallType::Tarball, None, false),
+            Ok(Plan::NotApplicable)
+        );
+    }
+
+    #[test]
+    fn the_two_units_are_separate_files_in_one_site() {
+        let dir = std::env::temp_dir().join(format!("razerctl-units2-{}", std::process::id()));
+        let site = Site {
+            user_dir: dir.join("systemd/user"),
+            packaged_dirs: vec![dir.join("usr-lib")],
+        };
+        site.write(&REMAP, "remap\n").unwrap();
+        site.write(&BATTERY, "battery\n").unwrap();
+        assert_eq!(site.existing(&REMAP).as_deref(), Some("remap\n"));
+        assert_eq!(site.existing(&BATTERY).as_deref(), Some("battery\n"));
+        site.remove(&REMAP).unwrap();
+        assert_eq!(site.existing(&REMAP), None);
+        assert_eq!(
+            site.existing(&BATTERY).as_deref(),
+            Some("battery\n"),
+            "removing one unit must not take the other"
+        );
+        assert_eq!(
+            site.unit_path(&REMAP),
+            dir.join("systemd/user/razerctl-remap.service")
+        );
+        std::fs::create_dir_all(dir.join("usr-lib")).unwrap();
+        std::fs::write(dir.join("usr-lib/razerctl-remap.service"), "x").unwrap();
+        assert!(site.packaged(&REMAP) && !site.packaged(&BATTERY));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

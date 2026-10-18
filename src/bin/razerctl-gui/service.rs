@@ -248,12 +248,46 @@ pub fn uses_macros(conf_text: &str) -> bool {
         .is_ok_and(|m| m.values().any(|a| matches!(a, Action::Macro { .. })))
 }
 
+/// What to do when the remap unit is not there, for how this copy was installed (DAN-1750). An AppImage writes the unit
+/// itself, so reaching this with an AppImage means that write did not take.
+fn not_installed_hint(install: &InstallType) -> &'static str {
+    match install {
+        InstallType::Tarball => "Run ./install.sh first.",
+        InstallType::Package => "Reinstall the razerctl package to restore it.",
+        InstallType::AppImage { .. } => {
+            "This AppImage writes it to ~/.config/systemd/user when you press Start; systemd didn't find it there, \
+             so try `systemctl --user daemon-reload`."
+        }
+    }
+}
+
+/// What to do when the binary the unit runs is too old or can't run, for how this copy was installed. `bin` is that binary.
+fn reinstall_hint(install: &InstallType, bin: &Path) -> &'static str {
+    match install {
+        InstallType::Tarball => "reinstall it with ./install.sh",
+        InstallType::Package => "reinstall the razerctl package",
+        InstallType::AppImage { path } if path == bin => {
+            "update this AppImage (App tab, Check for updates, or download the latest release)"
+        }
+        // a unit install.sh or a package left in place: this AppImage leaves it alone, so the fix is on that copy
+        InstallType::AppImage { .. } => {
+            "reinstall that copy, or delete its unit file and press Start again so this AppImage writes its own"
+        }
+    }
+}
+
 /// Before a start: is what the unit would run able to run the rules it will read? Only asks the binary when the
 /// rules play a macro. `conf` is the file the service reads, not necessarily the one this window edits.
-pub fn preflight(sys: &dyn Sys, unit: &UnitState, conf: &Path) -> Result<(), String> {
+pub fn preflight(
+    sys: &dyn Sys,
+    install: &InstallType,
+    unit: &UnitState,
+    conf: &Path,
+) -> Result<(), String> {
     if unit.load == "not-found" {
         return Err(format!(
-            "{SERVICE} is not installed. Run ./install.sh first."
+            "{SERVICE} is not installed. {}",
+            not_installed_hint(install)
         ));
     }
     let Some(bin) = &unit.binary else {
@@ -268,18 +302,78 @@ pub fn preflight(sys: &dyn Sys, unit: &UnitState, conf: &Path) -> Result<(), Str
     let (conf_s, macros_p) = (conf.to_string_lossy(), conf.with_file_name("macros.conf"));
     let macros_s = macros_p.to_string_lossy();
     let bin_s = bin.to_string_lossy();
-    match sys.run(&bin_s, &["macros", "check", "--config", &conf_s, "--file", &macros_s]) {
-        Err(e) => Err(format!("The service binary {} can't be run ({e}); reinstall razerctl.", tilde(bin))),
+    match sys.run(
+        &bin_s,
+        &["macros", "check", "--config", &conf_s, "--file", &macros_s],
+    ) {
+        Err(e) => Err(format!(
+            "The service binary {} can't be run ({e}); {}.",
+            tilde(bin),
+            reinstall_hint(install, bin)
+        )),
         Ok(o) if o.ok => Ok(()),
         Ok(o) if o.stderr.contains("unknown command") => Err(format!(
-            "The installed razerctl at {} is too old for macros (it has no `macros` command); reinstall it with ./install.sh.",
-            tilde(bin)
+            "The installed razerctl at {} is too old for macros (it has no `macros` command); {}.",
+            tilde(bin),
+            reinstall_hint(install, bin)
         )),
         Ok(o) => {
-            let why = last_line(&o.stderr).or_else(|| last_line(&o.stdout)).unwrap_or_else(|| "failed".into());
-            Err(format!("`{} macros check` failed for {}: {why}", tilde(bin), tilde(conf)))
+            let why = last_line(&o.stderr)
+                .or_else(|| last_line(&o.stdout))
+                .unwrap_or_else(|| "failed".into());
+            Err(format!(
+                "`{} macros check` failed for {}: {why}",
+                tilde(bin),
+                tilde(conf)
+            ))
         }
     }
+}
+
+// ------------------------------------------------------------------------------------ the AppImage's remap unit
+
+/// Before the remap unit is started or enabled: an AppImage has no unit, so [`units::plan_enable`] decides whether to
+/// write one (and reload systemd) first (DAN-1750). Every other install, and a unit `install.sh` or a package owns, is
+/// left as it is. `Ok(true)` when an older copy of our unit was rewritten because the AppImage moved, so a running
+/// service is still on the old path and needs a `try-restart`.
+pub fn prepare_remap_unit(
+    sys: &dyn Sys,
+    install: &InstallType,
+    site: &units::Site,
+) -> Result<bool, String> {
+    let plan = units::plan_enable(
+        &units::REMAP,
+        install,
+        site.existing(&units::REMAP).as_deref(),
+        site.packaged(&units::REMAP),
+    )
+    .map_err(|e| format!("The remap service can't be set up: {e}"))?;
+    let units::Plan::Write { text, replaces } = plan else {
+        return Ok(false);
+    };
+    site.write(&units::REMAP, &text).map_err(|e| {
+        format!(
+            "{} couldn't be written: {e}",
+            tilde(&site.unit_path(&units::REMAP))
+        )
+    })?;
+    let o = systemctl(sys, &["daemon-reload"])?;
+    if !o.ok {
+        return Err(format!(
+            "systemctl daemon-reload failed: {}",
+            o.stderr.trim()
+        ));
+    }
+    Ok(replaces)
+}
+
+/// The tray's Start: write the AppImage's unit if it needs one, then start it. (The window's Start goes through
+/// [`App::systemctl`], which also pre-flights and reads the result back.)
+pub fn start_remap(sys: &dyn Sys, install: &InstallType, site: &units::Site) -> Result<(), String> {
+    if prepare_remap_unit(sys, install, site)? {
+        systemctl(sys, &["try-restart", SERVICE])?;
+    }
+    systemctl(sys, &["start", SERVICE]).map(|_| ())
 }
 
 // --------------------------------------------------------------------------------------------- App glue
@@ -369,13 +463,30 @@ impl App {
     fn service_cmd(&mut self, args: &[&str], saved: bool) -> bool {
         let starts =
             matches!(args, ["start" | "restart", u] | ["enable", "--now", u] if *u == SERVICE);
+        if matches!(args, ["disable", "--now", u] if *u == SERVICE)
+            && matches!(self.update.install, InstallType::AppImage { .. })
+        {
+            return self.disable_remap();
+        }
         let mut first = None;
         if starts {
-            let unit = self.unit_state();
-            let conf = self
-                .service_conf_path()
-                .unwrap_or_else(|| self.conf_path.clone());
-            if let Err(e) = preflight(&*self.sys, &unit, &conf) {
+            // an AppImage writes its unit before anything can start it, so the pre-flight below reads the AppImage as the binary
+            let refused =
+                match prepare_remap_unit(&*self.sys, &self.update.install, &self.unit_site) {
+                    Err(e) => Some(e),
+                    Ok(moved) => {
+                        if moved && args[0] != "restart" {
+                            // the old unit may still be running from the AppImage's previous path
+                            let _ = systemctl(&*self.sys, &["try-restart", SERVICE]);
+                        }
+                        let unit = self.unit_state();
+                        let conf = self
+                            .service_conf_path()
+                            .unwrap_or_else(|| self.conf_path.clone());
+                        preflight(&*self.sys, &self.update.install, &unit, &conf).err()
+                    }
+                };
+            if let Some(e) = refused {
                 self.svc_pending = None;
                 self.err(if saved {
                     format!("Macros saved, but the service was not restarted. {e}")
@@ -427,6 +538,80 @@ impl App {
             None => self.refresh_service(),
         }
         ok
+    }
+
+    /// Disable at login for an AppImage: stop and disable the unit, and delete the file this GUI wrote so nothing stays
+    /// behind pointing at an AppImage that may be moved or deleted (DAN-1750). A unit somebody else owns is stopped and
+    /// kept; with no unit there is nothing to disable.
+    fn disable_remap(&mut self) -> bool {
+        self.svc_pending = None;
+        let plan = units::plan_disable(
+            &self.update.install,
+            self.unit_site.existing(&units::REMAP).as_deref(),
+            self.unit_site.packaged(&units::REMAP),
+        );
+        if plan == units::DisablePlan::NothingInstalled {
+            self.ok("The remap service is not installed, so there is nothing to disable.");
+            self.refresh_service();
+            return true;
+        }
+        match systemctl(&*self.sys, &["disable", "--now", SERVICE]) {
+            Ok(o) if o.ok => {}
+            Ok(o) => {
+                self.err(o.stderr.trim().to_string());
+                self.refresh_service();
+                return false;
+            }
+            Err(e) => {
+                self.err(e);
+                self.refresh_service();
+                return false;
+            }
+        }
+        let mut removed = Ok(());
+        if plan == units::DisablePlan::Remove {
+            removed = self
+                .unit_site
+                .remove(&units::REMAP)
+                .map_err(|e| {
+                    format!(
+                        "The remap service is off, but {} couldn't be removed: {e}",
+                        tilde(&self.unit_site.unit_path(&units::REMAP))
+                    )
+                })
+                .and_then(|()| systemctl(&*self.sys, &["daemon-reload"]).map(|_| ()));
+        }
+        match &removed {
+            Ok(()) => self.ok("systemctl disable --now ok"),
+            Err(e) => self.err(e.clone()),
+        }
+        self.refresh_service();
+        removed.is_ok()
+    }
+
+    /// At start-up: a remap unit this GUI wrote that names another AppImage path (the file was moved or renamed) fails in
+    /// a restart loop, so point it at this path now. Does nothing unless this is an AppImage and the unit is ours and
+    /// stale; never writes a new unit and never starts one that is stopped.
+    fn follow_moved_remap(&mut self) {
+        let stale = matches!(
+            units::plan_enable(
+                &units::REMAP,
+                &self.update.install,
+                self.unit_site.existing(&units::REMAP).as_deref(),
+                self.unit_site.packaged(&units::REMAP),
+            ),
+            Ok(units::Plan::Write { replaces: true, .. })
+        );
+        if !stale {
+            return;
+        }
+        let moved = prepare_remap_unit(&*self.sys, &self.update.install, &self.unit_site)
+            .and_then(|_| systemctl(&*self.sys, &["try-restart", SERVICE]).map(|_| ()));
+        match moved {
+            Ok(()) => self.ok("The remap service now points at this AppImage."),
+            Err(e) => self.err(e),
+        }
+        self.refresh_service();
     }
 
     /// Called every frame: once the settle time is up, read the unit back and say what happened.
@@ -501,17 +686,18 @@ impl App {
     pub fn enable_notifier(&mut self) -> Result<String, String> {
         let install = self.update.install.clone();
         let plan = units::plan_enable(
+            &units::BATTERY,
             &install,
-            self.unit_site.existing().as_deref(),
-            self.unit_site.packaged(),
+            self.unit_site.existing(&units::BATTERY).as_deref(),
+            self.unit_site.packaged(&units::BATTERY),
         )
         .map_err(|e| format!("Settings saved, but the notifier service can't be set up: {e}"))?;
         let mut moved = false;
         if let units::Plan::Write { text, replaces } = &plan {
-            self.unit_site.write(text).map_err(|e| {
+            self.unit_site.write(&units::BATTERY, text).map_err(|e| {
                 format!(
                     "Settings saved, but {} couldn't be written: {e}",
-                    tilde(&self.unit_site.unit_path())
+                    tilde(&self.unit_site.unit_path(&units::BATTERY))
                 )
             })?;
             self.notifier_ctl(&["daemon-reload"])
@@ -531,18 +717,21 @@ impl App {
         ))
     }
 
-    /// At start-up: a notifier unit this GUI wrote that names another AppImage path (the file was moved or renamed) is
-    /// failing in a restart loop, so rewrite it to this path now rather than wait for the user to find the toggle. Does
-    /// nothing unless the notifier is on, this is an AppImage and the unit is ours and stale; never writes a new unit.
+    /// At start-up: a unit this GUI wrote (the notifier, or the remap service) that names another AppImage path (the file
+    /// was moved or renamed) is failing in a restart loop, so rewrite it to this path now rather than wait for the user to
+    /// find the toggle. Does nothing unless this is an AppImage and the unit is ours and stale (the notifier also only when
+    /// it is on); never writes a new unit.
     pub fn follow_moved_appimage(&mut self) {
+        self.follow_moved_remap();
         if !self.batt_cfg.enabled {
             return;
         }
         let stale = matches!(
             units::plan_enable(
+                &units::BATTERY,
                 &self.update.install,
-                self.unit_site.existing().as_deref(),
-                self.unit_site.packaged(),
+                self.unit_site.existing(&units::BATTERY).as_deref(),
+                self.unit_site.packaged(&units::BATTERY),
             ),
             Ok(units::Plan::Write { replaces: true, .. })
         );
@@ -561,18 +750,18 @@ impl App {
         let install = self.update.install.clone();
         let plan = units::plan_disable(
             &install,
-            self.unit_site.existing().as_deref(),
-            self.unit_site.packaged(),
+            self.unit_site.existing(&units::BATTERY).as_deref(),
+            self.unit_site.packaged(&units::BATTERY),
         );
         if plan != units::DisablePlan::NothingInstalled {
             self.notifier_ctl(&["disable", "--now", battery_unit()])
                 .map_err(|e| notifier_failure(&install, "disable", &e))?;
         }
         if plan == units::DisablePlan::Remove {
-            self.unit_site.remove().map_err(|e| {
+            self.unit_site.remove(&units::BATTERY).map_err(|e| {
                 format!(
                     "Low-battery alerts are off, but {} couldn't be removed: {e}",
-                    tilde(&self.unit_site.unit_path())
+                    tilde(&self.unit_site.unit_path(&units::BATTERY))
                 )
             })?;
             self.notifier_ctl(&["daemon-reload"])
@@ -828,7 +1017,7 @@ pub mod tests {
             "",
             "razerctl: unknown command 'macros'\n\nUSAGE: ...",
         );
-        let e = preflight(&sys, &unit, &d.conf()).unwrap_err();
+        let e = preflight(&sys, &InstallType::Tarball, &unit, &d.conf()).unwrap_err();
         assert!(
             e.contains("too old for macros")
                 && e.contains("reinstall")
@@ -842,7 +1031,7 @@ pub mod tests {
             "",
             "razerctl: /x/macros.conf: not found (the mapping uses macro:NAME)\n",
         );
-        let e = preflight(&sys, &unit, &d.conf()).unwrap_err();
+        let e = preflight(&sys, &InstallType::Tarball, &unit, &d.conf()).unwrap_err();
         assert!(
             e.contains("macros check") && e.contains("not found") && !e.contains("restarted"),
             "{e}"
@@ -852,12 +1041,15 @@ pub mod tests {
             cmd.clone(),
             Err("No such file or directory (os error 2)".into()),
         );
-        assert!(preflight(&sys, &unit, &d.conf())
+        assert!(preflight(&sys, &InstallType::Tarball, &unit, &d.conf())
             .unwrap_err()
             .contains("can't be run"));
         // a good one
         sys.on(&cmd, true, "ok", "");
-        assert_eq!(preflight(&sys, &unit, &d.conf()), Ok(()));
+        assert_eq!(
+            preflight(&sys, &InstallType::Tarball, &unit, &d.conf()),
+            Ok(())
+        );
     }
 
     #[test]
@@ -865,9 +1057,17 @@ pub mod tests {
         let unit = parse_show(CRASH_LOOP);
         let d = Dir::new("plain", "back = ctrl+c\n");
         let sys = Fake::default();
-        assert_eq!(preflight(&sys, &unit, &d.conf()), Ok(()));
         assert_eq!(
-            preflight(&sys, &unit, Path::new("/nonexistent/remap.conf")),
+            preflight(&sys, &InstallType::Tarball, &unit, &d.conf()),
+            Ok(())
+        );
+        assert_eq!(
+            preflight(
+                &sys,
+                &InstallType::Tarball,
+                &unit,
+                Path::new("/nonexistent/remap.conf")
+            ),
             Ok(()),
             "no file: nothing to check"
         );
@@ -877,8 +1077,97 @@ pub mod tests {
             sys.calls()
         );
         let gone = parse_show("LoadState=not-found\n");
-        assert!(preflight(&sys, &gone, &d.conf())
+        assert!(preflight(&sys, &InstallType::Tarball, &gone, &d.conf())
             .unwrap_err()
             .contains("not installed"));
+    }
+
+    // ---- DAN-1750
+
+    const APPIMAGE: &str = "/home/u/Apps/razerctl-0.3.0-x86_64.AppImage";
+
+    fn appimage() -> InstallType {
+        InstallType::AppImage {
+            path: APPIMAGE.into(),
+        }
+    }
+
+    #[test]
+    fn the_preflight_copy_names_the_remedy_for_the_install_that_is_running() {
+        let d = Dir::new("copy", "back = macro:copy,held\n");
+        let gone = parse_show("LoadState=not-found\n");
+        let sys = Fake::default();
+        let e = |install: &InstallType| preflight(&sys, install, &gone, &d.conf()).unwrap_err();
+        assert!(
+            e(&InstallType::Tarball).ends_with("Run ./install.sh first."),
+            "{}",
+            e(&InstallType::Tarball)
+        );
+        for other in [e(&appimage()), e(&InstallType::Package)] {
+            assert!(!other.contains("install.sh"), "{other}");
+        }
+        assert!(e(&appimage()).contains("AppImage"), "{}", e(&appimage()));
+
+        // a binary too old for macros: the AppImage's own binary is fixed by updating it, a copy install.sh left is fixed there
+        let cmd = |bin: &str| {
+            format!(
+                "{bin} macros check --config {} --file {}",
+                d.conf().display(),
+                d.0.join("macros.conf").display()
+            )
+        };
+        let old = "razerctl: unknown command 'macros'\n";
+        let own = parse_show(&format!(
+            "LoadState=loaded\nExecStart={{ path={APPIMAGE} ; argv[]={APPIMAGE} remap ; }}\n"
+        ));
+        sys.on(&cmd(APPIMAGE), false, "", old);
+        let m = preflight(&sys, &appimage(), &own, &d.conf()).unwrap_err();
+        assert!(
+            m.contains("too old for macros")
+                && m.contains("update this AppImage")
+                && !m.contains("install.sh"),
+            "{m}"
+        );
+        let theirs = parse_show(CRASH_LOOP);
+        sys.on(&cmd("/home/u/.local/bin/razerctl"), false, "", old);
+        let m = preflight(&sys, &appimage(), &theirs, &d.conf()).unwrap_err();
+        assert!(m.contains("that copy") && !m.contains("install.sh"), "{m}");
+        let m = preflight(&sys, &InstallType::Tarball, &theirs, &d.conf()).unwrap_err();
+        assert!(m.ends_with("reinstall it with ./install.sh."), "{m}");
+        let m = preflight(&sys, &InstallType::Package, &theirs, &d.conf()).unwrap_err();
+        assert!(
+            m.contains("reinstall the razerctl package") && !m.contains("install.sh"),
+            "{m}"
+        );
+    }
+
+    #[test]
+    fn the_trays_start_writes_the_appimages_unit_first_and_asks_nothing_of_the_other_installs() {
+        let dir = std::env::temp_dir().join(format!("razerctl-svc-tray-{}", std::process::id()));
+        let site = units::Site {
+            user_dir: dir.join("systemd/user"),
+            packaged_dirs: vec![dir.join("usr-lib")],
+        };
+        let sys = Fake::default();
+        start_remap(&sys, &appimage(), &site).unwrap();
+        let unit = std::fs::read_to_string(site.unit_path(&units::REMAP)).unwrap();
+        assert!(
+            unit.contains(&format!("ExecStart={APPIMAGE} remap\n")),
+            "{unit}"
+        );
+        assert_eq!(
+            sys.calls(),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user start razerctl-remap.service"
+            ]
+        );
+        let sys = Fake::default();
+        start_remap(&sys, &InstallType::Tarball, &site).unwrap();
+        assert_eq!(
+            sys.calls(),
+            ["systemctl --user start razerctl-remap.service"]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

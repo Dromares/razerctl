@@ -2,6 +2,7 @@
 //! Shared by the `razerctl` CLI and the `razerctl-gui` desktop app.
 
 pub mod battery;
+pub mod cli;
 pub mod device;
 pub mod hidraw;
 pub mod macros;

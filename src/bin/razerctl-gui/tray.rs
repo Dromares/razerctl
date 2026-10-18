@@ -21,6 +21,8 @@ use std::time::Duration;
 
 use eframe::egui;
 use razerctl::battery;
+use razerctl::units;
+use razerctl::update::InstallType;
 
 use super::service::{self, RealSys};
 use super::SERVICE;
@@ -548,7 +550,9 @@ fn run_act(shared: &Arc<Shared>, act: Act) {
             std::thread::spawn(move || {
                 let sys = RealSys;
                 let r = match act {
-                    Act::StartRemap => service::systemctl(&sys, &["start", SERVICE]).map(|_| ()),
+                    Act::StartRemap => {
+                        service::start_remap(&sys, &InstallType::detect(), &units::Site::from_env())
+                    }
                     Act::StopRemap => service::systemctl(&sys, &["stop", SERVICE]).map(|_| ()),
                     _ => service::stop_all_macros(&sys),
                 };

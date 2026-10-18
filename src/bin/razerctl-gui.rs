@@ -41,14 +41,14 @@ use macro_ui::{MacroUi, Remap, Sub};
 use razerctl::device::{self, Backend, Info, Prefer};
 use razerctl::hidraw::Hidraw;
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
-use razerctl::{battery, remap, units};
+use razerctl::{battery, cli, remap, units};
 use service::{Failure, Pending, RealSys, Sys};
 use theme::*;
 use tray::{CloseAction, Cmd};
 use widgets::*;
 
 const TID: u8 = 0x1f;
-const SERVICE: &str = "razerctl-remap.service";
+const SERVICE: &str = units::REMAP.name;
 
 /// Choices offered in the per-button dropdown: (label, action string). `None` = custom key.
 const CHOICES: &[(&str, Option<&str>)] = &[
@@ -2421,9 +2421,12 @@ razerctl-gui — desktop settings for Razer mice
 USAGE:
     razerctl-gui [-V | --version] [-h | --help]
     razerctl-gui battery-watch
+    razerctl-gui remap [OPTIONS]
+    razerctl-gui macros check [--config FILE]
 
-Without arguments this opens the window. `battery-watch` runs the low-battery notifier with no window; the
-razerctl-battery.service unit the AppImage writes uses it. For the command-line tool, run `razerctl --help`.
+Without arguments this opens the window. `battery-watch` runs the low-battery notifier with no window, and `remap` runs the
+button remapper (what `razerctl remap` does, with the same options and exit statuses); `macros` is `razerctl macros`. The
+razerctl-battery.service and razerctl-remap.service units the AppImage writes use them. For the command-line tool, run `razerctl --help`.
 ";
 
 /// What an invocation with these arguments should print instead of opening the window, if anything. Only the first
@@ -2446,6 +2449,11 @@ fn main() -> eframe::Result {
     // The AppImage starts this binary and nothing else, so the notifier unit it writes asks for the loop here (DAN-1747).
     if args.first().map(String::as_str) == Some("battery-watch") {
         battery::watch_forever();
+    }
+    // Likewise `remap` and `macros`: the razerctl-remap.service unit the AppImage writes runs `<AppImage> remap`, and the
+    // pre-flight before a start runs `<AppImage> macros check`. Same code and exit statuses as the `razerctl` command (DAN-1750).
+    if let Some(code) = cli::embedded(&args) {
+        std::process::exit(code.into());
     }
     let (w, h) = demo::window_size().unwrap_or((1280.0, 900.0));
     let options = eframe::NativeOptions {
@@ -4937,6 +4945,261 @@ mod tests {
         assert!(
             e.contains("didn't enable") && !e.contains("install.sh"),
             "{e}"
+        );
+    }
+
+    // ---- DAN-1750: the remap unit for an AppImage
+
+    const REMAP_UNIT: &str = "razerctl-remap.service";
+
+    fn remap_unit_file(dir: &TempDir) -> String {
+        std::fs::read_to_string(dir.0.join("systemd/user").join(REMAP_UNIT)).unwrap_or_default()
+    }
+
+    /// `stubbed` (rules that play macros, `systemctl show` answered with `show`), but running as the AppImage at `path` with
+    /// its unit directory under `dir`.
+    fn appimage_remap_app(dir: &TempDir, path: &str, show: &str) -> (App, Fake) {
+        let (mut app, fake) = stubbed(dir, show);
+        app.update.install = razerctl::update::InstallType::AppImage { path: path.into() };
+        app.unit_site = units::Site {
+            user_dir: dir.0.join("systemd/user"),
+            packaged_dirs: vec![dir.0.join("usr-lib-systemd-user")],
+        };
+        (app, fake)
+    }
+
+    fn appimage_show(path: &str) -> String {
+        format!(
+            "{HEALTHY}ExecStart={{ path={path} ; argv[]={path} remap ; ignore_errors=no ; start_time=[n/a] ; stop_time=[n/a] ; pid=0 ; code=(null) ; status=0/0 }}\n"
+        )
+    }
+
+    fn position(calls: &[String], what: &str) -> usize {
+        calls
+            .iter()
+            .position(|c| c == what)
+            .unwrap_or_else(|| panic!("{what} was never called: {calls:?}"))
+    }
+
+    #[test]
+    fn starting_the_remap_service_from_an_appimage_writes_its_unit_before_systemctl_starts_it() {
+        for verb in [
+            &["start", SERVICE][..],
+            &["restart", SERVICE],
+            &["enable", "--now", SERVICE],
+        ] {
+            let dir = TempDir::new("remap-start");
+            let (mut app, fake) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
+            fake.on(&check_cmd_for(&dir, APPIMAGE), true, "ok", "");
+            assert!(app.systemctl(verb), "{verb:?}: {}", app.status);
+            let unit = remap_unit_file(&dir);
+            assert!(
+                unit.contains(&format!("ExecStart={APPIMAGE} remap\n")),
+                "{verb:?}:\n{unit}"
+            );
+            assert_eq!(unit.lines().next(), Some(units::MARKER));
+            assert!(!unit.contains(".mount_"), "never the mount path:\n{unit}");
+            let calls = fake.calls();
+            let line = format!("systemctl --user {}", verb.join(" "));
+            assert!(
+                position(&calls, "systemctl --user daemon-reload") < position(&calls, &line),
+                "the unit is reloaded before it is started: {calls:?}"
+            );
+            // a second start with nothing moved touches neither the file nor the reload
+            fake.calls.borrow_mut().clear();
+            assert!(app.systemctl(verb));
+            assert!(
+                !fake
+                    .calls()
+                    .contains(&"systemctl --user daemon-reload".to_string()),
+                "{:?}",
+                fake.calls()
+            );
+        }
+    }
+
+    /// The command the pre-flight runs: the binary is the AppImage itself.
+    fn check_cmd_for(dir: &TempDir, bin: &str) -> String {
+        format!(
+            "{bin} macros check --config {} --file {}",
+            dir.0.join("razerctl/remap.conf").display(),
+            dir.0.join("razerctl/macros.conf").display()
+        )
+    }
+
+    #[test]
+    fn the_preflight_macros_check_goes_to_the_appimage_binary() {
+        let dir = TempDir::new("remap-preflight");
+        let (mut app, fake) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
+        fake.on(&check_cmd_for(&dir, APPIMAGE), true, "ok", "");
+        assert!(app.systemctl(&["start", SERVICE]), "{}", app.status);
+        assert!(
+            fake.calls().contains(&check_cmd_for(&dir, APPIMAGE)),
+            "{:?}",
+            fake.calls()
+        );
+        // and a rejected config stops the start, naming the AppImage and not install.sh
+        fake.on(
+            &check_cmd_for(&dir, APPIMAGE),
+            false,
+            "",
+            "razerctl: remap.conf: undefined macro 'copy'\n",
+        );
+        assert!(!app.systemctl(&["start", SERVICE]));
+        assert!(
+            app.status.contains("macros check") && !app.status.contains("install.sh"),
+            "{}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn an_appimage_never_overwrites_a_remap_unit_that_install_sh_or_a_package_owns() {
+        let dir = TempDir::new("remap-owned");
+        let (mut app, fake) = appimage_remap_app(
+            &dir,
+            APPIMAGE,
+            &appimage_show("/home/u/.local/bin/razerctl"),
+        );
+        let installed = include_str!("../../systemd/razerctl-remap.service").to_string();
+        let user_dir = dir.0.join("systemd/user");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(user_dir.join(REMAP_UNIT), &installed).unwrap();
+        fake.on(
+            &check_cmd_for(&dir, "/home/u/.local/bin/razerctl"),
+            true,
+            "ok",
+            "",
+        );
+        assert!(app.systemctl(&["restart", SERVICE]), "{}", app.status);
+        assert_eq!(
+            remap_unit_file(&dir),
+            installed,
+            "install.sh's unit must be byte-identical"
+        );
+        assert!(
+            !fake
+                .calls()
+                .contains(&"systemctl --user daemon-reload".to_string()),
+            "{:?}",
+            fake.calls()
+        );
+        // a packaged unit, with nothing in the user directory
+        std::fs::remove_file(user_dir.join(REMAP_UNIT)).unwrap();
+        std::fs::create_dir_all(&app.unit_site.packaged_dirs[0]).unwrap();
+        std::fs::write(
+            app.unit_site.packaged_dirs[0].join(REMAP_UNIT),
+            "[Service]\n",
+        )
+        .unwrap();
+        assert!(app.systemctl(&["restart", SERVICE]));
+        assert_eq!(
+            remap_unit_file(&dir),
+            "",
+            "nothing is written beside a packaged unit"
+        );
+    }
+
+    #[test]
+    fn a_moved_appimage_rewrites_the_remap_unit_and_restarts_a_running_service_onto_the_new_path() {
+        let dir = TempDir::new("remap-moved");
+        let (mut app, _) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
+        assert!(app.systemctl(&["start", SERVICE]));
+        let moved = "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage";
+        let (mut app, fake) = appimage_remap_app(&dir, moved, &appimage_show(moved));
+        assert!(app.systemctl(&["start", SERVICE]), "{}", app.status);
+        assert!(remap_unit_file(&dir).contains(&format!("ExecStart={moved} remap\n")));
+        assert!(!remap_unit_file(&dir).contains("/Apps/"));
+        let calls = fake.calls();
+        assert!(
+            position(&calls, "systemctl --user daemon-reload")
+                < position(
+                    &calls,
+                    "systemctl --user try-restart razerctl-remap.service"
+                )
+                && position(
+                    &calls,
+                    "systemctl --user try-restart razerctl-remap.service"
+                ) < position(&calls, "systemctl --user start razerctl-remap.service"),
+            "{calls:?}"
+        );
+        // at start-up the stale path is followed without a click, and nothing is started
+        let dir = TempDir::new("remap-follow");
+        let (mut app, _) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
+        app.follow_moved_appimage();
+        assert_eq!(
+            remap_unit_file(&dir),
+            "",
+            "no unit is ever created at start-up"
+        );
+        assert!(app.systemctl(&["start", SERVICE]));
+        let (mut app, fake) = appimage_remap_app(&dir, moved, &appimage_show(moved));
+        app.follow_moved_appimage();
+        assert!(remap_unit_file(&dir).contains(&format!("ExecStart={moved} remap\n")));
+        assert!(fake
+            .calls()
+            .contains(&"systemctl --user try-restart razerctl-remap.service".to_string()));
+        assert!(!fake
+            .calls()
+            .iter()
+            .any(|c| c.starts_with("systemctl --user start") || c.contains("enable")));
+    }
+
+    #[test]
+    fn disabling_the_remap_service_removes_only_the_unit_the_appimage_wrote() {
+        let dir = TempDir::new("remap-disable");
+        let (mut app, fake) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
+        // nothing installed: nothing to disable, and no systemctl call that would fail
+        assert!(
+            app.systemctl(&["disable", "--now", SERVICE]),
+            "{}",
+            app.status
+        );
+        assert!(
+            !fake.calls().iter().any(|c| c.contains("disable")),
+            "{:?}",
+            fake.calls()
+        );
+        assert!(app.systemctl(&["enable", "--now", SERVICE]));
+        assert!(remap_unit_file(&dir).contains("ExecStart="));
+        fake.calls.borrow_mut().clear();
+        assert!(
+            app.systemctl(&["disable", "--now", SERVICE]),
+            "{}",
+            app.status
+        );
+        assert_eq!(remap_unit_file(&dir), "", "our unit is deleted");
+        let calls = fake.calls();
+        assert!(
+            position(
+                &calls,
+                "systemctl --user disable --now razerctl-remap.service"
+            ) < position(&calls, "systemctl --user daemon-reload"),
+            "{calls:?}"
+        );
+        assert!(!app.status_is_error, "{}", app.status);
+        // install.sh's unit is stopped and kept
+        let installed = include_str!("../../systemd/razerctl-remap.service").to_string();
+        std::fs::write(dir.0.join("systemd/user").join(REMAP_UNIT), &installed).unwrap();
+        assert!(app.systemctl(&["disable", "--now", SERVICE]));
+        assert_eq!(remap_unit_file(&dir), installed);
+    }
+
+    #[test]
+    fn other_installs_start_and_disable_the_remap_unit_they_have_and_write_nothing() {
+        let dir = TempDir::new("remap-tarball");
+        let (mut app, fake) = appimage_remap_app(&dir, APPIMAGE, HEALTHY);
+        app.update.install = razerctl::update::InstallType::Tarball;
+        assert!(app.systemctl(&["restart", SERVICE]));
+        assert!(app.systemctl(&["disable", "--now", SERVICE]));
+        assert_eq!(remap_unit_file(&dir), "");
+        let calls = fake.calls();
+        assert!(
+            calls.contains(&"systemctl --user disable --now razerctl-remap.service".to_string())
+        );
+        assert!(
+            !calls.contains(&"systemctl --user daemon-reload".to_string()),
+            "{calls:?}"
         );
     }
 }
