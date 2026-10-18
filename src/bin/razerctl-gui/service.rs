@@ -252,7 +252,10 @@ pub fn uses_macros(conf_text: &str) -> bool {
 /// itself, so reaching this with an AppImage means that write did not take.
 fn not_installed_hint(install: &InstallType) -> &'static str {
     match install {
-        InstallType::Tarball => "Run ./install.sh first.",
+        InstallType::Tarball => {
+            "Copy it from the tarball's systemd/ folder into ~/.config/systemd/user/ (see the README), \
+             or run ./install.sh from a source checkout."
+        }
         InstallType::Package => "Reinstall the razerctl package to restore it.",
         InstallType::AppImage { .. } => {
             "This AppImage writes it to ~/.config/systemd/user when you press Start; systemd didn't find it there, \
@@ -262,9 +265,11 @@ fn not_installed_hint(install: &InstallType) -> &'static str {
 }
 
 /// What to do when the binary the unit runs is too old or can't run, for how this copy was installed. `bin` is that binary.
-fn reinstall_hint(install: &InstallType, bin: &Path) -> &'static str {
+pub(super) fn reinstall_hint(install: &InstallType, bin: &Path) -> &'static str {
     match install {
-        InstallType::Tarball => "reinstall it with ./install.sh",
+        InstallType::Tarball => {
+            "reinstall it from the latest tarball (see the README), or with ./install.sh from a source checkout"
+        }
         InstallType::Package => "reinstall the razerctl package",
         InstallType::AppImage { path } if path == bin => {
             "update this AppImage (App tab, Check for updates, or download the latest release)"
@@ -659,10 +664,14 @@ impl App {
 // ------------------------------------------------------------------------------------------- battery notifier
 
 /// The status-bar line when `systemctl` refuses to enable or disable the notifier. The settings are already saved; the
-/// hint at the end has to fit how razerctl was installed (an AppImage user has no `install.sh`).
+/// hint at the end has to fit how razerctl was installed (an AppImage user has no `install.sh`, and a release tarball
+/// ships the units but not the script).
 pub fn notifier_failure(install: &InstallType, verb: &str, why: &str) -> String {
     let hint = match install {
-        InstallType::Tarball => " (run ./install.sh to install it)",
+        InstallType::Tarball => {
+            " (copy it from the tarball's systemd/ folder into ~/.config/systemd/user/, see the README; \
+             or run ./install.sh from a source checkout)"
+        }
         InstallType::Package => " (reinstall the razerctl package to restore the unit)",
         InstallType::AppImage { .. } => "",
     };
@@ -1092,6 +1101,41 @@ pub mod tests {
         }
     }
 
+    /// A release tarball does not ship `install.sh` (DAN-1762): each Tarball hint has to point at the `systemd/` folder it
+    /// does ship, and keep `./install.sh` for a source checkout only.
+    #[test]
+    fn every_tarball_hint_covers_a_release_tarball_and_a_source_checkout() {
+        let bin = Path::new("/home/u/.local/bin/razerctl");
+        let tarball = &InstallType::Tarball;
+        let hints = [
+            (
+                "not_installed_hint",
+                not_installed_hint(tarball).to_string(),
+            ),
+            ("reinstall_hint", reinstall_hint(tarball, bin).to_string()),
+            (
+                "notifier_failure",
+                notifier_failure(tarball, "enable", "no such unit"),
+            ),
+        ];
+        for (name, hint) in &hints {
+            assert!(
+                hint.contains("tarball")
+                    && hint.contains("README")
+                    && hint.contains("source checkout"),
+                "{name}: {hint}"
+            );
+            assert!(
+                hint.contains("./install.sh from a source checkout"),
+                "{name} must limit ./install.sh to a source checkout: {hint}"
+            );
+        }
+        // the two that point at the units name the folder the tarball ships them in
+        for (name, hint) in [&hints[0], &hints[2]] {
+            assert!(hint.contains("systemd/"), "{name}: {hint}");
+        }
+    }
+
     #[test]
     fn the_preflight_copy_names_the_remedy_for_the_install_that_is_running() {
         let d = Dir::new("copy", "back = macro:copy,held\n");
@@ -1099,7 +1143,9 @@ pub mod tests {
         let sys = Fake::default();
         let e = |install: &InstallType| preflight(&sys, install, &gone, &d.conf()).unwrap_err();
         assert!(
-            e(&InstallType::Tarball).ends_with("Run ./install.sh first."),
+            e(&InstallType::Tarball).ends_with(
+                "Copy it from the tarball's systemd/ folder into ~/.config/systemd/user/ (see the README), or run ./install.sh from a source checkout."
+            ),
             "{}",
             e(&InstallType::Tarball)
         );
@@ -1133,7 +1179,9 @@ pub mod tests {
         let m = preflight(&sys, &appimage(), &theirs, &d.conf()).unwrap_err();
         assert!(m.contains("that copy") && !m.contains("install.sh"), "{m}");
         let m = preflight(&sys, &InstallType::Tarball, &theirs, &d.conf()).unwrap_err();
-        assert!(m.ends_with("reinstall it with ./install.sh."), "{m}");
+        assert!(m.ends_with(
+                "reinstall it from the latest tarball (see the README), or with ./install.sh from a source checkout."
+            ), "{m}");
         let m = preflight(&sys, &InstallType::Package, &theirs, &d.conf()).unwrap_err();
         assert!(
             m.contains("reinstall the razerctl package") && !m.contains("install.sh"),
