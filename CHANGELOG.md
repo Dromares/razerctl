@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+**AppImage: the low-battery notifier now turns on from the GUI.** Switching it on in the Device tab used to fail with "Unit
+razerctl-battery.service does not exist (run ./install.sh to install it)", because only `install.sh` and the package
+installed the unit and the AppImage has neither. Now the app writes `~/.config/systemd/user/razerctl-battery.service`
+itself (it follows `$XDG_CONFIG_HOME`), pointing at the AppImage file, reloads systemd and enables it. If you move the
+AppImage, the next start of the app (or turning the notifier on again) rewrites the path; updating in place keeps it working. Turning the notifier off
+stops the unit and removes the file the app wrote. A unit installed by `install.sh` or a package is never overwritten.
+`razerctl-gui battery-watch` runs the notifier loop with no window, which is what the unit starts. The error message no
+longer tells AppImage users to run `./install.sh`. The remap service still needs `./install.sh` or the tarball.
+
 The `razerctl-bin` recipe is removed and razerctl will not be published to the AUR. Arch and CachyOS users install the
 AppImage or the tarball, or build the package from a checkout with `makepkg -si` in `packaging/`. Nothing about how the
 mouse is driven changed.

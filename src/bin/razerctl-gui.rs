@@ -31,7 +31,6 @@ mod widgets;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{
@@ -42,7 +41,7 @@ use macro_ui::{MacroUi, Remap, Sub};
 use razerctl::device::{self, Backend, Info, Prefer};
 use razerctl::hidraw::Hidraw;
 use razerctl::onboard::{self, Assignment, Onboard, MODE_NORMAL};
-use razerctl::{battery, remap};
+use razerctl::{battery, remap, units};
 use service::{Failure, Pending, RealSys, Sys};
 use theme::*;
 use tray::{CloseAction, Cmd};
@@ -175,6 +174,8 @@ struct App {
     watching: bool,
     batt_cfg: battery::Config,
     batt_service: String,
+    /// Where the notifier's user unit lives and which directories a package owns (an AppImage writes its own; `service.rs`).
+    unit_site: units::Site,
     /// Button id of the highlighted table row / mouse-diagram tag.
     selected: Option<u8>,
     /// Button whose write failed in the last `save_buttons`, for the per-row marker.
@@ -273,6 +274,7 @@ impl App {
             watching: false,
             batt_cfg: battery::load(),
             batt_service: String::new(),
+            unit_site: units::Site::from_env(),
             selected: None,
             failed: None,
             pal: Pal::new(Mode::Dark),
@@ -533,28 +535,20 @@ impl App {
         self.save_buttons();
     }
 
-    /// Save battery settings, and start/stop the background notifier to match the toggle.
+    /// Save battery settings, and start/stop the background notifier to match the toggle (`service.rs`).
     fn apply_battery_settings(&mut self) {
         if let Err(e) = battery::save(&self.batt_cfg) {
             self.err(format!("couldn't save battery settings: {e}"));
             return;
         }
-        let args: &[&str] = if self.batt_cfg.enabled {
-            &["enable", "--now", battery::SERVICE]
+        let r = if self.batt_cfg.enabled {
+            self.enable_notifier()
         } else {
-            &["disable", "--now", battery::SERVICE]
+            self.disable_notifier()
         };
-        match Command::new("systemctl").arg("--user").args(args).output() {
-            Ok(o) if o.status.success() => self.ok(if self.batt_cfg.enabled {
-                format!("Low-battery alerts on: you'll be notified at {}% or below.", self.batt_cfg.threshold)
-            } else {
-                "Low-battery alerts off.".to_string()
-            }),
-            Ok(o) => self.err(format!(
-                "Settings saved, but the notifier service didn't {}: {} (run ./install.sh to install it)",
-                args[0], String::from_utf8_lossy(&o.stderr).trim()
-            )),
-            Err(e) => self.err(e.to_string()),
+        match r {
+            Ok(msg) => self.ok(msg),
+            Err(e) => self.err(e),
         }
         self.refresh_service();
     }
@@ -2426,8 +2420,10 @@ razerctl-gui — desktop settings for Razer mice
 
 USAGE:
     razerctl-gui [-V | --version] [-h | --help]
+    razerctl-gui battery-watch
 
-Without arguments this opens the window. For the command-line tool, run `razerctl --help`.
+Without arguments this opens the window. `battery-watch` runs the low-battery notifier with no window; the
+razerctl-battery.service unit the AppImage writes uses it. For the command-line tool, run `razerctl --help`.
 ";
 
 /// What an invocation with these arguments should print instead of opening the window, if anything. Only the first
@@ -2447,6 +2443,10 @@ fn main() -> eframe::Result {
         print!("{text}");
         return Ok(());
     }
+    // The AppImage starts this binary and nothing else, so the notifier unit it writes asks for the loop here (DAN-1747).
+    if args.first().map(String::as_str) == Some("battery-watch") {
+        battery::watch_forever();
+    }
     let (w, h) = demo::window_size().unwrap_or((1280.0, 900.0));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -2465,6 +2465,9 @@ fn main() -> eframe::Result {
         Box::new(move |cc| {
             install_fonts(&cc.egui_ctx);
             let mut app = App::new(for_app);
+            if !demo::hooks_active() {
+                app.follow_moved_appimage();
+            }
             // background checks only in a real launch: the visual-review hooks and the tests never reach the network
             app.update.auto = !demo::hooks_active();
             Ok(Box::new(app))
@@ -2547,6 +2550,10 @@ mod tests {
                 interval_min: 5,
             },
             batt_service: "inactive".into(),
+            unit_site: units::Site {
+                user_dir: std::env::temp_dir().join("razerctl-gui-test-never-written/systemd/user"),
+                packaged_dirs: vec![],
+            },
             selected: None,
             failed: None,
             pal: Pal::new(Mode::Dark),
@@ -4700,5 +4707,236 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ---- DAN-1747: the notifier unit for an AppImage
+
+    const APPIMAGE: &str = "/home/u/Apps/razerctl-0.3.0-x86_64.AppImage";
+    const UNIT: &str = "razerctl-battery.service";
+
+    /// An app that thinks it runs as the AppImage at `path`, with its unit directory under `dir` and `systemctl` stubbed.
+    /// `apply_battery_settings` is never called here: it saves `battery.conf` to the real config directory.
+    fn appimage_app(dir: &TempDir, path: &str) -> (App, Fake) {
+        let mut app = macro_app(Sub::Rules);
+        app.update.install = razerctl::update::InstallType::AppImage { path: path.into() };
+        app.unit_site = units::Site {
+            user_dir: dir.0.join("systemd/user"),
+            packaged_dirs: vec![dir.0.join("usr-lib-systemd-user")],
+        };
+        app.batt_cfg.enabled = true;
+        let fake = Fake::default();
+        app.sys = Box::new(fake.clone());
+        (app, fake)
+    }
+
+    fn unit_file(dir: &TempDir) -> String {
+        std::fs::read_to_string(dir.0.join("systemd/user").join(UNIT)).unwrap_or_default()
+    }
+
+    #[test]
+    fn enabling_the_notifier_from_an_appimage_writes_its_unit_before_systemctl_enables_it() {
+        let dir = TempDir::new("batt-enable");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        let msg = app.enable_notifier().unwrap();
+        assert!(msg.starts_with("Low-battery alerts on"), "{msg}");
+        assert!(
+            unit_file(&dir).contains(&format!("ExecStart={APPIMAGE} battery-watch\n")),
+            "{}",
+            unit_file(&dir)
+        );
+        assert_eq!(
+            fake.calls(),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now razerctl-battery.service"
+            ]
+        );
+        // a second toggle (or a threshold change) with nothing moved touches neither the file nor the reload
+        fake.calls.borrow_mut().clear();
+        app.enable_notifier().unwrap();
+        assert_eq!(
+            fake.calls(),
+            ["systemctl --user enable --now razerctl-battery.service"]
+        );
+    }
+
+    #[test]
+    fn a_moved_appimage_rewrites_the_unit_and_restarts_the_running_notifier() {
+        let dir = TempDir::new("batt-moved");
+        let (mut app, _) = appimage_app(&dir, APPIMAGE);
+        app.enable_notifier().unwrap();
+        let moved = "/home/u/Downloads/razerctl-0.3.0-x86_64.AppImage";
+        let (mut app, fake) = appimage_app(&dir, moved);
+        app.enable_notifier().unwrap();
+        let unit = unit_file(&dir);
+        assert!(
+            unit.contains(&format!("ExecStart={moved} battery-watch\n")),
+            "{unit}"
+        );
+        assert!(!unit.contains("/Apps/"), "{unit}");
+        assert_eq!(
+            fake.calls(),
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now razerctl-battery.service",
+                "systemctl --user try-restart razerctl-battery.service"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_appimage_never_overwrites_a_unit_that_install_sh_or_a_package_owns() {
+        let dir = TempDir::new("batt-clobber");
+        let shipped = include_str!("../../systemd/razerctl-battery.service");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        let user = dir.0.join("systemd/user");
+        std::fs::create_dir_all(&user).unwrap();
+        std::fs::write(user.join(UNIT), shipped).unwrap();
+        app.enable_notifier().unwrap();
+        assert_eq!(
+            unit_file(&dir),
+            shipped,
+            "install.sh's unit must be left as it is"
+        );
+        assert_eq!(
+            fake.calls(),
+            ["systemctl --user enable --now razerctl-battery.service"]
+        );
+        // a package's unit with no copy in ~/.config
+        std::fs::remove_file(user.join(UNIT)).unwrap();
+        std::fs::create_dir_all(&app.unit_site.packaged_dirs[0]).unwrap();
+        std::fs::write(app.unit_site.packaged_dirs[0].join(UNIT), "[Service]\n").unwrap();
+        app.enable_notifier().unwrap();
+        assert_eq!(
+            unit_file(&dir),
+            "",
+            "nothing is written next to a packaged unit"
+        );
+        // and turning it off keeps a unit the AppImage did not write
+        std::fs::write(user.join(UNIT), shipped).unwrap();
+        app.disable_notifier().unwrap();
+        assert_eq!(unit_file(&dir), shipped);
+    }
+
+    #[test]
+    fn starting_from_a_new_path_repoints_a_stale_unit_but_never_writes_a_missing_one() {
+        let dir = TempDir::new("batt-follow");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        app.follow_moved_appimage(); // enabled, but no unit: the user's toggle writes it, start-up does not
+        assert_eq!(unit_file(&dir), "");
+        assert!(fake.calls().is_empty());
+        app.enable_notifier().unwrap();
+        let moved = "/home/u/Downloads/razerctl.AppImage";
+        let (mut app, fake) = appimage_app(&dir, moved);
+        app.follow_moved_appimage();
+        assert!(unit_file(&dir).contains(&format!("ExecStart={moved} battery-watch\n")));
+        assert_eq!(
+            fake.calls()[..3],
+            [
+                "systemctl --user daemon-reload",
+                "systemctl --user enable --now razerctl-battery.service",
+                "systemctl --user try-restart razerctl-battery.service"
+            ]
+        );
+        // same path again, and notifier off: nothing happens
+        fake.calls.borrow_mut().clear();
+        app.follow_moved_appimage();
+        app.batt_cfg.enabled = false;
+        app.follow_moved_appimage();
+        assert!(fake.calls().is_empty());
+    }
+
+    #[test]
+    fn disabling_from_an_appimage_stops_the_unit_and_removes_the_file_it_wrote() {
+        let dir = TempDir::new("batt-disable");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        app.enable_notifier().unwrap();
+        fake.calls.borrow_mut().clear();
+        assert_eq!(app.disable_notifier().unwrap(), "Low-battery alerts off.");
+        assert_eq!(unit_file(&dir), "");
+        assert_eq!(
+            fake.calls(),
+            [
+                "systemctl --user disable --now razerctl-battery.service",
+                "systemctl --user daemon-reload"
+            ]
+        );
+        // nothing installed, nothing to disable: no systemctl error for a unit that never existed
+        fake.calls.borrow_mut().clear();
+        assert_eq!(app.disable_notifier().unwrap(), "Low-battery alerts off.");
+        assert!(fake.calls().is_empty(), "{:?}", fake.calls());
+    }
+
+    #[test]
+    fn a_failed_disable_keeps_the_unit_file_so_the_user_can_try_again() {
+        let dir = TempDir::new("batt-disable-fails");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        app.enable_notifier().unwrap();
+        fake.on(
+            "systemctl --user disable --now razerctl-battery.service",
+            false,
+            "",
+            "Failed to disable unit: no bus\n",
+        );
+        let e = app.disable_notifier().unwrap_err();
+        assert!(e.contains("didn't disable") && e.contains("no bus"), "{e}");
+        assert!(unit_file(&dir).contains("battery-watch"));
+    }
+
+    #[test]
+    fn the_error_copy_fits_the_install_type() {
+        use razerctl::update::InstallType;
+        let why = "Unit razerctl-battery.service does not exist";
+        let appimage = service::notifier_failure(
+            &InstallType::AppImage {
+                path: APPIMAGE.into(),
+            },
+            "enable",
+            why,
+        );
+        assert!(!appimage.contains("install.sh"), "{appimage}");
+        assert!(appimage.contains(why));
+        let tarball = service::notifier_failure(&InstallType::Tarball, "enable", why);
+        assert!(
+            tarball.ends_with("(run ./install.sh to install it)"),
+            "{tarball}"
+        );
+        let package = service::notifier_failure(&InstallType::Package, "enable", why);
+        assert!(!package.contains("install.sh"), "{package}");
+    }
+
+    #[test]
+    fn other_installs_enable_the_unit_they_have_and_write_nothing() {
+        let dir = TempDir::new("batt-tarball");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        app.update.install = razerctl::update::InstallType::Tarball;
+        app.enable_notifier().unwrap();
+        assert_eq!(unit_file(&dir), "");
+        assert_eq!(
+            fake.calls(),
+            ["systemctl --user enable --now razerctl-battery.service"]
+        );
+        app.disable_notifier().unwrap();
+        assert_eq!(
+            fake.calls()[1],
+            "systemctl --user disable --now razerctl-battery.service"
+        );
+    }
+
+    #[test]
+    fn an_appimage_enable_failure_does_not_tell_the_user_to_run_install_sh() {
+        let dir = TempDir::new("batt-enable-fails");
+        let (mut app, fake) = appimage_app(&dir, APPIMAGE);
+        fake.on(
+            "systemctl --user enable --now razerctl-battery.service",
+            false,
+            "",
+            "Failed to enable unit: Unit razerctl-battery.service does not exist\n",
+        );
+        let e = app.enable_notifier().unwrap_err();
+        assert!(
+            e.contains("didn't enable") && !e.contains("install.sh"),
+            "{e}"
+        );
     }
 }
