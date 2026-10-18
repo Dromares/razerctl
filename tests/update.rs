@@ -747,6 +747,10 @@ fn package_and_tarball_installs_are_told_where_and_never_asked() {
         out.contains("package manager") && !out.contains("[y/N]"),
         "{out}"
     );
+    assert!(
+        out.contains("package under /usr/") && out.contains("not on the AUR yet"),
+        "{out}"
+    );
     let (res, out) = cli(&fx, &[], &InstallType::Tarball, "y\n");
     assert_eq!(res, Ok(()));
     assert!(

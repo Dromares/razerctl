@@ -44,7 +44,7 @@ pub fn run(
     match install {
         InstallType::Package => writeln!(
             out,
-            "razerctl was installed by your package manager, so it is updated there (yay -Syu or paru -Syu). Nothing was changed."
+            "razerctl is installed as a package under /usr/, so your package manager updates it, not razerctl. Nothing was changed.\nThe AUR recipe razerctl-bin (yay -Syu or paru -Syu) is not on the AUR yet."
         )
         .map_err(w),
         InstallType::Tarball => writeln!(

@@ -77,7 +77,7 @@ replug, but that has not been tested on every desktop, so replug if the GUI stil
 
 | Installed with | How it updates |
 |---|---|
-| AUR `razerctl-bin` | `yay -Syu` / `paru -Syu`, with the rest of the system. |
+| Package (files under `/usr/`) | Through the package manager that installed it. Once the board has pushed the `razerctl-bin` recipe to the AUR, that is `yay -Syu` / `paru -Syu`, with the rest of the system. The recipe in [packaging/aur/razerctl-bin](packaging/aur/razerctl-bin) is **not on the AUR yet**, so for now there is nothing to update this way. |
 | AppImage | The in-app update check shows the new version and its changelog and only updates after you confirm. [AppImageUpdate](https://github.com/AppImageCommunity/AppImageUpdate), Gear Lever and AppImageLauncher also work, using the release's `.zsync` file. |
 | Tarball / `install.sh` | The in-app check only tells you a newer release exists; repeat the install steps with the new tarball (for `install.sh`, `git pull` and run it again). |
 
