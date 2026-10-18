@@ -2421,7 +2421,32 @@ impl eframe::App for App {
     }
 }
 
+const USAGE: &str = "\
+razerctl-gui — desktop settings for Razer mice
+
+USAGE:
+    razerctl-gui [-V | --version] [-h | --help]
+
+Without arguments this opens the window. For the command-line tool, run `razerctl --help`.
+";
+
+/// What an invocation with these arguments should print instead of opening the window, if anything. Only the first
+/// argument counts, and any other argument still opens the window, so a launcher that passes extra arguments keeps working.
+fn early_exit_text(args: &[String]) -> Option<String> {
+    match args.first().map(String::as_str) {
+        Some("-V" | "--version") => Some(format!("razerctl {}\n", env!("CARGO_PKG_VERSION"))),
+        Some("-h" | "--help") => Some(USAGE.to_string()),
+        _ => None,
+    }
+}
+
 fn main() -> eframe::Result {
+    // before eframe and winit start, so these work with no display
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(text) = early_exit_text(&args) {
+        print!("{text}");
+        return Ok(());
+    }
     let (w, h) = demo::window_size().unwrap_or((1280.0, 900.0));
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
