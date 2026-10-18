@@ -9,7 +9,16 @@ itself (it follows `$XDG_CONFIG_HOME`), pointing at the AppImage file, reloads s
 AppImage, the next start of the app (or turning the notifier on again) rewrites the path; updating in place keeps it working. Turning the notifier off
 stops the unit and removes the file the app wrote. A unit installed by `install.sh` or a package is never overwritten.
 `razerctl-gui battery-watch` runs the notifier loop with no window, which is what the unit starts. The error message no
-longer tells AppImage users to run `./install.sh`. The remap service still needs `./install.sh` or the tarball.
+longer tells AppImage users to run `./install.sh`.
+
+**AppImage: the remap service now runs from the GUI too.** Start, Save and restart, Enable at login and the tray's Start used to
+fail with "razerctl-remap.service is not installed. Run ./install.sh first." because the AppImage installs no unit. Now the
+app writes `~/.config/systemd/user/razerctl-remap.service` the same way it does the notifier's, with `ExecStart=` running
+the AppImage file and the shipped restart policy unchanged (a config problem exits 78 and is not retried). Disable at login
+stops it and removes the file the app wrote; a unit from `install.sh` or a package is never overwritten, and a moved
+AppImage is followed at the next start. `razerctl-gui remap` and `razerctl-gui macros …` do what `razerctl remap` and
+`razerctl macros …` do (same exit statuses), which is what the unit and the pre-flight check run. Error messages now name the
+remedy for how razerctl was installed, and a missing-permission error from the AppImage names the udev rule line.
 
 The `razerctl-bin` recipe is removed and razerctl will not be published to the AUR. Arch and CachyOS users install the
 AppImage or the tarball, or build the package from a checkout with `makepkg -si` in `packaging/`. Nothing about how the

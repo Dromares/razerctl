@@ -22,7 +22,8 @@ sudo curl -fLo /etc/udev/rules.d/70-razerctl.rules https://github.com/Dromares/r
 ```
 
 The second line is the udev rule (see below); an AppImage cannot install it by itself. It needs glibc 2.35 or newer and
-carries only the GUI and CLI binaries, not the systemd units. Details and the build recipe are under
+carries the GUI and CLI binaries and no systemd units: the app writes its own when you turn on the remap service or the
+low-battery notifier. Details and the build recipe are under
 [AppImage details](#appimage-details-and-building).
 
 ### Tarball
@@ -86,7 +87,7 @@ Open **razerctl** from the app menu (or run `razerctl-gui`).
   with no software running, on any computer. Left click is locked so you can't lose clicking.
 * **Device** tab: battery, firmware, serial, DPI stages, set DPI / polling rate.
 * **Software remap** tab: optional computer-side remapper (`remap.conf` + systemd user service)
-  for things the mouse can't store.
+  for things the mouse can't store. From the AppImage, Start / Enable at login need no install step either (see below).
 * **Low-battery notification** (Device tab): optional desktop alert at or below a chosen
   percentage, run by the `razerctl-battery.service` user unit (settings in
   `~/.config/razerctl/battery.conf`). From the AppImage, turning it on needs no install step: the app writes the unit
@@ -106,12 +107,20 @@ does **not** install the udev rule, so the mouse stays unreachable until you ins
 [Install, AppImage](#appimage)).
 
 The command-line tool is inside it too (`--appimage-extract`, then `squashfs-root/usr/bin/razerctl`). The
-systemd units are not packaged. The **low-battery notifier** needs nothing from you: turning it on in the Device tab writes
-`$XDG_CONFIG_HOME/systemd/user/razerctl-battery.service` (normally `~/.config/systemd/user/`) with `ExecStart=` running
-`<the AppImage> battery-watch`, reloads systemd and enables it; moving the AppImage and starting it (or turning the notifier on again)
-rewrites the path, and turning it off stops the unit and deletes the file. A unit that `./install.sh` or a package put there
-is never overwritten. The **remap service** is not available from the AppImage yet; use `./install.sh` or the tarball if
-you want it.
+systemd units are not packaged; the app writes the two it needs into `$XDG_CONFIG_HOME/systemd/user/` (normally
+`~/.config/systemd/user/`) when you ask for them, with `ExecStart=` running the AppImage file itself (`$APPIMAGE`, never
+the temporary mount path):
+
+* **Low-battery notifier**: turning it on in the Device tab writes `razerctl-battery.service` running
+  `<the AppImage> battery-watch`, reloads systemd and enables it.
+* **Remap service**: Start, Save and restart, and Enable at login in the Software remap tab (and Start in the tray menu)
+  write `razerctl-remap.service` running `<the AppImage> remap`, with the same restart policy as `systemd/razerctl-remap.service`
+  (a config problem exits 78 and is not retried). Disable at login stops it and deletes the file. It needs read access to the
+  mouse's `/dev/input/event*` nodes, which the udev rule from [Install, AppImage](#appimage) grants, and `/dev/uinput`.
+
+Moving the AppImage and starting it (or pressing Start / turning the notifier on again) rewrites the path in a unit the app
+wrote, and turning a service off deletes its file. A unit that `./install.sh` or a package put there is never overwritten.
+`<the AppImage> remap` and `<the AppImage> macros …` do what `razerctl remap` and `razerctl macros …` do.
 
 To build one (the image needs at least the build machine's glibc, so the release is built
 in an Ubuntu 22.04 root filesystem):
@@ -221,7 +230,9 @@ install -Dm755 target/release/razerctl ~/.local/bin/razerctl
 cp systemd/razerctl-remap.service ~/.config/systemd/user/ && systemctl --user enable --now razerctl-remap
 ```
 Requirements: read access to the Razer `/dev/input/event*` nodes (openrazer group) and rw on
-`/dev/uinput` (your user already has both).
+`/dev/uinput` (your user already has both). From the AppImage there is no unit to copy: the Software remap tab writes it
+when you press Start (see [AppImage details](#appimage-details-and-building)); the udev rule line from
+[Install, AppImage](#appimage) is what grants the input nodes.
 
 `razerctl remap` exits 78 when the config is the problem (no rules, a rule that does not parse, an undefined macro)
 and the unit does not restart on that: it stays `failed` with the reason in `journalctl --user -u razerctl-remap`.
