@@ -4350,7 +4350,7 @@ mod tests {
             );
             assert!(
                 l.iter()
-                    .any(|s| s.starts_with("Updates come from your system package manager")),
+                    .any(|s| s.starts_with("razerctl is installed as a package under /usr/")),
                 "{l:?}"
             );
         }
@@ -4423,8 +4423,14 @@ mod tests {
             ),
             (
                 InstallType::Package,
-                vec!["CLOSE", "yay -Syu", "paru -Syu"],
-                vec!["UPDATE", "NOT NOW", "OPEN RELEASE PAGE"],
+                vec!["CLOSE"],
+                vec![
+                    "UPDATE",
+                    "NOT NOW",
+                    "OPEN RELEASE PAGE",
+                    "yay -Syu",
+                    "paru -Syu",
+                ],
             ),
         ] {
             app.update.install = install.clone();
