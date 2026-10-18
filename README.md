@@ -10,15 +10,15 @@
 
 Pick one format. Every one needs the [udev rule](#the-udev-rule) once, because only root can install it.
 
-> **Release downloads are not live yet.** The links below point at the GitHub releases of
-> `github.com/Dromares/razerctl`, which stay unreachable until the owner makes the repository public. Until then, build
-> from source.
+Prebuilt downloads are on the [releases page](https://github.com/Dromares/razerctl/releases/latest); building from source is optional.
 
 ### Arch / CachyOS (AUR)
 
 ```
 yay -S razerctl-bin          # or: paru -S razerctl-bin
 ```
+
+`razerctl-bin` is **not on the AUR yet**, so this command will not work until the package is published; use the AppImage or tarball below meanwhile.
 
 Installs the prebuilt release to `/usr/bin` and the udev rule to `/usr/lib/udev/rules.d/`. It conflicts with, and
 provides, `razerctl`. The package's install message repeats the replug step below. (Package recipe:
