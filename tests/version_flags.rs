@@ -33,7 +33,10 @@ fn assert_prints(out: &Output, what: &str, expected: impl Fn(&str) -> bool) {
         "{what}: exit {:?}\nstdout: {stdout}\nstderr: {stderr}",
         out.status.code()
     );
-    assert!(expected(&stdout), "{what}: unexpected stdout {stdout:?}\nstderr: {stderr}");
+    assert!(
+        expected(&stdout),
+        "{what}: unexpected stdout {stdout:?}\nstderr: {stderr}"
+    );
 }
 
 #[test]
@@ -48,7 +51,9 @@ fn cli_prints_its_version() {
 fn cli_help_is_unchanged() {
     for flag in ["--help", "-h"] {
         let out = run(env!("CARGO_BIN_EXE_razerctl"), &[flag]);
-        assert_prints(&out, &format!("razerctl {flag}"), |s| s.contains("USAGE:") && s.contains("COMMANDS:"));
+        assert_prints(&out, &format!("razerctl {flag}"), |s| {
+            s.contains("USAGE:") && s.contains("COMMANDS:")
+        });
     }
 }
 
