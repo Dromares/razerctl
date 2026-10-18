@@ -6,7 +6,7 @@ The AppImage now manages its own background services, so the low-battery notifie
 the app with no install step. Nothing about how the mouse is driven changed.
 
 **How to get it.** AppImage users on v0.3.0 get this through the in-app updater (the update banner, then *Update*), or
-through AppImageUpdate or Gear Lever. Tarball users re-run `./install.sh` from the new tarball, as before.
+through AppImageUpdate or Gear Lever. Tarball users download the new tarball and repeat the install steps; if you installed with `./install.sh`, `git pull` and run it again.
 
 **AppImage: the low-battery notifier now turns on from the GUI.** Switching it on in the Device tab used to fail with "Unit
 razerctl-battery.service does not exist (run ./install.sh to install it)", because only `install.sh` and the package
