@@ -237,7 +237,7 @@ when you press Start (see [AppImage details](#appimage-details-and-building)); t
 `razerctl remap` exits 78 when the config is the problem (no rules, a rule that does not parse, an undefined macro)
 and the unit does not restart on that: it stays `failed` with the reason in `journalctl --user -u razerctl-remap`.
 Any other failure (no mouse yet, a crash) is retried every 2 s. After you change the unit file, `systemctl --user
-daemon-reload` (`./install.sh` does it). The GUI's "Save and restart service" / "Start service" check the unit's
+daemon-reload` (from a source checkout, `./install.sh` does it). The GUI's "Save and restart service" / "Start service" check the unit's
 `ExecStart` binary first when the rules play macros, then read the unit back and show why it is not running.
 
 ### Macros
@@ -273,7 +273,7 @@ razerctl remap --macros FILE             # use another macros file (default abov
 (`systemctl --user kill --kill-whom=main --signal=SIGUSR1 razerctl-remap.service`): every running macro ends within
 a poll tick (~20 ms), anything it held down is released, and remapping carries on. A `razerctl` older than this
 change has no handler for the signal, so the service exits and systemd restarts it 2 s later (same effect, one
-interruption): reinstall the binary (`./install.sh`) to get the in-place stop.
+interruption): reinstall the binary the way you installed it (from a source checkout, `./install.sh`) to get the in-place stop.
 
 ## System tray and closing the window
 

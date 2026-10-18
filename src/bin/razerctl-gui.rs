@@ -4906,7 +4906,9 @@ mod tests {
         assert!(appimage.contains(why));
         let tarball = service::notifier_failure(&InstallType::Tarball, "enable", why);
         assert!(
-            tarball.ends_with("(run ./install.sh to install it)"),
+            tarball.ends_with(
+                "(copy it from the tarball's systemd/ folder into ~/.config/systemd/user/, see the README; or run ./install.sh from a source checkout)"
+            ),
             "{tarball}"
         );
         let package = service::notifier_failure(&InstallType::Package, "enable", why);
@@ -5225,7 +5227,9 @@ mod tests {
         app.update.install = razerctl::update::InstallType::Tarball;
         assert!(!app.systemctl(&["start", SERVICE]));
         assert!(
-            app.status.ends_with("Run ./install.sh first."),
+            app.status.ends_with(
+                "Copy it from the tarball's systemd/ folder into ~/.config/systemd/user/ (see the README), or run ./install.sh from a source checkout."
+            ),
             "{}",
             app.status
         );

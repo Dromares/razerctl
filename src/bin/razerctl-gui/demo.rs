@@ -14,7 +14,7 @@
 //! real UI code, and Save / Apply / systemctl keep calling the real device and systemd paths.
 
 use super::macro_ui::{Draft, MacroUi, Sub};
-use super::service::Failure;
+use super::service::{reinstall_hint, Failure};
 use super::theme::Mode;
 use super::{App, ButtonRow, Tab, CHOICES, SERVICE};
 use eframe::egui;
@@ -390,7 +390,11 @@ fn macro_scenario(app: &mut App, name: &str) {
             app.mac.sub = Sub::Macros;
             app.mac.sel = pos(app, "paste-enter");
             app.service_state = "inactive".into();
-            app.err("Macros saved, but the service was not restarted. The installed razerctl at ~/.local/bin/razerctl is too old for macros (it has no `macros` command); reinstall it with ./install.sh.");
+            let bin = std::path::Path::new("/home/demo/.local/bin/razerctl");
+            app.err(format!(
+                "Macros saved, but the service was not restarted. The installed razerctl at ~/.local/bin/razerctl is too old for macros (it has no `macros` command); {}.",
+                reinstall_hint(&razerctl::update::InstallType::Tarball, bin)
+            ));
         }
         "macro-stopall" => {
             app.mac.sel = pos(app, "rapid-click");
