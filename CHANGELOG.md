@@ -25,8 +25,8 @@ below.
     against the sum, replaces the file you started in place, keeps the old one as `<name>.old`, and asks you to restart.
     A checksum mismatch refuses and changes nothing. If razerctl cannot write to the folder, the new file is saved in
     your Downloads folder (or your home folder) and the message says where.
-  - **Package under `/usr/` (the AUR `razerctl-bin`):** check **off** by default, and notify-only if you turn it on.
-    razerctl never replaces files under `/usr`; update with `yay -Syu` or `paru -Syu`.
+  - **Package under `/usr/` (for example the `razerctl-bin` recipe in `packaging/aur/razerctl-bin/`, which is not on the AUR yet):** check **off** by default, and notify-only if you turn it on.
+    razerctl never replaces files under `/usr`; update with your package manager.
   - **Tarball, `./install.sh`, or a binary you copied yourself:** check on by default, notify-only, with a link to the
     release page. Repeat the install steps with the new release.
 - Checking a download against `SHA256SUMS` catches a corrupted or truncated download. It does **not** protect against
@@ -60,7 +60,7 @@ Every format needs the udev rule once, because only root can install it, and the
 - **Tarball:** `sudo install -Dm644 70-razerctl.rules /etc/udev/rules.d/70-razerctl.rules`, then
   `sudo udevadm control --reload && sudo udevadm trigger`.
 - **`./install.sh`:** installs it with sudo.
-- **AUR package:** installs it to `/usr/lib/udev/rules.d/`. The recipe is in `packaging/aur/razerctl-bin/`.
+- **Arch package** (`packaging/aur/razerctl-bin/`, not on the AUR yet): installs it to `/usr/lib/udev/rules.d/`.
 
 If the GUI still reports no access after installing the rule, unplug and replug the mouse. The rule itself is unchanged
 since v0.2.0.
