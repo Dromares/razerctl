@@ -5033,6 +5033,8 @@ mod tests {
         let (mut app, fake) = appimage_remap_app(&dir, APPIMAGE, &appimage_show(APPIMAGE));
         fake.on(&check_cmd_for(&dir, APPIMAGE), true, "ok", "");
         assert!(app.systemctl(&["start", SERVICE]), "{}", app.status);
+        // the binary the check asks is the one the unit the app just wrote runs
+        assert!(remap_unit_file(&dir).contains(&format!("ExecStart={APPIMAGE} remap\n")));
         assert!(
             fake.calls().contains(&check_cmd_for(&dir, APPIMAGE)),
             "{:?}",
@@ -5200,6 +5202,32 @@ mod tests {
         assert!(
             !calls.contains(&"systemctl --user daemon-reload".to_string()),
             "{calls:?}"
+        );
+    }
+
+    #[test]
+    fn an_appimage_that_cannot_find_the_remap_unit_is_not_told_to_run_install_sh() {
+        let dir = TempDir::new("remap-missing");
+        let (mut app, _) = appimage_remap_app(&dir, APPIMAGE, "LoadState=not-found\n");
+        // a packaged unit is left alone, so nothing is written and the manager's answer stands
+        std::fs::create_dir_all(&app.unit_site.packaged_dirs[0]).unwrap();
+        std::fs::write(
+            app.unit_site.packaged_dirs[0].join(REMAP_UNIT),
+            "[Service]\n",
+        )
+        .unwrap();
+        assert!(!app.systemctl(&["start", SERVICE]));
+        assert!(
+            app.status.contains("not installed") && !app.status.contains("install.sh"),
+            "{}",
+            app.status
+        );
+        app.update.install = razerctl::update::InstallType::Tarball;
+        assert!(!app.systemctl(&["start", SERVICE]));
+        assert!(
+            app.status.ends_with("Run ./install.sh first."),
+            "{}",
+            app.status
         );
     }
 }
