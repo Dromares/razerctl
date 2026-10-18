@@ -53,7 +53,8 @@ cd /tmp/razerctl-vX.Y.Z
 sha256sum -c SHA256SUMS                         # every asset: OK
 test -s razerctl-X.Y.Z-x86_64.AppImage.zsync && echo zsync non-empty
 chmod +x razerctl-X.Y.Z-x86_64.AppImage
-./razerctl-X.Y.Z-x86_64.AppImage --appimage-updateinformation   # gh-releases-zsync|Dromares|razerctl|latest|...
+./razerctl-X.Y.Z-x86_64.AppImage --appimage-updateinformation   # gh-releases-zsync|Dromares|razerctl|latest|... (no FUSE: see the README for the objcopy line)
+./razerctl-X.Y.Z-x86_64.AppImage --version                      # razerctl X.Y.Z
 tar xzf razerctl-X.Y.Z-x86_64-linux.tar.gz && ./razerctl-X.Y.Z-x86_64-linux/razerctl --version
 ```
 
@@ -62,10 +63,22 @@ Check that all five assets are there, `isDraft` is `true`, the notes are the cha
 
 ## 4. Publish by hand
 
-Read the draft once more, then publish it in the GitHub web UI (Releases, the draft, *Publish release*) or:
+Read the draft once more, then publish it in the GitHub web UI (Releases, the draft, make sure *Set as the latest release*
+is ticked, *Publish release*) or:
 
 ```sh
 gh release edit vX.Y.Z --repo Dromares/razerctl --draft=false --latest
+```
+
+`--latest` is not optional. Publishing with only `--draft=false` left the previous release as Latest (DAN-1694), and the
+in-app updater (`/releases/latest`) and AppImageUpdate (`gh-releases-zsync|...|latest|...`) both follow Latest. The
+workflow cannot set it, because GitHub does not let a draft be Latest.
+
+Right after publishing, check what an anonymous client sees. This must print the new tag; if it prints the old one,
+run the `gh release edit ... --latest` line again:
+
+```sh
+curl -fsS https://api.github.com/repos/Dromares/razerctl/releases/latest | grep '"tag_name"'      # "tag_name": "vX.Y.Z",
 ```
 
 Publishing is the point of no return: the in-app updater and `/releases/latest/download/...` links see it immediately.

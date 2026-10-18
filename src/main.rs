@@ -56,6 +56,7 @@ OPTIONS:
     --backend   auto (default): use OpenRazer sysfs when its driver is bound, else hidraw
     --tid       transaction id byte (default 0x1f, what Synapse/OpenRazer use for modern mice)
     -d N        select device index from `list` (default 0)
+    -V, --version  print the version and exit
 ";
 
 fn parse_u8(s: &str) -> Result<u8, String> {
@@ -217,6 +218,11 @@ fn run() -> Result<(), Fail> {
             }
             "-h" | "--help" => {
                 print!("{USAGE}");
+                return Ok(());
+            }
+            // like --help, this returns before device discovery and any config read
+            "-V" | "--version" => {
+                println!("razerctl {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
             _ => i += 1,
