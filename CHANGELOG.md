@@ -1,6 +1,12 @@
 # Changelog
 
-## Unreleased
+## v0.3.1
+
+The AppImage now manages its own background services, so the low-battery notifier and the software remap turn on from
+the app with no install step. Nothing about how the mouse is driven changed.
+
+**How to get it.** AppImage users on v0.3.0 get this through the in-app updater (the update banner, then *Update*), or
+through AppImageUpdate or Gear Lever. Tarball users re-run `./install.sh` from the new tarball, as before.
 
 **AppImage: the low-battery notifier now turns on from the GUI.** Switching it on in the Device tab used to fail with "Unit
 razerctl-battery.service does not exist (run ./install.sh to install it)", because only `install.sh` and the package
@@ -19,10 +25,14 @@ stops it and removes the file the app wrote; a unit from `install.sh` or a packa
 AppImage is followed at the next start. `razerctl-gui remap` and `razerctl-gui macros …` do what `razerctl remap` and
 `razerctl macros …` do (same exit statuses), which is what the unit and the pre-flight check run. Error messages now name the
 remedy for how razerctl was installed, and a missing-permission error from the AppImage names the udev rule line.
+The remap service still needs what it always needed: the udev rule (`70-razerctl.rules`, installed once with the `sudo curl`
+line in the README under *Install, AppImage*, then replug the mouse), which grants read access to the mouse's
+`/dev/input/event*` nodes, and access to `/dev/uinput`.
 
-The `razerctl-bin` recipe is removed and razerctl will not be published to the AUR. Arch and CachyOS users install the
-AppImage or the tarball, or build the package from a checkout with `makepkg -si` in `packaging/`. Nothing about how the
-mouse is driven changed.
+**Package installs.** The `razerctl-bin` recipe in `packaging/aur/` is removed and razerctl will not be published to the
+AUR. Arch and CachyOS users install the AppImage or the tarball, or build the package from a checkout with `makepkg -si`
+in `packaging/`. The update notices on a package under `/usr/` (the App tab, the update dialog and `razerctl update`) now
+just say the package manager updates it, with no `yay` or `paru` hint.
 
 ## v0.3.0
 
