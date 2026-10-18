@@ -53,7 +53,8 @@ cd /tmp/razerctl-vX.Y.Z
 sha256sum -c SHA256SUMS                         # every asset: OK
 test -s razerctl-X.Y.Z-x86_64.AppImage.zsync && echo zsync non-empty
 chmod +x razerctl-X.Y.Z-x86_64.AppImage
-./razerctl-X.Y.Z-x86_64.AppImage --appimage-updateinformation   # gh-releases-zsync|Dromares|razerctl|latest|...
+./razerctl-X.Y.Z-x86_64.AppImage --appimage-updateinformation   # gh-releases-zsync|Dromares|razerctl|latest|... (no FUSE: see the README for the objcopy line)
+./razerctl-X.Y.Z-x86_64.AppImage --version                      # razerctl X.Y.Z
 tar xzf razerctl-X.Y.Z-x86_64-linux.tar.gz && ./razerctl-X.Y.Z-x86_64-linux/razerctl --version
 ```
 
