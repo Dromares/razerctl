@@ -89,7 +89,8 @@ Open **razerctl** from the app menu (or run `razerctl-gui`).
   for things the mouse can't store.
 * **Low-battery notification** (Device tab): optional desktop alert at or below a chosen
   percentage, run by the `razerctl-battery.service` user unit (settings in
-  `~/.config/razerctl/battery.conf`).
+  `~/.config/razerctl/battery.conf`). From the AppImage, turning it on needs no install step: the app writes the unit
+  itself (see [AppImage details](#appimage-details-and-building)).
 * **Button tester** (bottom bar): shows what the computer actually receives when you press a button.
 
 CLI equivalent: `razerctl --backend hidraw onboard` / `onboard set BUTTON ACTION`.
@@ -105,7 +106,12 @@ does **not** install the udev rule, so the mouse stays unreachable until you ins
 [Install, AppImage](#appimage)).
 
 The command-line tool is inside it too (`--appimage-extract`, then `squashfs-root/usr/bin/razerctl`). The
-systemd units are not packaged; use `./install.sh` if you want the remap service or the low-battery notifier.
+systemd units are not packaged. The **low-battery notifier** needs nothing from you: turning it on in the Device tab writes
+`$XDG_CONFIG_HOME/systemd/user/razerctl-battery.service` (normally `~/.config/systemd/user/`) with `ExecStart=` running
+`<the AppImage> battery-watch`, reloads systemd and enables it; moving the AppImage and starting it (or turning the notifier on again)
+rewrites the path, and turning it off stops the unit and deletes the file. A unit that `./install.sh` or a package put there
+is never overwritten. The **remap service** is not available from the AppImage yet; use `./install.sh` or the tarball if
+you want it.
 
 To build one (the image needs at least the build machine's glibc, so the release is built
 in an Ubuntu 22.04 root filesystem):

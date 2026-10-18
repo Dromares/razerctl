@@ -12,6 +12,8 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use razerctl::remap::{self, Action};
+use razerctl::units;
+use razerctl::update::InstallType;
 
 use super::macro_ui::tilde;
 use super::{App, SERVICE};
@@ -466,6 +468,117 @@ impl App {
                 self.svc_failure = Some(f);
             }
         }
+    }
+}
+
+// ------------------------------------------------------------------------------------------- battery notifier
+
+/// The status-bar line when `systemctl` refuses to enable or disable the notifier. The settings are already saved; the
+/// hint at the end has to fit how razerctl was installed (an AppImage user has no `install.sh`).
+pub fn notifier_failure(install: &InstallType, verb: &str, why: &str) -> String {
+    let hint = match install {
+        InstallType::Tarball => " (run ./install.sh to install it)",
+        InstallType::Package => " (reinstall the razerctl package to restore the unit)",
+        InstallType::AppImage { .. } => "",
+    };
+    format!("Settings saved, but the notifier service didn't {verb}: {why}{hint}")
+}
+
+impl App {
+    /// `systemctl --user ARGS` on the notifier, `Err(stderr)` when it fails. Never goes through [`App::systemctl`]: that one
+    /// pre-flights and reads back the remap unit.
+    fn notifier_ctl(&self, args: &[&str]) -> Result<(), String> {
+        let o = systemctl(&*self.sys, args)?;
+        if o.ok {
+            Ok(())
+        } else {
+            Err(o.stderr.trim().to_string())
+        }
+    }
+
+    /// Turn the notifier on. An AppImage has no unit to enable, so [`units::plan_enable`] decides whether to write one
+    /// first (and reload systemd); every other install enables the unit it already has. Returns the status line.
+    pub fn enable_notifier(&mut self) -> Result<String, String> {
+        let install = self.update.install.clone();
+        let plan = units::plan_enable(
+            &install,
+            self.unit_site.existing().as_deref(),
+            self.unit_site.packaged(),
+        )
+        .map_err(|e| format!("Settings saved, but the notifier service can't be set up: {e}"))?;
+        let mut moved = false;
+        if let units::Plan::Write { text, replaces } = &plan {
+            self.unit_site.write(text).map_err(|e| {
+                format!(
+                    "Settings saved, but {} couldn't be written: {e}",
+                    tilde(&self.unit_site.unit_path())
+                )
+            })?;
+            self.notifier_ctl(&["daemon-reload"])
+                .map_err(|e| notifier_failure(&install, "reload", &e))?;
+            moved = *replaces;
+        }
+        self.notifier_ctl(&["enable", "--now", battery_unit()])
+            .map_err(|e| notifier_failure(&install, "enable", &e))?;
+        if moved {
+            // the old unit may still be running from the AppImage's previous path
+            self.notifier_ctl(&["try-restart", battery_unit()])
+                .map_err(|e| notifier_failure(&install, "restart", &e))?;
+        }
+        Ok(format!(
+            "Low-battery alerts on: you'll be notified at {}% or below.",
+            self.batt_cfg.threshold
+        ))
+    }
+
+    /// At start-up: a notifier unit this GUI wrote that names another AppImage path (the file was moved or renamed) is
+    /// failing in a restart loop, so rewrite it to this path now rather than wait for the user to find the toggle. Does
+    /// nothing unless the notifier is on, this is an AppImage and the unit is ours and stale; never writes a new unit.
+    pub fn follow_moved_appimage(&mut self) {
+        if !self.batt_cfg.enabled {
+            return;
+        }
+        let stale = matches!(
+            units::plan_enable(
+                &self.update.install,
+                self.unit_site.existing().as_deref(),
+                self.unit_site.packaged(),
+            ),
+            Ok(units::Plan::Write { replaces: true, .. })
+        );
+        if stale {
+            match self.enable_notifier() {
+                Ok(_) => self.ok("Low-battery notifier now points at this AppImage."),
+                Err(e) => self.err(e),
+            }
+            self.refresh_service();
+        }
+    }
+
+    /// Turn the notifier off. For an AppImage that also deletes the unit file this GUI wrote, so nothing stays behind
+    /// pointing at an AppImage that may be moved or deleted. A unit somebody else owns is stopped and kept.
+    pub fn disable_notifier(&mut self) -> Result<String, String> {
+        let install = self.update.install.clone();
+        let plan = units::plan_disable(
+            &install,
+            self.unit_site.existing().as_deref(),
+            self.unit_site.packaged(),
+        );
+        if plan != units::DisablePlan::NothingInstalled {
+            self.notifier_ctl(&["disable", "--now", battery_unit()])
+                .map_err(|e| notifier_failure(&install, "disable", &e))?;
+        }
+        if plan == units::DisablePlan::Remove {
+            self.unit_site.remove().map_err(|e| {
+                format!(
+                    "Low-battery alerts are off, but {} couldn't be removed: {e}",
+                    tilde(&self.unit_site.unit_path())
+                )
+            })?;
+            self.notifier_ctl(&["daemon-reload"])
+                .map_err(|e| notifier_failure(&install, "reload", &e))?;
+        }
+        Ok("Low-battery alerts off.".to_string())
     }
 }
 
