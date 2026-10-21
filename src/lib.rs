@@ -8,6 +8,7 @@ pub mod firmware;
 pub mod hidraw;
 pub mod macros;
 pub mod onboard;
+pub mod probe;
 pub mod protocol;
 pub mod remap;
 pub mod sha256;

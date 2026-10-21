@@ -1,6 +1,8 @@
-//! `razerctl firmware`: look inside the vendor's firmware updater and rehearse a flash on paper. Nothing in here opens a
-//! device (DAN-1885, phase 1 of DAN-1878): `inspect` reads a `.exe` the user supplies, `flash --dry-run` drives the DFU
-//! state machine against a simulated device and prints the frames. Razer's firmware is never stored in this repository;
+//! `razerctl firmware`: look inside the vendor's firmware updater and rehearse a flash on paper. Nothing in this module
+//! opens a device (DAN-1885, phase 1 of DAN-1878): `inspect` reads a `.exe` the user supplies, `flash --dry-run` drives the
+//! DFU state machine against a simulated device and prints the frames. The only device command of `firmware` is
+//! `probe-bootloader` (DAN-1908, phase 2), which lives in `crate::probe`, outside this module, and cannot reach the DFU
+//! code. Razer's firmware is never stored in this repository;
 //! it is extracted from the user's own copy of the updater at run time.
 
 pub mod dfu;
@@ -199,7 +201,8 @@ pub fn describe(path: &str, file_sha256: &str, ins: &Inspection) -> Vec<String> 
 }
 
 const USAGE: &str = "usage: firmware inspect UPDATER.EXE
-       firmware flash UPDATER.EXE --image NAME --dry-run [--device-version X.YY.ZZ] [--allow-reflash]";
+       firmware flash UPDATER.EXE --image NAME --dry-run [--device-version X.YY.ZZ] [--allow-reflash]
+       firmware probe-bootloader [--yes-enter-bootloader] [--out FILE]";
 
 fn read_updater(path: &str) -> Result<(Vec<u8>, Inspection), String> {
     let exe = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -275,7 +278,7 @@ fn flash_cmd(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `razerctl firmware inspect|flash ...`. Offline: no device is opened.
+/// `razerctl firmware inspect, flash or probe-bootloader ...`. Only `probe-bootloader` opens a device (see `crate::probe`).
 pub fn cli(args: &[String]) -> Result<(), String> {
     match args {
         [sub, path] if sub == "inspect" => {
@@ -287,6 +290,7 @@ pub fn cli(args: &[String]) -> Result<(), String> {
             Ok(())
         }
         [sub, rest @ ..] if sub == "flash" => flash_cmd(rest),
+        [sub, rest @ ..] if sub == "probe-bootloader" => crate::probe::cli::probe_bootloader(rest),
         _ => Err(USAGE.into()),
     }
 }
