@@ -89,12 +89,10 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
         ));
     }
     let Some(control) = hw::control_node(&nodes) else {
-        return Err(
-            format!(
+        return Err(format!(
             "refusing: no {} interface with a feature report was found; nothing was sent",
             start.id_text()
-        ),
-        );
+        ));
     };
 
     let (traffic, unchecked) = hw::collect_traffic(Path::new("/proc"), &nodes, std::process::id());

@@ -4,8 +4,8 @@
 use super::sysfs::{Interface0, UsbDevice};
 use super::usbfs::Setup;
 use super::{
-    exit_frame, query_frame, Build, Decoded, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
-    QUERY_PAIRS, RETURN_TIMEOUT, Start, UDEV_HINT,
+    exit_frame, query_frame, Build, Decoded, Start, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
+    QUERY_PAIRS, RETURN_TIMEOUT, UDEV_HINT,
 };
 use crate::protocol::REPORT_LEN;
 use std::fmt::Write as _;

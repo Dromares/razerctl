@@ -75,9 +75,9 @@ impl Start {
     pub fn pid(self) -> u16 {
         self.id().1
     }
-    /// `1532:009f`, lower case, as the report writes ids.
+    /// `1532:009F`, upper case, as the messages of probe v1 to v3 write the dongle.
     pub fn id_text(self) -> String {
-        format!("{:04x}:{:04x}", self.id().0, self.id().1)
+        format!("{:04X}:{:04X}", self.id().0, self.id().1)
     }
     /// What the run calls the thing the user plugged in.
     pub fn what(self) -> &'static str {
@@ -667,8 +667,8 @@ pub fn plan_text() -> String {
          \x20    HID report descriptor\n\
          \x20 3c. send the query Razer's updater sends first (10:80) as a HID feature SET_REPORT and read its GET_REPORT (up to 5\n\
          \x20    reads, up to 3 sends); it asks the bootloader for its PID and changes nothing\n\
-         \x20 3d. only if the reply has status 2 and the PID of the identity it started from (009F for the dongle, 009E for the cable): send exit (10:05) straight away on the same handle (up to 3\n\
-         \x20    sends); with any other reply nothing more is sent and you are told to replug\n\
+         \x20 3d. only if the reply has status 2 and the starting PID (009F for the dongle, 009E for the cable): send exit (10:05)\n\
+         \x20    straight away on the same handle (up to 3 sends); with any other reply nothing more is sent and you are told to replug\n\
          \x20 4. wait up to {} s for the identity it started from to come back, and write down how long it took, from 10:05 and from entry\n\
          It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command; the only frames it sends are\n\
          00:87, 00:04, 10:80 and 10:05). While it runs the\n\

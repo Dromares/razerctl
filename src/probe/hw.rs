@@ -19,8 +19,8 @@ use super::report::{BootloaderWait, Exchange, Get, OpenFailure, Pair, ReturnWait
 use super::sysfs::{self, UsbDevice};
 use super::usbfs::{self, ControlIo, UsbGuarded, Usbfs};
 use super::{
-    enter_frame, permitted, read_version_frame, Answer, Decoded, ProbeIo, Traffic, BOOTLOADER_ID,
-    EXIT_PAIRS, QUERY, QUERY_GETS, QUERY_PAIRS, Start,
+    enter_frame, permitted, read_version_frame, Answer, Decoded, ProbeIo, Start, Traffic,
+    BOOTLOADER_ID, EXIT_PAIRS, QUERY, QUERY_GETS, QUERY_PAIRS,
 };
 use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{Report, Status, REPORT_LEN};
@@ -276,7 +276,10 @@ impl RealProbe {
         let start = Start::of((node.vid, node.pid)).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!("{:04x}:{:04x} is neither 1532:009F nor 1532:009E", node.vid, node.pid),
+                format!(
+                    "{:04x}:{:04x} is neither 1532:009F nor 1532:009E",
+                    node.vid, node.pid
+                ),
             )
         })?;
         Ok(RealProbe {
