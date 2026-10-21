@@ -6,8 +6,8 @@
 //!
 //! 1. [`RealProbe`] implements [`ProbeIo`] and nothing else of ours. `ProbeIo` has no method that takes a frame or a
 //!    control request, so a caller cannot ask it to send one; the methods that write ([`ProbeIo::read_version`],
-//!    [`ProbeIo::enter_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from the constructors in
-//!    `probe/mod.rs`.
+//!    [`ProbeIo::enter_bootloader`], [`ProbeIo::query_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from
+//!    the constructors in `probe/mod.rs`.
 //! 2. Every hidraw write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not one of the
 //!    two normal-mode probe frames ([`super::permitted`]); every usbfs request goes through
 //!    [`super::usbfs::UsbGuarded`], which refuses all but its three. Both are runtime checks at the last point before the
