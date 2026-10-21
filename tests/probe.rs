@@ -1,14 +1,17 @@
-//! `razerctl firmware probe-bootloader` (DAN-1908): golden frames, simulated runs of every path, the refusals, and the
-//! fence that keeps the probe from ever erasing or writing. Every device here is simulated: nothing in this file opens
-//! `/dev/hidraw*` or `/dev/input`, and the one test that runs the binary does so without `--yes-enter-bootloader`.
+//! `razerctl firmware probe-bootloader` (DAN-1908, DAN-1929): golden frames and control requests, simulated runs of every
+//! path, the refusals, and the fence that keeps the probe from ever erasing or writing. Every device here is simulated
+//! or a fixture tree in a temp directory: nothing in this file opens `/dev/hidraw*`, `/dev/input` or `/dev/bus/usb`, or
+//! reads the real `/sys`, and the one test that runs the binary does so without `--yes-enter-bootloader`.
 
 use razerctl::firmware::{dfu, flash};
 use razerctl::hidraw::FeatureIo;
 use razerctl::probe::cli;
-use razerctl::probe::hw::{self, Guarded};
+use razerctl::probe::hw::{self, Guarded, RealProbe, Roots};
 use razerctl::probe::report::{
-    utc, BootloaderWait, Enumeration, OpenFailure, Outcome, ProbeLog, ReturnWait,
+    utc, BootloaderWait, ExitResult, OpenFailure, Outcome, ProbeLog, ReturnWait, SendError,
 };
+use razerctl::probe::sysfs::{self, Interface0, UsbDevice};
+use razerctl::probe::usbfs::{self, ControlIo, Setup, UsbGuarded};
 use razerctl::probe::{
     self, enter_frame, exit_frame, permitted, read_version_frame, Answer, Build, ProbeIo, Traffic,
     BOOTLOADER_ID, NORMAL_ID,
@@ -71,11 +74,13 @@ fn the_probe_frames_are_the_ones_phase_one_pinned() {
 }
 
 #[test]
-fn only_the_three_probe_frames_are_permitted() {
-    for f in [read_version_frame(), enter_frame(), exit_frame()] {
+fn only_the_two_normal_mode_frames_are_permitted_over_hidraw() {
+    for f in [read_version_frame(), enter_frame()] {
         assert!(permitted(&f.to_bytes()), "{f:?}");
     }
     let refused: Vec<(&str, Report)> = vec![
+        // 10:05 is the usbfs transport's frame: the bootloader has no hidraw node, so hidraw never carries it
+        ("exit 10:05", exit_frame()),
         ("erase 10:01", dfu::erase_frame(0x1000, 0x2000)),
         ("program 10:02", dfu::program_frame(0x1000, &[1, 2, 3])),
         ("verify 10:83", dfu::verify_frame(0x1000)),
@@ -95,10 +100,6 @@ fn only_the_three_probe_frames_are_permitted() {
             "enter with tid 0x1f",
             Report::new((0x00, 0x04), 2, 0x1f).with_args(&[1, 0]),
         ),
-        (
-            "exit with args",
-            Report::new((0x10, 0x05), 1, 0).with_args(&[1]),
-        ),
         ("read version 00:81", Report::new((0x00, 0x81), 2, 0)),
     ];
     for (what, f) in refused {
@@ -107,7 +108,7 @@ fn only_the_three_probe_frames_are_permitted() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
-// The guarded channel, against a simulated feature-report device
+// The guarded hidraw channel, against a simulated feature-report device
 
 /// Answers each frame with success for the same command; records what reached it.
 struct SimFeature {
@@ -143,28 +144,47 @@ impl FeatureIo for SimFeature {
     }
 }
 
+/// A channel whose writes fail with a given errno after recording the frame (the bootloader cutting the transfer short).
+struct FailingFeature(i32, RefCell<usize>);
+
+impl FeatureIo for FailingFeature {
+    fn send_feature(&self, _: &[u8; REPORT_LEN]) -> io::Result<()> {
+        *self.1.borrow_mut() += 1;
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+    fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]> {
+        Err(io::Error::from_raw_os_error(self.0))
+    }
+}
+
 #[test]
-fn the_real_code_path_emits_exactly_the_golden_frames() {
+fn the_hidraw_code_path_emits_exactly_the_golden_frames() {
     let g = Guarded(SimFeature::new());
     let v = hw::read_version_via(&g).unwrap();
     assert_eq!(&v.args[..3], &[1, 4, 0]);
     assert!(hw::enter_via(&g).unwrap().is_ok());
-    assert!(hw::exit_via(&g).unwrap().is_ok());
     let sent = g.0.sent.borrow();
     assert_eq!(
         *sent,
-        vec![
-            golden(8, 0x00, 0x87, &[]),
-            golden(2, 0x00, 0x04, &[1, 0]),
-            golden(0, 0x10, 0x05, &[]),
-        ]
+        vec![golden(8, 0x00, 0x87, &[]), golden(2, 0x00, 0x04, &[1, 0])]
     );
+}
+
+#[test]
+fn an_errno_on_the_enter_send_reaches_the_caller_as_an_errno() {
+    // the board's first run: the enter frame was cut off by the disconnect and the write returned EPROTO (71)
+    let g = Guarded(FailingFeature(71, RefCell::new(0)));
+    let e = hw::enter_via(&g).unwrap_err();
+    assert_eq!(e.errno, Some(71));
+    assert!(e.to_string().contains("errno 71"), "{e}");
+    assert_eq!(*g.0 .1.borrow(), 1);
 }
 
 #[test]
 fn the_guard_stops_every_other_frame_before_the_device() {
     let g = Guarded(SimFeature::new());
     let forbidden = [
+        exit_frame(),
         dfu::erase_frame(0x1000, 0x2000),
         dfu::program_frame(0x1000, &[0xAA; 64]),
         flash::record_frame(1, ":00000001FF").unwrap(),
@@ -183,38 +203,405 @@ fn the_guard_stops_every_other_frame_before_the_device() {
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
+// The usbfs transport: golden control requests, and the guard, against a recording device
+
+#[test]
+fn golden_setup_packets() {
+    // GET_DESCRIPTOR: device-to-host, standard, interface; request 6; wValue 0x2200 (HID report descriptor, index 0);
+    // wIndex 0 (interface 0); wLength 1024
+    assert_eq!(
+        Setup::get_report_descriptor().to_bytes(),
+        [0x81, 0x06, 0x00, 0x22, 0x00, 0x00, 0x00, 0x04]
+    );
+    // SET_REPORT: host-to-device, class, interface; request 9; wValue 0x0300 (feature report, id 0); wIndex 0; wLength 90
+    assert_eq!(
+        Setup::set_report_feature().to_bytes(),
+        [0x21, 0x09, 0x00, 0x03, 0x00, 0x00, 0x5a, 0x00]
+    );
+    // GET_REPORT: device-to-host, class, interface; request 1; same wValue; wLength 90
+    assert_eq!(
+        Setup::get_report_feature().to_bytes(),
+        [0xA1, 0x01, 0x00, 0x03, 0x00, 0x00, 0x5a, 0x00]
+    );
+    assert!(Setup::get_report_descriptor().is_read());
+    assert!(!Setup::set_report_feature().is_read());
+    assert!(Setup::get_report_feature().is_read());
+}
+
+#[test]
+fn golden_ioctl_numbers() {
+    // <linux/usbdevice_fs.h>: _IOWR('U', 0, struct usbdevfs_ctrltransfer) and _IOR('U', 15, unsigned int)
+    #[cfg(target_pointer_width = "64")]
+    assert_eq!(usbfs::USBDEVFS_CONTROL, 0xC018_5500);
+    assert_eq!(usbfs::USBDEVFS_CLAIMINTERFACE, 0x8004_550F);
+}
+
+/// A usbfs device that records every request that reaches it: the setup packet and, for a write, the payload.
+struct SimUsb {
+    requests: RefCell<Vec<(Setup, Vec<u8>)>>,
+    claimed: RefCell<Vec<u8>>,
+    descriptor: Vec<u8>,
+    set_errno: Option<i32>,
+}
+
+impl SimUsb {
+    fn new() -> SimUsb {
+        SimUsb {
+            requests: RefCell::new(Vec::new()),
+            claimed: RefCell::new(Vec::new()),
+            descriptor: DESC.to_vec(),
+            set_errno: None,
+        }
+    }
+}
+
+impl ControlIo for SimUsb {
+    fn claim_interface(&self, interface: u8) -> io::Result<()> {
+        self.claimed.borrow_mut().push(interface);
+        Ok(())
+    }
+    fn control(&self, setup: &Setup, data: &mut [u8]) -> io::Result<usize> {
+        let payload = if setup.is_read() {
+            Vec::new()
+        } else {
+            data.to_vec()
+        };
+        self.requests.borrow_mut().push((*setup, payload));
+        if *setup == Setup::get_report_descriptor() {
+            data[..self.descriptor.len()].copy_from_slice(&self.descriptor);
+            Ok(self.descriptor.len())
+        } else if *setup == Setup::set_report_feature() {
+            match self.set_errno {
+                Some(e) => Err(io::Error::from_raw_os_error(e)),
+                None => Ok(data.len()),
+            }
+        } else {
+            let mut r = Report::new((0x10, 0x05), 0, 0);
+            r.status = 2;
+            data.copy_from_slice(&r.to_bytes());
+            Ok(data.len())
+        }
+    }
+}
+
+#[test]
+fn the_usbfs_path_sends_exactly_the_three_requests() {
+    let g = UsbGuarded(SimUsb::new());
+    g.claim_interface(usbfs::INTERFACE).unwrap();
+    assert_eq!(usbfs::read_report_descriptor(&g).unwrap(), DESC.to_vec());
+    let x = hw::exit_via(&g);
+    assert_eq!(x.sent, Ok(()));
+    let status = x.status.unwrap().unwrap();
+    assert_eq!((status.command_class, status.command_id), (0x10, 0x05));
+    assert_eq!(status.status, 2);
+    assert_eq!(*g.0.claimed.borrow(), [0]);
+    assert_eq!(
+        *g.0.requests.borrow(),
+        vec![
+            (Setup::get_report_descriptor(), Vec::new()),
+            (
+                Setup::set_report_feature(),
+                golden(0, 0x10, 0x05, &[]).to_vec()
+            ),
+            (Setup::get_report_feature(), Vec::new()),
+        ]
+    );
+}
+
+#[test]
+fn a_failed_set_report_is_reported_with_its_errno_and_no_status_read() {
+    let mut sim = SimUsb::new();
+    sim.set_errno = Some(71);
+    let g = UsbGuarded(sim);
+    let x = hw::exit_via(&g);
+    assert_eq!(x.sent.as_ref().unwrap_err().errno, Some(71));
+    assert!(
+        x.status.is_none(),
+        "no GET_REPORT after a failed SET_REPORT"
+    );
+    assert_eq!(g.0.requests.borrow().len(), 1);
+}
+
+fn set_report(value: u16, index: u16, length: u16) -> Setup {
+    Setup {
+        value,
+        index,
+        length,
+        ..Setup::set_report_feature()
+    }
+}
+
+#[test]
+fn the_usbfs_guard_stops_every_other_request_before_the_device() {
+    let g = UsbGuarded(SimUsb::new());
+    let exit = golden(0, 0x10, 0x05, &[]).to_vec();
+    let mut cases: Vec<(&str, Setup, Vec<u8>)> = vec![
+        // a SET_REPORT with any payload but 10:05
+        (
+            "erase 10:01",
+            Setup::set_report_feature(),
+            dfu::erase_frame(0x1000, 0x2000).to_bytes().to_vec(),
+        ),
+        (
+            "program 10:02",
+            Setup::set_report_feature(),
+            dfu::program_frame(0x1000, &[0xAA; 64]).to_bytes().to_vec(),
+        ),
+        (
+            "flash record 0a:02",
+            Setup::set_report_feature(),
+            flash::record_frame(1, ":00000001FF")
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        ),
+        (
+            "flash enter 0a:00",
+            Setup::set_report_feature(),
+            Report::new(flash::ENTER, 0, 0).to_bytes().to_vec(),
+        ),
+        (
+            "enter 00:04",
+            Setup::set_report_feature(),
+            enter_frame().to_bytes().to_vec(),
+        ),
+        (
+            "read version 00:87",
+            Setup::set_report_feature(),
+            read_version_frame().to_bytes().to_vec(),
+        ),
+        ("zeros", Setup::set_report_feature(), vec![0; REPORT_LEN]),
+        ("exit with a flipped byte", Setup::set_report_feature(), {
+            let mut b = exit.clone();
+            b[8] = 1;
+            b
+        }),
+        (
+            "exit one byte short",
+            set_report(0x0300, 0, 89),
+            exit[..89].to_vec(),
+        ),
+        // the right payload under the wrong setup
+        (
+            "exit as report id 1",
+            set_report(0x0301, 0, 90),
+            exit.clone(),
+        ),
+        (
+            "exit as an output report",
+            set_report(0x0200, 0, 90),
+            exit.clone(),
+        ),
+        (
+            "exit on interface 1",
+            set_report(0x0300, 1, 90),
+            exit.clone(),
+        ),
+        (
+            "exit with a vendor request type",
+            Setup {
+                request_type: 0x40,
+                ..Setup::set_report_feature()
+            },
+            exit.clone(),
+        ),
+        (
+            "exit as SET_IDLE",
+            Setup {
+                request: 0x0A,
+                ..Setup::set_report_feature()
+            },
+            exit.clone(),
+        ),
+        (
+            "exit as SET_PROTOCOL",
+            Setup {
+                request: 0x0B,
+                ..Setup::set_report_feature()
+            },
+            exit.clone(),
+        ),
+        // standard and class requests that change the device
+        (
+            "SET_CONFIGURATION",
+            Setup {
+                request_type: 0x00,
+                request: 0x09,
+                value: 1,
+                index: 0,
+                length: 0,
+            },
+            vec![],
+        ),
+        (
+            "SET_INTERFACE",
+            Setup {
+                request_type: 0x01,
+                request: 0x0B,
+                value: 0,
+                index: 0,
+                length: 0,
+            },
+            vec![],
+        ),
+        (
+            "CLEAR_FEATURE(ENDPOINT_HALT)",
+            Setup {
+                request_type: 0x02,
+                request: 0x01,
+                value: 0,
+                index: 0x81,
+                length: 0,
+            },
+            vec![],
+        ),
+        (
+            "SET_ADDRESS",
+            Setup {
+                request_type: 0x00,
+                request: 0x05,
+                value: 9,
+                index: 0,
+                length: 0,
+            },
+            vec![],
+        ),
+        // reads that are not the three
+        (
+            "device descriptor",
+            Setup {
+                request_type: 0x80,
+                request: 0x06,
+                value: 0x0100,
+                index: 0,
+                length: 18,
+            },
+            vec![0; 18],
+        ),
+        (
+            "report descriptor of interface 1",
+            Setup {
+                index: 1,
+                ..Setup::get_report_descriptor()
+            },
+            vec![0; 1024],
+        ),
+        (
+            "report descriptor, wrong length",
+            Setup {
+                length: 64,
+                ..Setup::get_report_descriptor()
+            },
+            vec![0; 64],
+        ),
+        (
+            "report descriptor into a short buffer",
+            Setup::get_report_descriptor(),
+            vec![0; 64],
+        ),
+        (
+            "GET_REPORT as an input report",
+            Setup {
+                value: 0x0100,
+                ..Setup::get_report_feature()
+            },
+            vec![0; 90],
+        ),
+        (
+            "GET_REPORT of interface 1",
+            Setup {
+                index: 1,
+                ..Setup::get_report_feature()
+            },
+            vec![0; 90],
+        ),
+        (
+            "GET_STATUS",
+            Setup {
+                request_type: 0x80,
+                request: 0x00,
+                value: 0,
+                index: 0,
+                length: 2,
+            },
+            vec![0; 2],
+        ),
+    ];
+    cases.push((
+        "the right setup with no payload",
+        Setup::set_report_feature(),
+        vec![],
+    ));
+    for (what, setup, mut data) in cases {
+        let e = g.control(&setup, &mut data).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{what}");
+    }
+    for interface in [1u8, 2, 255] {
+        assert!(g.claim_interface(interface).is_err(), "claimed {interface}");
+    }
+    assert!(
+        g.0.requests.borrow().is_empty() && g.0.claimed.borrow().is_empty(),
+        "something reached the device"
+    );
+    // and the three that are allowed do get through
+    assert!(usbfs::permitted(
+        &Setup::get_report_descriptor(),
+        &[0; 1024]
+    ));
+    assert!(usbfs::permitted(&Setup::set_report_feature(), &exit));
+    assert!(usbfs::permitted(&Setup::get_report_feature(), &[0; 90]));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
 // Simulated runs
 
 fn at(secs: u64) -> SystemTime {
     UNIX_EPOCH + Duration::from_secs(1_792_000_000 + secs)
 }
 
-fn enumeration(pid: u16, node: &str, interface: u8, desc: &[u8], secs: u64) -> Enumeration {
-    Enumeration {
-        vid: 0x1532,
-        pid,
-        node: node.into(),
-        interface: Some(interface),
-        bcd_device: Some(0x009f),
-        descriptor: desc.to_vec(),
-        seen_at: at(secs),
-    }
-}
-
 const DESC: [u8; 12] = [
     0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x95, 0x5A, 0xB1, 0x02, 0xC0,
 ];
+
+/// The kernel's cached descriptors of the bootloader, as far as the tests care: a device descriptor.
+const KERNEL_DESC: [u8; 18] = [
+    0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40, 0x32, 0x15, 0x0E, 0x11, 0x9F, 0x00, 0x01, 0x02,
+    0x00, 0x01,
+];
+
+fn bootloader_device(interface0: Interface0) -> UsbDevice {
+    UsbDevice {
+        name: "8-3".into(),
+        vid: 0x1532,
+        pid: 0x110E,
+        bus: Some(8),
+        dev: Some(5),
+        bcd_device: Some(0x009f),
+        product: Some("RAZER BOOTLOADER".into()),
+        interface0,
+        descriptors: Ok(KERNEL_DESC.to_vec()),
+        seen_at: at(3),
+    }
+}
+
+fn errno(n: i32) -> SendError {
+    SendError::from(io::Error::from_raw_os_error(n))
+}
 
 /// A scripted device. Each call is appended to `calls`; the clock advances one second per call.
 struct Sim {
     calls: Vec<&'static str>,
     clock: u64,
     version: Result<Report, String>,
-    enter: Result<Answer, String>,
-    bootloader: Option<Vec<Enumeration>>,
+    enter: Result<Answer, SendError>,
+    dongle_left: Option<Duration>,
+    bootloader: Option<UsbDevice>,
     open: Result<String, OpenFailure>,
-    exit: Result<Answer, String>,
-    back: Option<Duration>,
+    descriptor: Result<Vec<u8>, SendError>,
+    exit: ExitResult,
+    bootloader_left: Option<Duration>,
+    /// Seconds after the end of the step-4 call at which 1532:009F is listed again.
+    back: Option<u64>,
 }
 
 fn reply(cmd: (u8, u8), status: u8) -> Report {
@@ -232,13 +619,16 @@ impl Sim {
             clock: 0,
             version: Ok(v),
             enter: Ok(Ok(reply((0x00, 0x04), 2))),
-            bootloader: Some(vec![
-                enumeration(0x110E, "/dev/hidraw7", 0, &DESC, 4),
-                enumeration(0x110E, "/dev/hidraw8", 1, &[0x05, 0x01], 4),
-            ]),
-            open: Ok("/dev/hidraw7 (interface 0)".into()),
-            exit: Ok(Ok(reply((0x10, 0x05), 2))),
-            back: Some(Duration::from_millis(2500)),
+            dongle_left: Some(Duration::from_millis(300)),
+            bootloader: Some(bootloader_device(Interface0::Unbound)),
+            open: Ok("/dev/bus/usb/008/005".into()),
+            descriptor: Ok(DESC.to_vec()),
+            exit: ExitResult {
+                sent: Ok(()),
+                status: Some(Ok(reply((0x10, 0x05), 2))),
+            },
+            bootloader_left: Some(Duration::from_millis(200)),
+            back: Some(2),
         }
     }
     fn tick(&mut self, what: &'static str) {
@@ -258,35 +648,53 @@ impl ProbeIo for Sim {
         self.tick("read_version");
         self.version.clone()
     }
-    fn enter_bootloader(&mut self) -> Result<Answer, String> {
+    fn enter_bootloader(&mut self) -> Result<Answer, SendError> {
         self.tick("enter_bootloader");
         self.enter.clone()
+    }
+    fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration> {
+        assert_eq!(timeout, probe::LEAVE_TIMEOUT);
+        self.tick("wait_for_dongle_gone");
+        self.dongle_left
     }
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait {
         assert_eq!(timeout, probe::BOOTLOADER_TIMEOUT);
         self.tick("wait_for_bootloader");
         match self.bootloader.clone() {
-            Some(seen) => BootloaderWait {
-                seen,
-                appeared_after: Some(Duration::from_millis(1800)),
+            Some(device) => BootloaderWait {
+                device: Some(device),
+                appeared_at: Some(at(self.clock)),
             },
             None => BootloaderWait::default(),
         }
     }
-    fn open_bootloader(&mut self) -> Result<String, OpenFailure> {
-        self.tick("open_bootloader");
+    fn open_usbfs(&mut self, device: &UsbDevice) -> Result<String, OpenFailure> {
+        assert_eq!((device.vid, device.pid), BOOTLOADER_ID);
+        self.tick("open_usbfs");
         self.open.clone()
     }
-    fn exit_bootloader(&mut self) -> Result<Answer, String> {
+    fn read_report_descriptor(&mut self) -> Result<Vec<u8>, SendError> {
+        self.tick("read_report_descriptor");
+        self.descriptor.clone()
+    }
+    fn exit_bootloader(&mut self) -> ExitResult {
         self.tick("exit_bootloader");
         self.exit.clone()
+    }
+    fn wait_for_bootloader_gone(&mut self, timeout: Duration) -> Option<Duration> {
+        assert_eq!(timeout, probe::LEAVE_TIMEOUT);
+        self.tick("wait_for_bootloader_gone");
+        self.bootloader_left
     }
     fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait {
         assert_eq!(timeout, probe::RETURN_TIMEOUT);
         self.tick("wait_for_return");
         ReturnWait {
-            after: self.back,
-            nodes: vec!["1532:009f /dev/hidraw3 interface 0 bcdDevice 0200".into()],
+            back_at: self.back.map(|s| at(self.clock + s)),
+            nodes: vec![
+                "1532:009f 8-3 bus 8 device 6 bcdDevice 0101 product \"Razer Viper Mini SE Dongle\""
+                    .into(),
+            ],
         }
     }
 }
@@ -304,27 +712,28 @@ fn run(sim: &mut Sim) -> (ProbeLog, usize) {
     (log, checkpoints)
 }
 
+const HAPPY_CALLS: [&str; 7] = [
+    "read_version",
+    "enter_bootloader",
+    "wait_for_bootloader",
+    "open_usbfs",
+    "read_report_descriptor",
+    "exit_bootloader",
+    "wait_for_return",
+];
+
 #[test]
-fn a_full_run_goes_through_the_five_steps_in_order() {
+fn a_full_run_goes_through_the_steps_in_order() {
     let mut sim = Sim::happy();
     let (log, checkpoints) = run(&mut sim);
-    assert_eq!(
-        sim.calls,
-        [
-            "read_version",
-            "enter_bootloader",
-            "wait_for_bootloader",
-            "open_bootloader",
-            "exit_bootloader",
-            "wait_for_return"
-        ]
-    );
+    assert_eq!(sim.calls, HAPPY_CALLS);
     assert_eq!(log.outcome, Some(Outcome::Completed));
     assert!(!log.outcome.as_ref().unwrap().needs_replug());
     assert_eq!(log.version_read.as_deref(), Some("1.04.00"));
-    assert_eq!(log.enumerations.len(), 2);
-    assert_eq!(log.returned_after, Some(Duration::from_millis(2500)));
-    // one checkpoint at the start, one after each of the five steps' first halves, and the final one
+    assert_eq!(log.bootloader.as_ref().unwrap().name, "8-3");
+    assert_eq!(log.report_descriptor, Some(Ok(DESC.to_vec())));
+    assert_eq!(log.returned_at, Some(at(9)));
+    // one checkpoint at the start, one after each step's first half, and the final one
     assert!(checkpoints >= 7, "{checkpoints}");
 }
 
@@ -344,16 +753,24 @@ fn the_report_is_self_explanatory() {
         "1. read version (00:87)",
         "ok, version 1.04.00",
         "2. enter bootloader (00:04 mode 1)",
-        "3. wait for 1532:110E",
-        "1532:110E appeared 1.80 s after the wait began",
-        "#1 1532:110e  hidraw node /dev/hidraw7  interface 0  bcdDevice 009f",
-        "report descriptor (12 bytes): 06 00 ff 09 01 a1 01 95 5a b1 02 c0",
-        "#2 1532:110e  hidraw node /dev/hidraw8  interface 1",
-        "4. open the 1532:110E node",
-        "succeeded as the current user, root was not needed",
-        "5. exit bootloader (10:05)",
-        "1532:009F came back by itself 2.50 s after 10:05 was sent",
-        "1532:009F after 10:05: came back by itself after 2.50 s",
+        "sent without error",
+        "3. wait for 1532:110E in /sys/bus/usb/devices",
+        "1532:110E listed as 8-3 1.00 s after the wait began",
+        "device 8-3  bus 8  device number 5",
+        "bcdDevice 009f  product \"RAZER BOOTLOADER\"",
+        "driver bound to interface 0: none",
+        "kernel descriptors (18 bytes): 12 01 00 02 00 00 00 40 32 15 0e 11 9f 00 01 02 00 01",
+        "3b. usbfs: open the node, read the report descriptor",
+        "usbfs (step 3b): opened /dev/bus/usb/008/005 as the current user, root was not needed, interface 0 claimed",
+        "GET_DESCRIPTOR 81 06 00 22 00 00 00 04 (12 bytes): 06 00 ff 09 01 a1 01 95 5a b1 02 c0",
+        "3c. exit bootloader (10:05)",
+        "exit 10:05, SET_REPORT 21 09 00 03 00 00 5a 00: accepted",
+        "GET_REPORT a1 01 00 03 00 00 5a 00: command 10:05 status byte 0x02",
+        "4. wait for 1532:009F",
+        "1532:009F listed again 4.00 s after the 10:05 send",
+        "1532:009F after 10:05: came back 4.00 s after the 10:05 send, 8.00 s after the enter-bootloader send (step 2), 6.00 s after 1532:110E appeared (step 3); back at 2026-10-1",
+        "Razer USB devices at the end of step 4 (1)",
+        "1532:009f 8-3 bus 8 device 6 bcdDevice 0101",
     ] {
         assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
     }
@@ -361,9 +778,105 @@ fn the_report_is_self_explanatory() {
         !text.contains("NEXT"),
         "no replug instruction after a clean run"
     );
+    // the board unplugged the dongle on the first run: nothing shows it ever returns on its own
+    assert!(!text.contains("by itself"), "{text}");
     // every step carries a start and an end time
     assert!(text.matches("Z ->").count() >= 6, "{text}");
 }
+
+// --- step 2: an error on the send is "entered" only if the dongle leaves the bus --------------------------------------
+
+#[test]
+fn an_eproto_on_the_enter_send_with_the_dongle_leaving_counts_as_entered_and_goes_on() {
+    // the board's first run (2026-10-21): the write returned EPROTO (71) because the dongle dropped off the bus
+    // mid-transfer, which is the command working
+    let mut sim = Sim::happy();
+    sim.enter = Err(errno(71));
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        [
+            "read_version",
+            "enter_bootloader",
+            "wait_for_dongle_gone",
+            "wait_for_bootloader",
+            "open_usbfs",
+            "read_report_descriptor",
+            "exit_bootloader",
+            "wait_for_return"
+        ]
+    );
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    let text = log.render();
+    assert!(
+        text.contains("the send returned errno 71 (Protocol error (os error 71))"),
+        "{text}"
+    );
+    assert!(
+        text.contains(
+            "1532:009F left the bus 0.30 s later, so the dongle DID enter the bootloader"
+        ),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_error_on_the_enter_send_with_the_dongle_staying_is_not_entered() {
+    let mut sim = Sim::happy();
+    sim.enter = Err(errno(71));
+    sim.dongle_left = None;
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        ["read_version", "enter_bootloader", "wait_for_dongle_gone"],
+        "nothing may follow an enter send that did not take"
+    );
+    assert!(matches!(log.outcome, Some(Outcome::EnterFailed(_))));
+    assert!(!log.outcome.as_ref().unwrap().needs_replug());
+    let text = log.render();
+    assert!(text.contains("STOPPED at step 2"), "{text}");
+    assert!(text.contains("errno 71"), "{text}");
+    assert!(
+        text.contains("1532:009F did not leave the bus within 3 s, so it did not enter"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_enter_send_without_an_error_does_not_wait_for_the_dongle_to_leave() {
+    let mut sim = Sim::happy();
+    let _ = run(&mut sim);
+    assert!(!sim.calls.contains(&"wait_for_dongle_gone"));
+}
+
+#[test]
+fn a_device_that_resets_without_a_reply_is_still_waited_on() {
+    let mut sim = Sim::happy();
+    sim.enter = Ok(Err("Input/output error (os error 5)".into()));
+    let (log, _) = run(&mut sim);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    assert!(log
+        .render()
+        .contains("sent without error; no reply read (Input/output error"));
+}
+
+#[test]
+fn a_device_that_refuses_the_bootloader_is_not_waited_on() {
+    for status in [3u8, 4, 5] {
+        let mut sim = Sim::happy();
+        sim.enter = Ok(Ok(reply((0x00, 0x04), status)));
+        let (log, _) = run(&mut sim);
+        assert_eq!(
+            sim.calls,
+            ["read_version", "enter_bootloader"],
+            "status {status}"
+        );
+        assert!(matches!(log.outcome, Some(Outcome::EnterFailed(_))));
+        assert!(!log.outcome.as_ref().unwrap().needs_replug());
+    }
+}
+
+// --- step 3: 1532:110E in sysfs ---------------------------------------------------------------------------------------
 
 #[test]
 fn step_three_timeout_sends_nothing_further_and_says_replug() {
@@ -379,39 +892,65 @@ fn step_three_timeout_sends_nothing_further_and_says_replug() {
     assert!(log.outcome.as_ref().unwrap().needs_replug());
     let text = log.render();
     assert!(text.contains("STEP 3 TIMED OUT"), "{text}");
-    assert!(text.contains("TIMED OUT: no 1532:110E within 20 s. Nothing further was sent"));
+    assert!(text.contains("TIMED OUT: no 1532:110E within 10 s. Nothing further was sent"));
     assert!(
         text.contains("NEXT    Unplug the dongle and plug it back in"),
         "{text}"
     );
     assert!(
-        text.contains("enumerations observed in step 3 (0)"),
+        !text.contains("udev"),
+        "the udev line is for a node that cannot be opened: {text}"
+    );
+    assert!(text.contains("never listed"), "{text}");
+}
+
+#[test]
+fn a_bound_driver_is_recorded_and_nothing_is_sent_or_detached() {
+    let mut sim = Sim::happy();
+    sim.bootloader = Some(bootloader_device(Interface0::Bound("usbhid".into())));
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        ["read_version", "enter_bootloader", "wait_for_bootloader"],
+        "a bound driver means no open, no descriptor read, no exit"
+    );
+    assert!(matches!(log.outcome, Some(Outcome::DriverBound(_))));
+    assert!(log.outcome.as_ref().unwrap().needs_replug());
+    let text = log.render();
+    assert!(text.contains("STOPPED at step 3b"), "{text}");
+    assert!(
+        text.contains("the kernel driver `usbhid` is bound to interface 0"),
         "{text}"
     );
-}
-
-#[test]
-fn step_five_timeout_is_written_and_says_replug() {
-    let mut sim = Sim::happy();
-    sim.back = None;
-    let (log, _) = run(&mut sim);
-    assert_eq!(log.outcome, Some(Outcome::DidNotReturn));
-    assert!(log.outcome.as_ref().unwrap().needs_replug());
-    assert!(!log.outcome.as_ref().unwrap().is_success());
-    let text = log.render();
-    assert!(text.contains("STEP 5 TIMED OUT"), "{text}");
-    assert!(text.contains("did NOT come back by itself"), "{text}");
-    assert!(text.contains("did not come back within 30 s"), "{text}");
+    assert!(
+        text.contains("driver bound to interface 0: `usbhid`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Not detached; nothing was sent to the bootloader"),
+        "{text}"
+    );
     assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
-    // the bootloader enumerations of step 3 are still in the file
-    assert!(text.contains("hidraw node /dev/hidraw7"), "{text}");
 }
 
 #[test]
-fn a_bootloader_node_that_needs_root_is_recorded_and_not_escalated() {
+fn an_interface_zero_that_is_not_listed_yet_is_not_a_bound_driver() {
+    let mut sim = Sim::happy();
+    sim.bootloader = Some(bootloader_device(Interface0::Missing));
+    let (log, _) = run(&mut sim);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    assert!(log
+        .render()
+        .contains("driver bound to interface 0: interface 0 is not listed"));
+}
+
+// --- step 3b: the usbfs node ------------------------------------------------------------------------------------------
+
+#[test]
+fn a_usbfs_node_that_needs_root_is_recorded_and_not_escalated() {
     let mut sim = Sim::happy();
     sim.open = Err(OpenFailure {
-        node: "/dev/hidraw7".into(),
+        node: "/dev/bus/usb/008/005".into(),
         errno: Some(13),
         message: "Permission denied (os error 13)".into(),
     });
@@ -422,35 +961,183 @@ fn a_bootloader_node_that_needs_root_is_recorded_and_not_escalated() {
             "read_version",
             "enter_bootloader",
             "wait_for_bootloader",
-            "open_bootloader"
+            "open_usbfs"
         ],
-        "10:05 must not be attempted without an open node"
+        "neither the descriptor read nor 10:05 may be attempted without an open node"
     );
-    assert!(matches!(log.outcome, Some(Outcome::OpenFailed(_))));
+    assert!(matches!(
+        log.outcome,
+        Some(Outcome::UsbfsUnavailable { .. })
+    ));
     assert!(log.outcome.as_ref().unwrap().needs_replug());
     let text = log.render();
+    assert!(text.contains("STOPPED at step 3b (usbfs)"), "{text}");
     assert!(text.contains("errno 13"), "{text}");
     assert!(
-        text.contains("root (or a udev rule for 1532:110E) would be needed"),
+        text.contains("the udev rule does not let this user open it"),
         "{text}"
     );
-    assert!(text.contains("Not escalated"), "{text}");
+    assert!(
+        text.contains("Nothing was sent to the bootloader"),
+        "{text}"
+    );
+    // both instructions: the udev line, then the replug
+    assert!(text.contains("NEXT    Reinstall the udev rule"), "{text}");
+    assert!(text.contains("sudo cp udev/70-razerctl.rules"), "{text}");
     assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
-    // the enumerations observed before the failed open are still reported
-    assert!(text.contains("report descriptor (12 bytes)"), "{text}");
+    // what was learnt before the failed open is still in the file
+    assert!(text.contains("kernel descriptors (18 bytes)"), "{text}");
 }
 
 #[test]
 fn a_failed_open_that_is_not_a_permission_error_says_so() {
     let mut sim = Sim::happy();
     sim.open = Err(OpenFailure {
-        node: "/dev/hidraw7".into(),
-        errno: Some(2),
-        message: "No such file or directory (os error 2)".into(),
+        node: "/dev/bus/usb/008/005".into(),
+        errno: Some(16),
+        message: "Device or resource busy (os error 16)".into(),
     });
     let (log, _) = run(&mut sim);
-    assert!(log.render().contains("errno 2"));
+    assert!(log.render().contains("errno 16"));
     assert!(log.render().contains("this is not a permission error"));
+    assert!(
+        !log.render().contains("NEXT    Reinstall the udev rule"),
+        "the udev line is for a permission error: {}",
+        log.render()
+    );
+    assert!(log.render().contains("NEXT    Unplug the dongle"));
+    assert_eq!(sim.calls.last(), Some(&"open_usbfs"));
+}
+
+#[test]
+fn a_report_descriptor_that_cannot_be_read_is_recorded_and_the_exit_still_goes() {
+    let mut sim = Sim::happy();
+    sim.descriptor = Err(errno(32));
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    let text = log.render();
+    assert!(
+        text.contains("GET_DESCRIPTOR 81 06 00 22 00 00 00 04: FAILED, errno 32"),
+        "{text}"
+    );
+}
+
+// --- step 3c: exit ----------------------------------------------------------------------------------------------------
+
+#[test]
+fn a_disconnect_during_the_exit_is_the_expected_shape_and_the_run_goes_on() {
+    let mut sim = Sim::happy();
+    sim.exit = ExitResult {
+        sent: Err(errno(71)),
+        status: None,
+    };
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        [
+            "read_version",
+            "enter_bootloader",
+            "wait_for_bootloader",
+            "open_usbfs",
+            "read_report_descriptor",
+            "exit_bootloader",
+            "wait_for_bootloader_gone",
+            "wait_for_return"
+        ]
+    );
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    let text = log.render();
+    assert!(
+        text.contains("exit 10:05, SET_REPORT 21 09 00 03 00 00 5a 00: errno 71"),
+        "{text}"
+    );
+    assert!(
+        text.contains("1532:110E left the bus 0.20 s later, so the exit took effect"),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_status_read_that_fails_after_an_accepted_exit_is_recorded_not_fatal() {
+    let mut sim = Sim::happy();
+    sim.exit = ExitResult {
+        sent: Ok(()),
+        status: Some(Err("No such device (os error 19)".into())),
+    };
+    let (log, _) = run(&mut sim);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    assert!(!sim.calls.contains(&"wait_for_bootloader_gone"));
+    let text = log.render();
+    assert!(
+        text.contains("GET_REPORT read nothing (No such device"),
+        "{text}"
+    );
+    assert!(
+        text.contains("GET_REPORT a1 01 00 03 00 00 5a 00: No such device"),
+        "{text}"
+    );
+}
+
+#[test]
+fn an_exit_that_failed_with_the_bootloader_still_there_stops_and_says_replug() {
+    let mut sim = Sim::happy();
+    sim.exit = ExitResult {
+        sent: Err(errno(32)),
+        status: None,
+    };
+    sim.bootloader_left = None;
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls.last(),
+        Some(&"wait_for_bootloader_gone"),
+        "no wait for the return after an exit that did not take"
+    );
+    assert!(matches!(log.outcome, Some(Outcome::ExitFailed(_))));
+    assert!(log.outcome.as_ref().unwrap().needs_replug());
+    let text = log.render();
+    assert!(text.contains("STOPPED at step 3c"), "{text}");
+    assert!(text.contains("errno 32"), "{text}");
+    assert!(text.contains("1532:110E is still on the bus"), "{text}");
+    assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
+}
+
+// --- step 4: 1532:009F is back ----------------------------------------------------------------------------------------
+
+#[test]
+fn step_four_timeout_is_written_and_says_replug() {
+    let mut sim = Sim::happy();
+    sim.back = None;
+    let (log, _) = run(&mut sim);
+    assert_eq!(log.outcome, Some(Outcome::DidNotReturn));
+    assert!(log.outcome.as_ref().unwrap().needs_replug());
+    assert!(!log.outcome.as_ref().unwrap().is_success());
+    let text = log.render();
+    assert!(text.contains("STEP 4 TIMED OUT"), "{text}");
+    assert!(text.contains("so it must be replugged"), "{text}");
+    assert!(
+        !text.contains("by itself"),
+        "never imply it comes back by itself: {text}"
+    );
+    assert!(text.contains("did not come back within 30 s"), "{text}");
+    assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
+    // everything learnt before the timeout is still in the file
+    assert!(text.contains("device 8-3  bus 8"), "{text}");
+    assert!(text.contains("exit 10:05, SET_REPORT"), "{text}");
+}
+
+#[test]
+fn the_return_is_timed_from_the_exit_and_from_the_entry() {
+    // 009F back 20 s after the end of the step-4 call: the numbers from the 10:05 send, from the enter send and from the
+    // bootloader appearing tell whether 10:05 is what brought it back
+    let mut sim = Sim::happy();
+    sim.back = Some(20);
+    let (log, _) = run(&mut sim);
+    let text = log.render();
+    assert!(
+        text.contains("came back 22.00 s after the 10:05 send, 26.00 s after the enter-bootloader send (step 2), 24.00 s after 1532:110E appeared"),
+        "{text}"
+    );
 }
 
 #[test]
@@ -471,65 +1158,6 @@ fn a_version_answer_that_is_not_success_stops_before_entering_the_bootloader() {
     let (log, _) = run(&mut sim);
     assert_eq!(sim.calls, ["read_version"]);
     assert!(log.render().contains("NotSupported"), "{}", log.render());
-}
-
-#[test]
-fn a_device_that_refuses_the_bootloader_is_not_waited_on() {
-    for status in [3u8, 4, 5] {
-        let mut sim = Sim::happy();
-        sim.enter = Ok(Ok(reply((0x00, 0x04), status)));
-        let (log, _) = run(&mut sim);
-        assert_eq!(
-            sim.calls,
-            ["read_version", "enter_bootloader"],
-            "status {status}"
-        );
-        assert!(matches!(log.outcome, Some(Outcome::EnterFailed(_))));
-        assert!(!log.outcome.as_ref().unwrap().needs_replug());
-    }
-}
-
-#[test]
-fn a_device_that_resets_without_a_reply_is_still_waited_on() {
-    let mut sim = Sim::happy();
-    sim.enter = Ok(Err("Input/output error (os error 5)".into()));
-    let (log, _) = run(&mut sim);
-    assert_eq!(log.outcome, Some(Outcome::Completed));
-    assert!(log
-        .render()
-        .contains("sent; no reply read (Input/output error"));
-}
-
-#[test]
-fn an_enter_frame_that_could_not_be_written_stops_the_run() {
-    let mut sim = Sim::happy();
-    sim.enter = Err("No such device".into());
-    let (log, _) = run(&mut sim);
-    assert_eq!(sim.calls, ["read_version", "enter_bootloader"]);
-    assert!(matches!(log.outcome, Some(Outcome::EnterFailed(_))));
-}
-
-#[test]
-fn an_exit_that_could_not_be_written_is_reported_with_the_replug_instruction() {
-    let mut sim = Sim::happy();
-    sim.exit = Err("Broken pipe (os error 32)".into());
-    let (log, _) = run(&mut sim);
-    assert_eq!(
-        sim.calls.last(),
-        Some(&"exit_bootloader"),
-        "no wait after a failed send"
-    );
-    assert!(matches!(log.outcome, Some(Outcome::ExitFailed(_))));
-    assert!(log.render().contains("NEXT    Unplug the dongle"));
-}
-
-#[test]
-fn a_wait_that_saw_only_other_nodes_is_a_timeout_not_a_bootloader() {
-    let mut sim = Sim::happy();
-    sim.bootloader = Some(vec![enumeration(0x00AB, "/dev/hidraw9", 0, &DESC, 4)]);
-    let (log, _) = run(&mut sim);
-    assert_eq!(log.outcome, Some(Outcome::BootloaderNeverAppeared));
-    assert!(!sim.calls.contains(&"open_bootloader"));
 }
 
 #[test]
@@ -557,11 +1185,401 @@ fn timestamps_are_utc_iso() {
 }
 
 #[test]
-fn ids_are_the_ones_the_plan_names() {
+fn ids_and_timeouts_are_the_ones_the_plan_names() {
     assert_eq!(NORMAL_ID, (0x1532, 0x009F));
     assert_eq!(BOOTLOADER_ID, (0x1532, 0x110E));
-    assert_eq!(probe::BOOTLOADER_TIMEOUT, Duration::from_secs(20));
+    // steps 2 and 3 are short: the bootloader enumerated about a second after the enter frame
+    assert_eq!(probe::BOOTLOADER_TIMEOUT, Duration::from_secs(10));
+    assert_eq!(probe::LEAVE_TIMEOUT, Duration::from_secs(3));
+    // the wait for the return starts after the exit send; nothing shows the bootloader leaves by itself, so it is short
     assert_eq!(probe::RETURN_TIMEOUT, Duration::from_secs(30));
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// The kernel's USB device list, against a fixture tree (never the real /sys)
+
+/// `iface0`: `None` = no `:1.0` directory; `Some(None)` = there, no driver; `Some(Some(d))` = driver `d` bound.
+#[allow(clippy::too_many_arguments)]
+fn fake_usb(
+    root: &Path,
+    name: &str,
+    id: (u16, u16),
+    bcd: u16,
+    product: &str,
+    (bus, dev): (u32, u32),
+    iface0: Option<Option<&str>>,
+) {
+    let d = root.join(name);
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("busnum"), format!("{bus}\n")).unwrap();
+    std::fs::write(d.join("devnum"), format!("{dev}\n")).unwrap();
+    std::fs::write(d.join("bcdDevice"), format!("{bcd:04x}\n")).unwrap();
+    std::fs::write(d.join("product"), format!("{product}\n")).unwrap();
+    std::fs::write(d.join("descriptors"), KERNEL_DESC).unwrap();
+    std::fs::write(d.join("idProduct"), format!("{:04x}\n", id.1)).unwrap();
+    // the ids come last: a scan that sees them sees the rest
+    std::fs::write(d.join("idVendor"), format!("{:04x}\n", id.0)).unwrap();
+    if let Some(driver) = iface0 {
+        let i = root.join(format!("{name}:1.0"));
+        std::fs::create_dir_all(&i).unwrap();
+        std::fs::write(i.join("bInterfaceNumber"), "00\n").unwrap();
+        if let Some(n) = driver {
+            std::os::unix::fs::symlink(
+                format!("../../../../bus/usb/drivers/{n}"),
+                i.join("driver"),
+            )
+            .unwrap();
+        }
+    }
+}
+
+fn fixture_roots(name: &str) -> (PathBuf, Roots) {
+    let base = scratch(name);
+    let roots = Roots {
+        sysfs: base.join("sys/bus/usb/devices"),
+        dev: base.join("dev/bus/usb"),
+    };
+    std::fs::create_dir_all(&roots.sysfs).unwrap();
+    std::fs::create_dir_all(&roots.dev).unwrap();
+    (base, roots)
+}
+
+fn dongle_in(root: &Path) {
+    fake_usb(
+        root,
+        "8-3",
+        NORMAL_ID,
+        0x0101,
+        "Razer Viper Mini SE Dongle",
+        (8, 4),
+        Some(Some("usbhid")),
+    );
+}
+
+/// A probe over fixture directories. Its control node is `/dev/null`, which nothing here writes to.
+fn fixture_probe(roots: Roots) -> RealProbe {
+    let node = razerctl::hidraw::HidrawNode {
+        dev: PathBuf::from("/dev/null"),
+        sysfs: PathBuf::from("/nonexistent"),
+        vid: 0x1532,
+        pid: 0x009F,
+        interface: Some(0),
+        name: "Razer Viper Mini SE".into(),
+        has_feature_reports: true,
+    };
+    RealProbe::open(&node, roots).unwrap()
+}
+
+#[test]
+fn sysfs_scan_reads_every_field_the_report_needs() {
+    let (base, roots) = fixture_roots("scan");
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x009f,
+        "RAZER BOOTLOADER",
+        (8, 5),
+        Some(None),
+    );
+    let found = sysfs::find(&roots.sysfs, BOOTLOADER_ID, at(7)).unwrap();
+    assert_eq!(found, {
+        let mut d = bootloader_device(Interface0::Unbound);
+        d.seen_at = at(7);
+        d
+    });
+    assert_eq!(
+        found.summary(),
+        "1532:110e 8-3 bus 8 device 5 bcdDevice 009f product \"RAZER BOOTLOADER\""
+    );
+    assert_eq!(
+        sysfs::usbfs_path(Path::new("/dev/bus/usb"), 8, 5),
+        Path::new("/dev/bus/usb/008/005")
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn sysfs_find_ignores_interfaces_hubs_and_other_ids() {
+    let (base, roots) = fixture_roots("find");
+    dongle_in(&roots.sysfs);
+    // a root hub and an unrelated device, and an interface directory that carries the bootloader's ids
+    fake_usb(
+        &roots.sysfs,
+        "usb8",
+        (0x1d6b, 0x0002),
+        0x0700,
+        "xHCI Host Controller",
+        (8, 1),
+        None,
+    );
+    let ifc = roots.sysfs.join("8-3:1.0");
+    std::fs::write(ifc.join("idVendor"), "1532\n").unwrap();
+    std::fs::write(ifc.join("idProduct"), "110e\n").unwrap();
+    assert!(sysfs::find(&roots.sysfs, BOOTLOADER_ID, at(0)).is_none());
+    assert!(sysfs::present(&roots.sysfs, NORMAL_ID));
+    assert!(!sysfs::present(&roots.sysfs, BOOTLOADER_ID));
+    let all = sysfs::scan(&roots.sysfs, at(0));
+    assert_eq!(
+        all.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+        ["8-3", "usb8"]
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_missing_sysfs_root_is_an_empty_list() {
+    let (base, _) = fixture_roots("missing");
+    assert!(sysfs::scan(&base.join("nope"), at(0)).is_empty());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_bound_an_unbound_and_a_missing_interface_zero_are_told_apart() {
+    let (base, roots) = fixture_roots("iface0");
+    fake_usb(
+        &roots.sysfs,
+        "1-1",
+        BOOTLOADER_ID,
+        0x9f,
+        "A",
+        (1, 2),
+        Some(Some("usbhid")),
+    );
+    fake_usb(
+        &roots.sysfs,
+        "1-2",
+        BOOTLOADER_ID,
+        0x9f,
+        "B",
+        (1, 3),
+        Some(None),
+    );
+    fake_usb(&roots.sysfs, "1-3", BOOTLOADER_ID, 0x9f, "C", (1, 4), None);
+    let all = sysfs::scan(&roots.sysfs, at(0));
+    assert_eq!(all[0].interface0, Interface0::Bound("usbhid".into()));
+    assert_eq!(all[1].interface0, Interface0::Unbound);
+    assert_eq!(all[2].interface0, Interface0::Missing);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn unreadable_descriptors_are_reported_not_hidden() {
+    let (base, roots) = fixture_roots("nodesc");
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x9f,
+        "B",
+        (8, 5),
+        Some(None),
+    );
+    std::fs::remove_file(roots.sysfs.join("8-3/descriptors")).unwrap();
+    let d = sysfs::find(&roots.sysfs, BOOTLOADER_ID, at(0)).unwrap();
+    assert!(d.descriptors.is_err());
+    let mut log = ProbeLog::new(build(), at(0), "dev".into());
+    log.push(probe::report::Step::new("3", "x", at(0), at(1), "y".into()));
+    log.bootloader = Some(d);
+    assert!(log
+        .render()
+        .contains("kernel descriptors: could not be read"));
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// --- the real transport's waits, against a fixture tree ---------------------------------------------------------------
+
+fn after<F: FnOnce() + Send + 'static>(ms: u64, f: F) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(ms));
+        f()
+    })
+}
+
+#[test]
+fn a_bootloader_listed_in_sysfs_with_no_hidraw_node_is_found() {
+    // the board's first run: 1532:110E enumerated, usbhid refused it, and no hidraw node was ever made. The listing in
+    // sysfs is the only place it shows up
+    let (base, roots) = fixture_roots("find110e");
+    let mut p = fixture_probe(roots.clone());
+    let sys = roots.sysfs.clone();
+    let t = after(200, move || {
+        fake_usb(
+            &sys,
+            "8-3",
+            BOOTLOADER_ID,
+            0x009f,
+            "RAZER BOOTLOADER",
+            (8, 5),
+            Some(None),
+        )
+    });
+    let w = p.wait_for_bootloader(Duration::from_secs(5));
+    t.join().unwrap();
+    let d = w.device.expect("the bootloader was not found");
+    assert_eq!((d.vid, d.pid), BOOTLOADER_ID);
+    assert_eq!((d.bus, d.dev), (Some(8), Some(5)));
+    assert_eq!(d.bcd_device, Some(0x009f));
+    assert_eq!(d.product.as_deref(), Some("RAZER BOOTLOADER"));
+    assert_eq!(d.interface0, Interface0::Unbound);
+    assert_eq!(d.descriptors, Ok(KERNEL_DESC.to_vec()));
+    assert!(w.appeared_at.is_some());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_wait_that_saw_only_the_dongle_is_a_timeout_not_a_bootloader() {
+    let (base, roots) = fixture_roots("only009f");
+    dongle_in(&roots.sysfs);
+    let mut p = fixture_probe(roots);
+    let w = p.wait_for_bootloader(Duration::from_millis(400));
+    assert!(w.device.is_none() && w.appeared_at.is_none());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn the_dongle_leaving_sysfs_is_seen_and_a_dongle_that_stays_is_not() {
+    let (base, roots) = fixture_roots("gone");
+    dongle_in(&roots.sysfs);
+    let mut p = fixture_probe(roots.clone());
+    assert_eq!(p.wait_for_dongle_gone(Duration::from_millis(300)), None);
+    let dir = roots.sysfs.join("8-3");
+    let t = after(250, move || std::fs::remove_dir_all(dir).unwrap());
+    let d = p
+        .wait_for_dongle_gone(Duration::from_secs(5))
+        .expect("the dongle left");
+    t.join().unwrap();
+    assert!(d >= Duration::from_millis(100), "{d:?}");
+    // already gone: immediate
+    std::fs::remove_dir_all(roots.sysfs.join("8-3:1.0")).unwrap();
+    assert!(
+        p.wait_for_dongle_gone(Duration::from_millis(300)).unwrap() < Duration::from_millis(50)
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn the_bootloader_leaving_sysfs_is_seen_and_one_that_stays_is_not() {
+    let (base, roots) = fixture_roots("blgone");
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x9f,
+        "B",
+        (8, 5),
+        Some(None),
+    );
+    let mut p = fixture_probe(roots.clone());
+    assert_eq!(p.wait_for_bootloader_gone(Duration::from_millis(300)), None);
+    let dir = roots.sysfs.join("8-3");
+    let t = after(250, move || std::fs::remove_dir_all(dir).unwrap());
+    assert!(p.wait_for_bootloader_gone(Duration::from_secs(5)).is_some());
+    t.join().unwrap();
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn the_dongle_is_back_only_when_009f_is_listed_and_110e_is_not() {
+    let (base, roots) = fixture_roots("back");
+    // both listed (the bootloader has not gone yet): not back
+    dongle_in(&roots.sysfs);
+    fake_usb(
+        &roots.sysfs,
+        "8-4",
+        BOOTLOADER_ID,
+        0x9f,
+        "B",
+        (8, 5),
+        Some(None),
+    );
+    let mut p = fixture_probe(roots.clone());
+    let r = p.wait_for_return(Duration::from_millis(300));
+    assert!(r.back_at.is_none());
+    // the bootloader goes: back
+    std::fs::remove_dir_all(roots.sysfs.join("8-4")).unwrap();
+    let r = p.wait_for_return(Duration::from_secs(2));
+    assert!(r.back_at.is_some());
+    assert_eq!(r.nodes.len(), 1, "{:?}", r.nodes);
+    assert!(r.nodes[0].starts_with("1532:009f 8-3 bus 8 device 4 bcdDevice 0101"));
+    // nothing listed at all: not back
+    std::fs::remove_dir_all(roots.sysfs.join("8-3")).unwrap();
+    assert!(p
+        .wait_for_return(Duration::from_millis(300))
+        .back_at
+        .is_none());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// --- opening the usbfs node, against a fixture directory --------------------------------------------------------------
+
+fn fixture_bootloader() -> UsbDevice {
+    bootloader_device(Interface0::Unbound)
+}
+
+#[test]
+fn a_missing_usbfs_node_is_an_open_failure_with_its_errno() {
+    let (base, roots) = fixture_roots("nonode");
+    let mut p = fixture_probe(roots);
+    let f = p.open_usbfs(&fixture_bootloader()).unwrap_err();
+    assert_eq!(f.errno, Some(2));
+    assert!(f.node.ends_with("008/005"), "{f}");
+    // nothing was opened, so nothing can be sent
+    let x = p.exit_bootloader();
+    assert!(x.sent.is_err() && x.status.is_none());
+    assert!(p.read_report_descriptor().is_err());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_usbfs_node_the_user_may_not_open_is_an_eacces_not_an_escalation() {
+    let (base, roots) = fixture_roots("eacces");
+    let node = roots.dev.join("008/005");
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::write(&node, "").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o000)).unwrap();
+    }
+    // root opens anything; the fixture proves nothing then
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipped: running as root");
+        let _ = std::fs::remove_dir_all(base);
+        return;
+    }
+    let mut p = fixture_probe(roots);
+    let f = p.open_usbfs(&fixture_bootloader()).unwrap_err();
+    assert_eq!(f.errno, Some(13), "{f}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_node_that_opens_but_cannot_be_claimed_is_an_open_failure_and_is_not_kept() {
+    // a regular file takes the open and refuses the ioctl (ENOTTY, 25), the same shape as a claim refused by the kernel
+    let (base, roots) = fixture_roots("noclaim");
+    let node = roots.dev.join("008/005");
+    std::fs::create_dir_all(node.parent().unwrap()).unwrap();
+    std::fs::write(&node, "").unwrap();
+    let mut p = fixture_probe(roots);
+    let f = p.open_usbfs(&fixture_bootloader()).unwrap_err();
+    assert_eq!(f.errno, Some(25), "{f}");
+    let x = p.exit_bootloader();
+    assert!(
+        x.sent.unwrap_err().message.contains("never opened"),
+        "an interface that could not be claimed must not be used"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_bootloader_without_a_bus_and_device_number_is_an_open_failure() {
+    let (base, roots) = fixture_roots("nobus");
+    let mut p = fixture_probe(roots);
+    let mut d = fixture_bootloader();
+    d.bus = None;
+    let f = p.open_usbfs(&d).unwrap_err();
+    assert!(f.message.contains("no busnum/devnum"), "{f}");
+    let _ = std::fs::remove_dir_all(base);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -794,8 +1812,9 @@ fn without_the_flag_it_prints_the_plan_and_exits_non_zero() {
         "would, on the Razer dongle 1532:009F",
         "1. read its version (00:87)",
         "2. send enter-bootloader (00:04, mode 1)",
-        "3. wait up to 20 s",
-        "5. send exit (10:05)",
+        "3. wait up to 10 s",
+        "3c. send exit (10:05)",
+        "4. wait up to 30 s",
         "never erases or writes firmware",
         "Nothing was sent",
         "--yes-enter-bootloader",
@@ -914,7 +1933,12 @@ const FORBIDDEN_COMMANDS: [&str; 3] = ["(0x10,0x01)", "(0x10,0x02)", "(0x0a,"];
 
 fn touches_a_device(src: &str) -> bool {
     code(src).iter().any(|l| {
-        tokens(l).contains(&"Hidraw") || l.contains("hidraw::") || l.contains("/dev/hidraw")
+        tokens(l).contains(&"Hidraw")
+            || tokens(l).contains(&"Usbfs")
+            || l.contains("hidraw::")
+            || l.contains("/dev/hidraw")
+            || l.contains("/dev/bus/usb")
+            || l.contains("libc::ioctl")
     })
 }
 
@@ -944,7 +1968,7 @@ fn fence_probe_cannot_name_the_dfu_code_or_a_destructive_command() {
         }
     }
     assert_eq!(
-        checked, 4,
+        checked, 6,
         "src/probe/ gained or lost a file: review the fence"
     );
 }
@@ -986,6 +2010,7 @@ fn fence_the_real_transport_implements_only_the_probe_trait() {
         impls("src/probe/hw.rs"),
         [
             "impl<T: FeatureIo> FeatureIo for Guarded<T> {",
+            "impl Roots {",
             "impl RealProbe {",
             "impl ProbeIo for RealProbe {",
         ]
@@ -1053,6 +2078,12 @@ fn fence_no_device_touching_module_can_reach_the_dfu_code() {
         device_files.contains(&"src/hidraw.rs".to_string()),
         "{device_files:?}"
     );
+    for f in ["src/probe/usbfs.rs", "src/probe/hw.rs"] {
+        assert!(
+            device_files.contains(&f.to_string()),
+            "{f} is not seen as touching a device: {device_files:?}"
+        );
+    }
 }
 
 #[test]
@@ -1088,7 +2119,7 @@ fn fence_every_write_in_the_real_transport_goes_through_the_guard() {
         [
             "fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {",
             "self.0.send_feature(payload)",
-            "io.send_feature(&frame.to_bytes())",
+            "io.send_feature(&frame.to_bytes())?;",
         ]
     );
     // the guard checks the allow-list before it delegates
@@ -1119,5 +2150,219 @@ fn fence_every_write_in_the_real_transport_goes_through_the_guard() {
         "OpenOptions",
     ] {
         assert!(!hw.contains(banned), "hw.rs uses `{banned}`");
+    }
+}
+
+// --- the usbfs transport (DAN-1929) -----------------------------------------------------------------------------------
+
+fn src_file(name: &str) -> String {
+    src_files()
+        .into_iter()
+        .find(|(n, _)| n == name)
+        .unwrap_or_else(|| panic!("{name} is gone"))
+        .1
+}
+
+/// The ioctl request constants of <linux/usbdevice_fs.h> that usbfs.rs may name.
+const USBFS_ALLOWED_IOCTLS: [&str; 2] = ["USBDEVFS_CONTROL", "USBDEVFS_CLAIMINTERFACE"];
+
+/// Words that only a usbfs reset, reconfiguration, driver detach or non-control transfer would need.
+const USBFS_BANNED_WORDS: [&str; 12] = [
+    "reset",
+    "detach",
+    "disconnect",
+    "setconfig",
+    "set_config",
+    "setinterface",
+    "set_interface",
+    "bulk",
+    "submiturb",
+    "clear_halt",
+    "clearhalt",
+    "drop_priv",
+];
+
+#[test]
+fn fence_the_usbfs_transport_issues_only_the_control_and_claim_ioctls() {
+    let lines = code(&src_file("src/probe/usbfs.rs"));
+    // one raw ioctl call in the file, in the one private method
+    let raw: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("libc::ioctl("))
+        .collect();
+    assert_eq!(raw.len(), 1, "{raw:?}");
+    // that method is called twice, once per allowed request
+    let calls: Vec<String> = lines
+        .iter()
+        .filter(|l| l.contains("self.ioctl("))
+        .map(|l| l.trim().to_string())
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            "self.ioctl(USBDEVFS_CLAIMINTERFACE, (&mut n as *mut u32).cast())",
+            "self.ioctl(USBDEVFS_CONTROL, (&mut t as *mut CtrlTransfer).cast())",
+        ]
+    );
+    // every request constant named is one of the two
+    for l in &lines {
+        for t in tokens(l) {
+            if t.starts_with("USBDEVFS_") {
+                assert!(
+                    USBFS_ALLOWED_IOCTLS.contains(&t),
+                    "usbfs.rs names `{t}`: {l}"
+                );
+            }
+        }
+        let low = l.to_lowercase();
+        for w in USBFS_BANNED_WORDS {
+            assert!(!low.contains(w), "usbfs.rs contains `{w}`: {l}");
+        }
+    }
+    // and the ioctl is nowhere else in the probe, nor anywhere in the library but hidraw.rs
+    for (name, src) in src_files() {
+        if name == "src/hidraw.rs" || name == "src/probe/usbfs.rs" {
+            continue;
+        }
+        for l in code(&src) {
+            assert!(!l.contains("libc::ioctl"), "{name} issues an ioctl: {l}");
+            assert!(
+                name == "src/probe/hw.rs" || !l.contains("/dev/bus/usb"),
+                "{name} names /dev/bus/usb: {l}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fence_the_usbfs_transport_implements_only_the_control_traits_and_has_three_requests() {
+    let lines: Vec<String> = code(&src_file("src/probe/usbfs.rs"))
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .collect();
+    let impls: Vec<&String> = lines.iter().filter(|l| l.starts_with("impl")).collect();
+    assert_eq!(
+        impls,
+        [
+            "impl Setup {",
+            "impl<T: ControlIo> ControlIo for UsbGuarded<T> {",
+            "impl Usbfs {",
+            "impl ControlIo for Usbfs {",
+        ],
+        "a trait other than the control channel is implemented for a usbfs type"
+    );
+    // the Setup constructors: the three requests, and nothing else builds a request
+    let ctors: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.starts_with("pub const fn "))
+        .collect();
+    assert_eq!(
+        ctors,
+        [
+            "pub const fn get_report_descriptor() -> Setup {",
+            "pub const fn set_report_feature() -> Setup {",
+            "pub const fn get_report_feature() -> Setup {",
+        ]
+    );
+    let literals: Vec<&String> = lines.iter().filter(|l| l.as_str() == "Setup {").collect();
+    assert_eq!(literals.len(), 3, "{literals:?}");
+    // the phase-1 DFU trait has exactly one implementation in the library, and it is the simulated device
+    for (name, src) in src_files() {
+        for l in code(&src) {
+            if name.starts_with("src/probe/") {
+                assert!(
+                    !tokens(&l).windows(2).any(|w| w == ["Transport", "for"]),
+                    "{name}: {l}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fence_every_usbfs_request_goes_through_the_guard() {
+    let lines: Vec<String> = code(&src_file("src/probe/usbfs.rs"))
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .collect();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("usbfs.rs lost `{needle}`"))
+    };
+    // the guard checks the allow-list before it delegates, and delegates in exactly one place per method
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("self.0.control("))
+            .count(),
+        1
+    );
+    assert!(at("if !permitted(setup, data)") < at("self.0.control(setup, data)"));
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("self.0.claim_interface("))
+            .count(),
+        1
+    );
+    assert!(at("if interface != INTERFACE") < at("self.0.claim_interface(interface)"));
+    // a bare `Usbfs` is built in one place, and handed out only inside the guard
+    let built: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("Usbfs { file"))
+        .collect();
+    assert_eq!(built, ["Ok(UsbGuarded(Usbfs { file }))"]);
+    assert!(lines
+        .iter()
+        .any(|l| l == "pub fn open(path: &Path) -> io::Result<UsbGuarded<Usbfs>> {"));
+    // every call of the control channel in the high-level helpers takes a guard
+    for l in lines.iter().filter(|l| l.starts_with("pub fn ")) {
+        assert!(
+            !l.contains("&Usbfs") && !l.contains("&T)"),
+            "a helper takes an unguarded channel: {l}"
+        );
+    }
+    // no other module holds a bare Usbfs
+    for (name, src) in src_files() {
+        if name == "src/probe/usbfs.rs" {
+            continue;
+        }
+        for l in code(&src) {
+            if tokens(&l).contains(&"Usbfs") {
+                assert!(
+                    l.contains("UsbGuarded<Usbfs>")
+                        || l.contains("Usbfs::open(")
+                        || l.trim_start().starts_with("use "),
+                    "{name} holds an unguarded Usbfs: {l}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fence_sysfs_only_reads() {
+    let src = src_file("src/probe/sysfs.rs");
+    for banned in [
+        "fs::write",
+        "File::create",
+        "OpenOptions",
+        ".write(",
+        "write_all",
+        "libc::",
+        "set_permissions",
+        "remove_",
+        "rename",
+        "create_dir",
+        "symlink(",
+        "ioctl",
+        "Hidraw",
+        "Usbfs",
+    ] {
+        for l in code(&src) {
+            assert!(!l.contains(banned), "sysfs.rs uses `{banned}`: {l}");
+        }
     }
 }

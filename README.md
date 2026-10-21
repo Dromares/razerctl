@@ -231,23 +231,38 @@ razerctl opens no device for either, and it does not ship or download Razer's fi
 of the updater. **Flashing a real device is not supported yet**; without `--dry-run` the command refuses.
 
 `probe-bootloader` is the one firmware command that talks to a device, and it only runs when you ask for it with `--yes-enter-bootloader`.
-It is a measurement for a later update feature: it reads the Viper Mini SE dongle's version (`00:87`), puts it into its
-bootloader (`00:04`, mode 1), waits up to 20 s for it to show up as `1532:110E`, writes down how it enumerated (hidraw
-node, interface, `bcdDevice`, report descriptor, and whether the node opens without root), then sends exit (`10:05`) and
-waits up to 30 s for `1532:009F` to come back. Everything goes into a text file (`--out FILE`, default
+It is a measurement for a later update feature. It reads the Viper Mini SE dongle's version (`00:87`) and puts it into its
+bootloader (`00:04`, mode 1). The bootloader enumerates as `1532:110E` and the kernel makes **no hidraw node** for it, so the
+probe finds it in `/sys/bus/usb/devices` (reading sysfs sends nothing) and writes down the bus and device number,
+`bcdDevice`, product string, any driver bound to interface 0 and the kernel's cached descriptors. It then opens the
+bootloader's `/dev/bus/usb/BBB/DDD` node, reads its HID report descriptor, sends exit (`10:05`) as a HID feature
+SET_REPORT and reads the GET_REPORT that answers it, and waits up to 30 s for `1532:009F` to come back, recording how long
+that took from the `10:05` send and from entry (which tells whether `10:05` is what brought it back). An error on the enter send counts as
+"entered" only if the dongle then leaves the USB bus. Everything goes into a text file (`--out FILE`, default
 `razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
 
-* **It never erases or writes firmware.** The command can send exactly three frames (`00:87`, `00:04` mode 1 and `10:05`);
-  no erase, program or Flash-stream frame exists in it, and `cargo test` fails if one is added.
+Before running it, reinstall the udev rule, which now has a line for `1532:110E` (without it the bootloader's node is
+root-only and the probe stops before sending anything to it):
+
+```
+sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger
+```
+
+* **It never erases or writes firmware.** Over hidraw the command can send exactly two frames (`00:87` and `00:04`
+  mode 1). Over usbfs it can send three control requests: the HID report descriptor read, `10:05` as a feature SET_REPORT,
+  and the GET_REPORT that reads its status; the only ioctls it issues are `USBDEVFS_CONTROL` and
+  `USBDEVFS_CLAIMINTERFACE`. No erase, program or Flash-stream frame exists in it, and `cargo test` fails if one is added.
 * Without `--yes-enter-bootloader` it only prints what it would do and exits with an error; nothing is sent.
+* If the bootloader's usbfs node cannot be opened (no udev rule), or a kernel driver owns interface 0, it sends nothing to the
+  bootloader, never uses root or detaches the driver, writes down the error number or the driver, and tells you to
+  install the rule and replug the dongle.
 * It refuses to start while another razerctl (the remap or battery service, the GUI, another command) or openrazer
   (`openrazer-daemon`, or the `razermouse` kernel driver bound to the dongle) is using the device, or anything else has its
   hidraw node open. Stop them first.
-* **The mouse does not work while it runs.** The expected worst case is that the dongle stays in bootloader mode until
-  you unplug it and plug it back in; if a step times out the file says which one and the command prints that
-  instruction. Whether a replug always recovers it has not been confirmed on Linux, which is part of what the probe is for.
-  If it does not, Razer's own updater on Windows is the fallback; that it can talk to a dongle in bootloader mode is
-  inferred from its code, not tested.
+* **The mouse does not work while it runs.** The worst case is that the dongle sits in bootloader mode until you unplug it
+  and plug it back in. If a step times out the file says which one and the command prints that instruction. Whether a replug always recovers it has not
+  been confirmed on Linux, which is part of what the probe is for. If it does not, Razer's own updater on Windows is the
+  fallback; that it can talk to a dongle in bootloader mode is inferred from its code, not tested.
 
 ## Button remapping (replaces the DriverKit extension)
 

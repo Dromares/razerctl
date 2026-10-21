@@ -56,9 +56,9 @@ COMMANDS:
                              Flashing a real device is not supported yet
     firmware probe-bootloader [--yes-enter-bootloader] [--out FILE]
                              Put the Viper Mini SE dongle into its bootloader (1532:110E), record how it
-                             enumerates on Linux, and take it out again. Never erases or writes firmware;
-                             without the flag it only prints what it would do. The mouse is dead while it
-                             runs. Worst case: replug the dongle
+                             enumerates on Linux (sysfs + usbfs, needs the updated udev rule), and take it out again.
+                             Never erases or writes firmware; without the flag it only prints what it would do.
+                             The mouse is dead while it runs. Worst case: replug the dongle
     update [--check]         Ask GitHub whether a newer release exists (only when you run this).
                              Without --check: show what is new, then ask y/N before replacing an
                              AppImage; other installs get the release link or the package command
