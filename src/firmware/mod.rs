@@ -3,6 +3,7 @@
 //! state machine against a simulated device and prints the frames. Razer's firmware is never stored in this repository;
 //! it is extracted from the user's own copy of the updater at run time.
 
+pub mod flash;
 pub mod ihex;
 pub mod resources;
 pub mod zip;
@@ -26,6 +27,10 @@ pub struct FirmwareImage {
     pub sha256: String,
     /// Intel-HEX records read (all checksums verified).
     pub records: usize,
+    /// The Intel-HEX record text, one entry per line, as the updater stores it.
+    pub lines: Vec<String>,
+    /// For a `Flash` image: the closing CRC-16 its stream carries (see `flash`).
+    pub flash_crc: Option<u16>,
     /// Bootloader the image is written through, when the config names one (`BLVID`/`BLPID`/`BLVER`/`BCDPID_BL`).
     pub bootloader: Option<Bootloader>,
 }
@@ -116,6 +121,15 @@ pub fn inspect(exe: &[u8]) -> Result<Inspection, String> {
             }),
             _ => None,
         };
+        let lines: Vec<String> = labels.iter().map(|l| cfg[l].trim().to_string()).collect();
+        let flash_crc = if kind == "Flash" {
+            Some(
+                flash::stream_crc(lines.iter().map(String::as_str))
+                    .map_err(|e| format!("{name}: {e}"))?,
+            )
+        } else {
+            None
+        };
         images.push(FirmwareImage {
             name: name.to_string(),
             vid: hex16(&cfg, &format!("VID{n}"))?,
@@ -124,6 +138,8 @@ pub fn inspect(exe: &[u8]) -> Result<Inspection, String> {
             sha256: crate::sha256::hex_digest(&image.data[..]).map_err(|e| e.to_string())?,
             image,
             records: want,
+            lines,
+            flash_crc,
             bootloader,
         });
     }
@@ -163,9 +179,12 @@ pub fn describe(path: &str, file_sha256: &str, ins: &Inspection) -> Vec<String> 
                 "  written via bootloader {:04x}:{:04x} (bcdDevice {:04x}, protocol {})",
                 b.vid, b.pid, b.bcd, b.version
             )),
-            None => out.push(
-                "  not a bootloader image (the vendor sends it through the running device)".into(),
-            ),
+            None => out.push(match f.flash_crc {
+                Some(c) => format!(
+                    "  sent through the running device as class 0x0A records; stream CRC-16 {c:#06x}"
+                ),
+                None => "  no bootloader entry in the config".into(),
+            }),
         }
     }
     out
