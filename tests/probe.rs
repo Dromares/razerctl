@@ -333,6 +333,10 @@ fn the_report_is_self_explanatory() {
     let mut sim = Sim::happy();
     let (log, _) = run(&mut sim);
     let text = log.render();
+    // `RAZERCTL_PROBE_SAMPLE=FILE cargo test` keeps the simulated run's report, to show what the board will paste
+    if let Some(p) = std::env::var_os("RAZERCTL_PROBE_SAMPLE") {
+        std::fs::write(p, &text).unwrap();
+    }
     for needle in [
         "razerctl 0.3.1 git 0123456789abcdef0123456789abcdef01234567",
         "started 2026-10-1", // 1_792_000_000 s
