@@ -195,8 +195,8 @@ struct CtrlTransfer {
     data: *mut libc::c_void,
 }
 
-const USBDEVFS_CONTROL: u64 = ioc(IOC_RW, 0, std::mem::size_of::<CtrlTransfer>());
-const USBDEVFS_CLAIMINTERFACE: u64 = ioc(IOC_READ, 15, std::mem::size_of::<u32>());
+pub const USBDEVFS_CONTROL: u64 = ioc(IOC_RW, 0, std::mem::size_of::<CtrlTransfer>());
+pub const USBDEVFS_CLAIMINTERFACE: u64 = ioc(IOC_READ, 15, std::mem::size_of::<u32>());
 
 /// An open `/dev/bus/usb/BBB/DDD`. Only [`Usbfs::open`] makes one, and it hands it out inside the guard.
 pub struct Usbfs {

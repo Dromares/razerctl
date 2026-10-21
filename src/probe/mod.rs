@@ -236,7 +236,7 @@ pub fn run<I: ProbeIo>(
     let wait = io.wait_for_bootloader(BOOTLOADER_TIMEOUT);
     let detail = match (&wait.device, wait.appeared_at) {
         (Some(d), Some(seen)) => format!(
-            "1532:110E listed as {} {} after the enter send",
+            "1532:110E listed as {} {} after the wait began",
             d.name,
             report::secs(seen.duration_since(at).unwrap_or_default())
         ),
@@ -429,7 +429,7 @@ pub fn plan_text() -> String {
          \x20 2. send enter-bootloader (00:04, mode 1); an error on that send counts as \"entered\" only if the dongle then leaves the bus\n\
          \x20 3. wait up to {} s for the dongle to be listed as 1532:110E in /sys/bus/usb/devices, and write down what the kernel\n\
          \x20    says about it (bus and device number, bcdDevice, product, driver on interface 0, cached descriptors)\n\
-         \x20 3b. open its /dev/bus/usb node (needs the udev rule), claim interface 0 and read its HID report descriptor\n\
+         \x20 3b. open its usbfs node (needs the udev rule), claim interface 0 and read its HID report descriptor\n\
          \x20 3c. send exit (10:05) as a HID feature SET_REPORT and read its GET_REPORT\n\
          \x20 4. wait up to {} s for 1532:009F to come back, and write down how long it took, from 10:05 and from entry\n\
          It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command). While it runs the\n\
