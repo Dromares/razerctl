@@ -5,10 +5,10 @@
 //! 2. find the dongle (`1532:009F`) and refuse if it is not exactly one device with a usable control node;
 //! 3. refuse if other razerctl or openrazer traffic is on it ([`super::refusals`]);
 //! 4. create the output file (it must not exist yet), so an unwritable path is found before the device is touched;
-//! 5. open the control node and run the five steps ([`super::run`]).
+//! 5. open the control node and run the steps ([`super::run`]).
 
-use super::hw::{self, RealProbe};
-use super::{plan_text, refusals, report::ProbeLog, run, Build, REPLUG};
+use super::hw::{self, RealProbe, Roots};
+use super::{plan_text, refusals, report::ProbeLog, run, Build};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -108,7 +108,7 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
 
     let out = a.out.unwrap_or_else(default_out);
     create_out(&out)?;
-    let mut probe = RealProbe::open(control).map_err(|e| {
+    let mut probe = RealProbe::open(control, Roots::system()).map_err(|e| {
         format!(
             "refusing: cannot open {} for read/write: {e} (install udev/70-razerctl.rules); nothing was sent",
             control.dev.display()
@@ -142,8 +142,8 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     }
     let _ = std::io::stdout().flush();
     let outcome = log.outcome.as_ref();
-    if outcome.is_some_and(|o| o.needs_replug()) {
-        eprintln!("{REPLUG}");
+    for n in outcome.map(|o| o.next_steps()).unwrap_or_default() {
+        eprintln!("{n}");
     }
     match outcome {
         Some(o) if o.is_success() => Ok(()),

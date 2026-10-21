@@ -1,41 +1,47 @@
 //! The one real transport of the bootloader probe. Everything that touches `/dev/hidraw*`, `/sys` and `/proc` for it is
-//! in this file, and `tests/probe.rs` pins what it may contain.
+//! in this file, and `tests/probe.rs` pins what it may contain. The USB side (`/sys/bus/usb`, `/dev/bus/usb`) is in
+//! `sysfs.rs` and `usbfs.rs`; this file only calls them.
 //!
 //! The fence, in three layers:
 //!
-//! 1. [`RealProbe`] implements [`ProbeIo`] and nothing else of ours. `ProbeIo` has no method that takes a frame, so a
-//!    caller cannot ask it to send one; the three methods that write ([`ProbeIo::read_version`],
+//! 1. [`RealProbe`] implements [`ProbeIo`] and nothing else of ours. `ProbeIo` has no method that takes a frame or a
+//!    control request, so a caller cannot ask it to send one; the methods that write ([`ProbeIo::read_version`],
 //!    [`ProbeIo::enter_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from the constructors in
 //!    `probe/mod.rs`.
-//! 2. Every write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not one of the three
-//!    probe frames ([`super::permitted`]). That is a runtime check at the last point before the kernel, so a frame
-//!    built by hand in this file would still not get out.
+//! 2. Every hidraw write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not one of the
+//!    two normal-mode probe frames ([`super::permitted`]); every usbfs request goes through
+//!    [`super::usbfs::UsbGuarded`], which refuses all but its three. Both are runtime checks at the last point before the
+//!    kernel, so a frame built by hand in this file would still not get out.
 //! 3. This file does not name the phase-1 DFU module, its trait or its erase/program constructors; the fence test reads
 //!    the source for that.
 
-use super::report::{BootloaderWait, Enumeration, OpenFailure, ReturnWait};
+use super::report::{BootloaderWait, ExitResult, OpenFailure, ReturnWait, SendError};
+use super::sysfs::{self, UsbDevice};
+use super::usbfs::{self, ControlIo, UsbGuarded, Usbfs};
 use super::{
-    enter_frame, exit_frame, permitted, read_version_frame, Answer, ProbeIo, Traffic,
-    BOOTLOADER_ID, NORMAL_ID,
+    enter_frame, permitted, read_version_frame, Answer, ProbeIo, Traffic, BOOTLOADER_ID, EXIT,
+    NORMAL_ID,
 };
 use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{Report, Status, REPORT_LEN};
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
-/// How often the node list is polled while waiting for a device to appear.
+/// How often the device list is polled while waiting for a device to appear or leave.
 const POLL: Duration = Duration::from_millis(100);
-/// After `1532:110E` first shows up, wait this long for its other interfaces and the udev ACL before listing it.
-const SETTLE: Duration = Duration::from_millis(1000);
+/// After `1532:110E` first shows up, wait this long for its interface directory and the udev ACL before reading it.
+const SETTLE: Duration = Duration::from_millis(500);
+/// A usbfs node that exists but is not yet readable is retried this long (udev applies the ACL just after the node
+/// appears). Any other error, or the same error after this, is final.
+const OPEN_RETRY: Duration = Duration::from_millis(2000);
 /// Follow-up reads of the reply after a send: `ATTEMPTS` polls, `STEP` apart.
 const REPLY_ATTEMPTS: usize = 5;
 const REPLY_STEP: Duration = Duration::from_millis(20);
 
-/// A feature-report channel that can only carry the probe's three frames. Generic so the tests can put a recording
-/// channel under it and show what does and does not get through.
+/// A feature-report channel that can only carry the probe's two normal-mode frames. Generic so the tests can put a
+/// recording channel under it and show what does and does not get through.
 pub struct Guarded<T: FeatureIo>(pub T);
 
 impl<T: FeatureIo> FeatureIo for Guarded<T> {
@@ -43,7 +49,7 @@ impl<T: FeatureIo> FeatureIo for Guarded<T> {
         if !permitted(payload) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "refused: the bootloader probe may only send 00:87, 00:04 mode 1 and 10:05",
+                "refused: the bootloader probe may only send 00:87 and 00:04 mode 1 over hidraw",
             ));
         }
         self.0.send_feature(payload)
@@ -53,11 +59,10 @@ impl<T: FeatureIo> FeatureIo for Guarded<T> {
     }
 }
 
-/// Send one probe frame, then read for its answer a few times. `Err` only if the frame could not be written; the
-/// answer is best effort because a device that resets straight away often has none to give.
-pub fn send_and_listen<T: FeatureIo>(io: &Guarded<T>, frame: &Report) -> Result<Answer, String> {
-    io.send_feature(&frame.to_bytes())
-        .map_err(|e| e.to_string())?;
+/// Send one probe frame, then read for its answer a few times. `Err` only if the frame could not be written (with the
+/// errno); the answer is best effort because a device that resets straight away often has none to give.
+pub fn send_and_listen<T: FeatureIo>(io: &Guarded<T>, frame: &Report) -> Result<Answer, SendError> {
+    io.send_feature(&frame.to_bytes())?;
     let sent = (frame.command_class, frame.command_id);
     let mut last = Err("no reply".to_string());
     for _ in 0..REPLY_ATTEMPTS {
@@ -92,55 +97,69 @@ pub fn read_version_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Report, String>
 }
 
 /// Step 2: `00:04` mode 1.
-pub fn enter_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, String> {
+pub fn enter_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, SendError> {
     send_and_listen(io, &enter_frame())
 }
 
-/// Step 5: `10:05`.
-pub fn exit_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, String> {
-    send_and_listen(io, &exit_frame())
-}
-
-/// Every Razer HID interface the kernel lists now, with its USB `bcdDevice` and report descriptor.
-pub fn enumerate_razer() -> Vec<Enumeration> {
-    let now = SystemTime::now();
-    hidraw::enumerate()
-        .unwrap_or_default()
-        .iter()
-        .map(|n| enumeration_of(n, now))
-        .collect()
-}
-
-fn enumeration_of(n: &HidrawNode, seen_at: SystemTime) -> Enumeration {
-    Enumeration {
-        vid: n.vid,
-        pid: n.pid,
-        node: n.dev.display().to_string(),
-        interface: n.interface,
-        bcd_device: bcd_device(&n.sysfs),
-        descriptor: fs::read(n.sysfs.join("report_descriptor")).unwrap_or_default(),
-        seen_at,
+/// Step 3c on any guarded usbfs channel: `10:05` as a feature SET_REPORT, then the GET_REPORT that reads its status.
+/// `status` is `None` if the SET_REPORT failed.
+pub fn exit_via<T: ControlIo>(io: &UsbGuarded<T>) -> ExitResult {
+    if let Err(e) = usbfs::send_exit(io) {
+        return ExitResult {
+            sent: Err(e.into()),
+            status: None,
+        };
+    }
+    let mut last = Err("no reply".to_string());
+    for _ in 0..REPLY_ATTEMPTS {
+        std::thread::sleep(REPLY_STEP);
+        match usbfs::read_status(io) {
+            Ok(r)
+                if matches!(
+                    r.status_for(EXIT),
+                    Status::NewCommand | Status::Busy | Status::Mismatch
+                ) =>
+            {
+                last = Ok(r)
+            }
+            Ok(r) => {
+                last = Ok(r);
+                break;
+            }
+            Err(e) => {
+                last = Err(e.to_string());
+                break;
+            }
+        }
+    }
+    ExitResult {
+        sent: Ok(()),
+        status: Some(last),
     }
 }
 
-/// `.../usb1/1-3/1-3:1.2/0003:1532:110E.0004` -> `.../1-3/bcdDevice`.
-fn bcd_device(sysfs: &Path) -> Option<u16> {
-    let canon = fs::canonicalize(sysfs).ok()?;
-    let usb = canon.parent()?.parent()?;
-    u16::from_str_radix(fs::read_to_string(usb.join("bcdDevice")).ok()?.trim(), 16).ok()
+/// Where the probe looks: the kernel's USB device list and the usbfs nodes. The tests point both at a fixture tree.
+#[derive(Debug, Clone)]
+pub struct Roots {
+    pub sysfs: PathBuf,
+    pub dev: PathBuf,
 }
 
-fn key(e: &Enumeration) -> (String, u16, u16) {
-    (e.node.clone(), e.vid, e.pid)
+impl Roots {
+    pub fn system() -> Roots {
+        Roots {
+            sysfs: PathBuf::from(sysfs::DEFAULT_ROOT),
+            dev: PathBuf::from("/dev/bus/usb"),
+        }
+    }
 }
 
-/// The real device: the dongle's control node, and later the node its bootloader appears on.
+/// The real device: the dongle's control node, and later the usbfs node its bootloader appears on.
 pub struct RealProbe {
     normal: Guarded<Hidraw>,
     node: HidrawNode,
-    before: HashSet<(String, u16, u16)>,
-    bootloader_nodes: Vec<Enumeration>,
-    bootloader: Option<(String, Guarded<Hidraw>)>,
+    roots: Roots,
+    usb: Option<UsbGuarded<Usbfs>>,
 }
 
 /// The nodes of `1532:009F` that exist now.
@@ -159,16 +178,41 @@ pub fn control_node(nodes: &[HidrawNode]) -> Option<&HidrawNode> {
         .or_else(|| nodes.iter().find(|n| n.has_feature_reports))
 }
 
+/// Poll `done` every [`POLL`] until it is true or `timeout` has passed; the time it took if it became true.
+fn poll_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<Duration> {
+    let start = Instant::now();
+    loop {
+        if done() {
+            return Some(start.elapsed());
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 impl RealProbe {
     /// Open the control node of the dongle for read/write. Sends nothing.
-    pub fn open(node: &HidrawNode) -> io::Result<RealProbe> {
+    pub fn open(node: &HidrawNode, roots: Roots) -> io::Result<RealProbe> {
         Ok(RealProbe {
             normal: Guarded(Hidraw::open(&node.dev)?),
             node: node.clone(),
-            before: HashSet::new(),
-            bootloader_nodes: Vec::new(),
-            bootloader: None,
+            roots,
+            usb: None,
         })
+    }
+
+    fn present(&self, id: (u16, u16)) -> bool {
+        sysfs::present(&self.roots.sysfs, id)
+    }
+}
+
+fn open_failure(node: &Path, e: &io::Error) -> OpenFailure {
+    OpenFailure {
+        node: node.display().to_string(),
+        errno: e.raw_os_error(),
+        message: e.to_string(),
     }
 }
 
@@ -192,110 +236,101 @@ impl ProbeIo for RealProbe {
         read_version_via(&self.normal)
     }
 
-    fn enter_bootloader(&mut self) -> Result<Answer, String> {
-        // what exists now, so that step 3 can tell the bootloader's interfaces from the ones that were already there
-        self.before = enumerate_razer().iter().map(key).collect();
+    fn enter_bootloader(&mut self) -> Result<Answer, SendError> {
         enter_via(&self.normal)
     }
 
+    fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration> {
+        poll_until(timeout, || !self.present(NORMAL_ID))
+    }
+
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait {
-        let start = Instant::now();
-        let mut found: Vec<Enumeration> = Vec::new();
-        let mut appeared_after = None;
-        let mut settled_at: Option<Instant> = None;
-        while start.elapsed() < timeout {
-            for e in enumerate_razer() {
-                let is_new = !self.before.contains(&key(&e));
-                let is_boot = (e.vid, e.pid) == BOOTLOADER_ID;
-                if (is_new || is_boot) && !found.iter().any(|f| key(f) == key(&e)) {
-                    if is_boot && appeared_after.is_none() {
-                        appeared_after = Some(start.elapsed());
-                        settled_at = Some(Instant::now() + SETTLE);
-                    }
-                    found.push(e);
-                }
-            }
-            if settled_at.is_some_and(|t| Instant::now() >= t) {
-                break;
-            }
-            std::thread::sleep(POLL);
+        let found = poll_until(timeout, || self.present(BOOTLOADER_ID));
+        if found.is_none() {
+            return BootloaderWait::default();
         }
-        self.bootloader_nodes = found
-            .iter()
-            .filter(|e| (e.vid, e.pid) == BOOTLOADER_ID)
-            .cloned()
-            .collect();
+        let appeared_at = SystemTime::now();
+        // the interface directory and the driver link come a moment after the device itself
+        std::thread::sleep(SETTLE);
         BootloaderWait {
-            seen: found,
-            appeared_after,
+            device: sysfs::find(&self.roots.sysfs, BOOTLOADER_ID, SystemTime::now()),
+            appeared_at: Some(appeared_at),
         }
     }
 
-    fn open_bootloader(&mut self) -> Result<String, OpenFailure> {
-        // the interface with a feature report, lowest number first; otherwise the first one listed
-        let pick = self
-            .bootloader_nodes
-            .iter()
-            .filter(|e| hidraw::descriptor_has_feature(&e.descriptor))
-            .min_by_key(|e| e.interface.unwrap_or(u8::MAX))
-            .or_else(|| self.bootloader_nodes.first())
-            .cloned()
-            .ok_or_else(|| OpenFailure {
-                node: "(none)".into(),
+    fn open_usbfs(&mut self, device: &UsbDevice) -> Result<String, OpenFailure> {
+        let (Some(bus), Some(dev)) = (device.bus, device.dev) else {
+            return Err(OpenFailure {
+                node: "(unknown)".into(),
                 errno: None,
-                message: "no 1532:110E node was recorded".into(),
-            })?;
-        match Hidraw::open(Path::new(&pick.node)) {
-            Ok(h) => {
-                let name = format!(
-                    "{} (interface {})",
-                    pick.node,
-                    pick.interface.map_or("?".into(), |i| i.to_string())
-                );
-                self.bootloader = Some((pick.node, Guarded(h)));
-                Ok(name)
+                message: format!("{} has no busnum/devnum in sysfs", device.name),
+            });
+        };
+        let path = sysfs::usbfs_path(&self.roots.dev, bus, dev);
+        let start = Instant::now();
+        let usb = loop {
+            match Usbfs::open(&path) {
+                Ok(u) => break u,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                    ) && start.elapsed() < OPEN_RETRY =>
+                {
+                    std::thread::sleep(POLL)
+                }
+                Err(e) => return Err(open_failure(&path, &e)),
             }
-            Err(e) => Err(OpenFailure {
-                node: pick.node,
-                errno: e.raw_os_error(),
-                message: e.to_string(),
-            }),
+        };
+        usb.claim_interface(usbfs::INTERFACE)
+            .map_err(|e| open_failure(&path, &e))?;
+        self.usb = Some(usb);
+        Ok(path.display().to_string())
+    }
+
+    fn read_report_descriptor(&mut self) -> Result<Vec<u8>, SendError> {
+        let usb = self.usb.as_ref().ok_or(SendError {
+            errno: None,
+            message: "the usbfs node was never opened".into(),
+        })?;
+        usbfs::read_report_descriptor(usb).map_err(SendError::from)
+    }
+
+    fn exit_bootloader(&mut self) -> ExitResult {
+        match &self.usb {
+            Some(usb) => exit_via(usb),
+            None => ExitResult {
+                sent: Err(SendError {
+                    errno: None,
+                    message: "the usbfs node was never opened".into(),
+                }),
+                status: None,
+            },
         }
     }
 
-    fn exit_bootloader(&mut self) -> Result<Answer, String> {
-        let (node, io) = self
-            .bootloader
-            .as_ref()
-            .ok_or("the bootloader node was never opened")?;
-        exit_via(io).map_err(|e| format!("{node}: {e}"))
+    fn wait_for_bootloader_gone(&mut self, timeout: Duration) -> Option<Duration> {
+        poll_until(timeout, || !self.present(BOOTLOADER_ID))
     }
 
     fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait {
-        let start = Instant::now();
-        loop {
-            let now = enumerate_razer();
-            let back = now.iter().any(|e| (e.vid, e.pid) == NORMAL_ID)
-                && !now.iter().any(|e| (e.vid, e.pid) == BOOTLOADER_ID);
-            if back || start.elapsed() >= timeout {
-                return ReturnWait {
-                    after: back.then(|| start.elapsed()),
-                    nodes: now
-                        .iter()
-                        .map(|e| {
-                            format!(
-                                "{:04x}:{:04x} {} interface {} bcdDevice {}",
-                                e.vid,
-                                e.pid,
-                                e.node,
-                                e.interface.map_or("?".into(), |i| i.to_string()),
-                                e.bcd_device.map_or("?".into(), |b| format!("{b:04x}"))
-                            )
-                        })
-                        .collect(),
-                };
+        let mut back_at = None;
+        poll_until(timeout, || {
+            let now = sysfs::scan(&self.roots.sysfs, SystemTime::now());
+            let back = now.iter().any(|d| (d.vid, d.pid) == NORMAL_ID)
+                && !now.iter().any(|d| (d.vid, d.pid) == BOOTLOADER_ID);
+            if back {
+                back_at = Some(SystemTime::now());
             }
-            std::thread::sleep(POLL);
+            back
+        });
+        ReturnWait {
+            back_at,
+            nodes: sysfs::scan(&self.roots.sysfs, SystemTime::now())
+                .iter()
+                .filter(|d| d.vid == hidraw::RAZER_VID)
+                .map(UsbDevice::summary)
+                .collect(),
         }
     }
 }
