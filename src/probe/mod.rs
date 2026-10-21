@@ -46,10 +46,10 @@ pub const BOOTLOADER_ID: (u16, u16) = (0x1532, 0x110E);
 pub const BOOTLOADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long steps 2 and 3c wait for a device to leave the bus after a send that returned an error.
 pub const LEAVE_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long step 4 waits for `1532:009F` to come back, counted from the exit send. The bootloader left by itself 99.8 s
-/// after it entered on the board's first run, so this is long enough to see that happen if `10:05` does nothing. It is
-/// the only long wait, and it starts after the exit was sent.
-pub const RETURN_TIMEOUT: Duration = Duration::from_secs(120);
+/// How long step 4 waits for `1532:009F` to come back, counted from the exit send. If `10:05` works it is back within
+/// seconds. Nothing shows that the bootloader ever leaves by itself (the return on the board's first run was a replug),
+/// so a timeout here means the dongle has to be replugged.
+pub const RETURN_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What to tell the user when the usbfs node of the bootloader cannot be opened.
 pub const UDEV_HINT: &str = "Reinstall the udev rule, which now has a line for the bootloader (1532:110E): sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger";
@@ -371,7 +371,7 @@ pub fn run<I: ProbeIo>(
             )
         ),
         None => format!(
-            "TIMED OUT: no 1532:009F within {} s of 10:05, so it did NOT come back by itself",
+            "TIMED OUT: no 1532:009F within {} s of 10:05, so it must be replugged",
             RETURN_TIMEOUT.as_secs()
         ),
     };
@@ -438,7 +438,7 @@ pub fn plan_text() -> String {
          \x20 4. wait up to {} s for 1532:009F to come back, and write down how long it took, from 10:05 and from entry\n\
          It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command). While it runs the\n\
          mouse stops working. Expected worst case: the dongle stays in bootloader mode until you unplug it and plug it back\n\
-         in, or for about 100 s if the bootloader leaves by itself (seen once; not confirmed). If the node cannot be opened,\n\
+         in. If the node cannot be opened,\n\
          or a kernel driver owns interface 0, nothing is sent to the bootloader.\n\
          Nothing was sent. To run it, add --yes-enter-bootloader.",
         BOOTLOADER_TIMEOUT.as_secs(),

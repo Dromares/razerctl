@@ -1112,8 +1112,12 @@ fn step_four_timeout_is_written_and_says_replug() {
     assert!(!log.outcome.as_ref().unwrap().is_success());
     let text = log.render();
     assert!(text.contains("STEP 4 TIMED OUT"), "{text}");
-    assert!(text.contains("did NOT come back by itself"), "{text}");
-    assert!(text.contains("did not come back within 120 s"), "{text}");
+    assert!(text.contains("so it must be replugged"), "{text}");
+    assert!(
+        !text.contains("by itself"),
+        "never imply it comes back by itself: {text}"
+    );
+    assert!(text.contains("did not come back within 30 s"), "{text}");
     assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
     // everything learnt before the timeout is still in the file
     assert!(text.contains("device 8-3  bus 8"), "{text}");
@@ -1122,14 +1126,14 @@ fn step_four_timeout_is_written_and_says_replug() {
 
 #[test]
 fn the_return_is_timed_from_the_exit_and_from_the_entry() {
-    // 009F back 88 s after the end of the step-4 call: the clock says 4 s of steps before the wait began, so the numbers
-    // tell an exit that worked (seconds) from the bootloader's own timeout (about 100 s)
+    // 009F back 20 s after the end of the step-4 call: the numbers from the 10:05 send, from the enter send and from the
+    // bootloader appearing tell whether 10:05 is what brought it back
     let mut sim = Sim::happy();
-    sim.back = Some(88);
+    sim.back = Some(20);
     let (log, _) = run(&mut sim);
     let text = log.render();
     assert!(
-        text.contains("came back 90.00 s after the 10:05 send, 94.00 s after the enter-bootloader send (step 2), 92.00 s after 1532:110E appeared"),
+        text.contains("came back 22.00 s after the 10:05 send, 26.00 s after the enter-bootloader send (step 2), 24.00 s after 1532:110E appeared"),
         "{text}"
     );
 }
@@ -1182,12 +1186,11 @@ fn timestamps_are_utc_iso() {
 fn ids_and_timeouts_are_the_ones_the_plan_names() {
     assert_eq!(NORMAL_ID, (0x1532, 0x009F));
     assert_eq!(BOOTLOADER_ID, (0x1532, 0x110E));
-    // steps 2 and 3 are short: the bootloader enumerated about a second after the enter frame and left by itself 99.8 s
-    // after entering, so the exit has to be sent long before that
+    // steps 2 and 3 are short: the bootloader enumerated about a second after the enter frame
     assert_eq!(probe::BOOTLOADER_TIMEOUT, Duration::from_secs(10));
     assert_eq!(probe::LEAVE_TIMEOUT, Duration::from_secs(3));
-    // the one long wait starts after the exit send, and is long enough to see a self-timeout at ~100 s
-    assert_eq!(probe::RETURN_TIMEOUT, Duration::from_secs(120));
+    // the wait for the return starts after the exit send; nothing shows the bootloader leaves by itself, so it is short
+    assert_eq!(probe::RETURN_TIMEOUT, Duration::from_secs(30));
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1809,7 +1812,7 @@ fn without_the_flag_it_prints_the_plan_and_exits_non_zero() {
         "2. send enter-bootloader (00:04, mode 1)",
         "3. wait up to 10 s",
         "3c. send exit (10:05)",
-        "4. wait up to 120 s",
+        "4. wait up to 30 s",
         "never erases or writes firmware",
         "Nothing was sent",
         "--yes-enter-bootloader",

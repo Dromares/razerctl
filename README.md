@@ -236,9 +236,8 @@ bootloader (`00:04`, mode 1). The bootloader enumerates as `1532:110E` and the k
 probe finds it in `/sys/bus/usb/devices` (reading sysfs sends nothing) and writes down the bus and device number,
 `bcdDevice`, product string, any driver bound to interface 0 and the kernel's cached descriptors. It then opens the
 bootloader's `/dev/bus/usb/BBB/DDD` node, reads its HID report descriptor, sends exit (`10:05`) as a HID feature
-SET_REPORT and reads the GET_REPORT that answers it, and waits up to 120 s for `1532:009F` to come back, recording how long
-that took from the `10:05` send and from entry (the bootloader left by itself about 100 s after entering the first time
-it was tried, so the two numbers tell an exit that worked from a self-timeout). An error on the enter send counts as
+SET_REPORT and reads the GET_REPORT that answers it, and waits up to 30 s for `1532:009F` to come back, recording how long
+that took from the `10:05` send and from entry (which tells whether `10:05` is what brought it back). An error on the enter send counts as
 "entered" only if the dongle then leaves the USB bus. Everything goes into a text file (`--out FILE`, default
 `razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
 
@@ -261,8 +260,7 @@ sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --relo
   (`openrazer-daemon`, or the `razermouse` kernel driver bound to the dongle) is using the device, or anything else has its
   hidraw node open. Stop them first.
 * **The mouse does not work while it runs.** The worst case is that the dongle sits in bootloader mode until you unplug it
-  and plug it back in, or for about 100 s if the bootloader times out by itself (seen once; not yet confirmed). If a step
-  times out the file says which one and the command prints that instruction. Whether a replug always recovers it has not
+  and plug it back in. If a step times out the file says which one and the command prints that instruction. Whether a replug always recovers it has not
   been confirmed on Linux, which is part of what the probe is for. If it does not, Razer's own updater on Windows is the
   fallback; that it can talk to a dongle in bootloader mode is inferred from its code, not tested.
 

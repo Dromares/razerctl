@@ -147,7 +147,7 @@ impl Outcome {
     fn headline(&self) -> String {
         match self {
             Outcome::Completed => {
-                "COMPLETED: every step ran and 1532:009F came back without a replug".into()
+                "COMPLETED: every step ran and 1532:009F is listed again (timing below)".into()
             }
             Outcome::ReadVersionFailed(w) => {
                 format!("STOPPED at step 1 (read version): {w}. Nothing was sent after it")
