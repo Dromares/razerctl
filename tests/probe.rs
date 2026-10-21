@@ -1084,7 +1084,7 @@ fn fence_every_write_in_the_real_transport_goes_through_the_guard() {
         [
             "fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {",
             "self.0.send_feature(payload)",
-            "io.send_feature(&frame.to_bytes()).map_err(|e| e.to_string())?;",
+            "io.send_feature(&frame.to_bytes())",
         ]
     );
     // the guard checks the allow-list before it delegates
