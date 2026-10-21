@@ -92,7 +92,7 @@ pub fn crc_frame(region: u8, crc: u16) -> Report {
 }
 
 /// Every frame of the stream for `lines`, the closing CRC frame last.
-pub fn stream_frames<'a>(region: u8, lines: &[&'a str]) -> Result<Vec<Report>, String> {
+pub fn stream_frames(region: u8, lines: &[&str]) -> Result<Vec<Report>, String> {
     let mut v = lines
         .iter()
         .map(|l| record_frame(region, l))

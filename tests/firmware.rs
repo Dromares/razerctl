@@ -646,6 +646,7 @@ fn inspect_refuses_a_flash_record_too_long_for_a_frame() {
 // class 0x0A stream
 
 /// A literal port of the vendor's `Common.CRC16` (byte-swap form), kept apart from the implementation under test.
+#[allow(clippy::manual_rotate)] // spelled out on purpose: this is the vendor's code, not what clippy would write
 fn vendor_crc16(mut crc: u16, data: &[u8]) -> u16 {
     for &b in data {
         crc = (crc >> 8) | (crc << 8);

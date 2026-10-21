@@ -116,7 +116,7 @@ pub fn parse(data: &[u8]) -> Result<HashMap<String, String>, String> {
             p: names_start + np,
         };
         let len = nc.v7("a name")? as usize;
-        if len % 2 != 0 {
+        if !len.is_multiple_of(2) {
             return Err(format!("resource name {i} has an odd UTF-16 byte length"));
         }
         let units: Vec<u16> = nc
