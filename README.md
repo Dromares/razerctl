@@ -215,6 +215,20 @@ razerctl list | info | battery | dpi [X [Y]] | poll [HZ] | raw CLASS ID SIZE [AR
 razerctl --backend hidraw raw 00 81 02      # firmware version, raw
 ```
 
+## Firmware: inspect and dry-run only (flashing is not supported yet)
+
+```
+razerctl firmware inspect ViperMiniSignatureEdition_..._FirmwareUpdater_....exe
+razerctl firmware flash   ViperMiniSignatureEdition_..._FirmwareUpdater_....exe --image Dev1 --dry-run
+```
+
+`inspect` reads Razer's firmware updater `.exe` that you downloaded yourself, finds the ZIP appended to it, and lists each
+firmware image inside: the product id it is for, the version, the address range, the size and its SHA-256, after checking
+every Intel-HEX record checksum. It refuses a damaged or unfamiliar file and says what is wrong. `flash ... --dry-run`
+runs the vendor's flashing sequence against a *simulated* device and prints every frame it would send. Both are offline:
+razerctl opens no device for either, and it does not ship or download Razer's firmware, so the image never leaves your copy
+of the updater. **Flashing a real device is not supported yet**; without `--dry-run` the command refuses.
+
 ## Button remapping (replaces the DriverKit extension)
 
 Synapse's `com.razer.appengine.driver.dext` intercepts button reports (`handleReport` →
