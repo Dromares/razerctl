@@ -215,11 +215,12 @@ razerctl list | info | battery | dpi [X [Y]] | poll [HZ] | raw CLASS ID SIZE [AR
 razerctl --backend hidraw raw 00 81 02      # firmware version, raw
 ```
 
-## Firmware: inspect and dry-run only (flashing is not supported yet)
+## Firmware: inspect, dry-run and bootloader probe (flashing is not supported yet)
 
 ```
 razerctl firmware inspect ViperMiniSignatureEdition_..._FirmwareUpdater_....exe
 razerctl firmware flash   ViperMiniSignatureEdition_..._FirmwareUpdater_....exe --image Dev1 --dry-run
+razerctl firmware probe-bootloader --yes-enter-bootloader
 ```
 
 `inspect` reads Razer's firmware updater `.exe` that you downloaded yourself, finds the ZIP appended to it, and lists each
@@ -228,6 +229,25 @@ every Intel-HEX record checksum. It refuses a damaged or unfamiliar file and say
 runs the vendor's flashing sequence against a *simulated* device and prints every frame it would send. Both are offline:
 razerctl opens no device for either, and it does not ship or download Razer's firmware, so the image never leaves your copy
 of the updater. **Flashing a real device is not supported yet**; without `--dry-run` the command refuses.
+
+`probe-bootloader` is the one firmware command that talks to a device, and it only runs when you ask for it with `--yes-enter-bootloader`.
+It is a measurement for a later update feature: it reads the Viper Mini SE dongle's version (`00:87`), puts it into its
+bootloader (`00:04`, mode 1), waits up to 20 s for it to show up as `1532:110E`, writes down how it enumerated (hidraw
+node, interface, `bcdDevice`, report descriptor, and whether the node opens without root), then sends exit (`10:05`) and
+waits up to 30 s for `1532:009F` to come back. Everything goes into a text file (`--out FILE`, default
+`razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
+
+* **It never erases or writes firmware.** The command can send exactly three frames (`00:87`, `00:04` mode 1 and `10:05`);
+  no erase, program or Flash-stream frame exists in it, and a test fails the build if one is added.
+* Without `--yes-enter-bootloader` it only prints what it would do and exits with an error; nothing is sent.
+* It refuses to start while another razerctl (the remap or battery service, the GUI, another command) or openrazer
+  (`openrazer-daemon`, or the `razermouse` kernel driver bound to the dongle) is using the device, or anything else has its
+  hidraw node open. Stop them first.
+* **The mouse does not work while it runs.** The expected worst case is that the dongle stays in bootloader mode until
+  you unplug it and plug it back in; if a step times out the file says which one and the command prints that
+  instruction. Whether a replug always recovers it has not been confirmed on Linux, which is part of what the probe is for.
+  If it does not, Razer's own updater on Windows is the fallback; that it can talk to a dongle in bootloader mode is
+  inferred from its code, not tested.
 
 ## Button remapping (replaces the DriverKit extension)
 

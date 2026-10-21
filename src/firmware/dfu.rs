@@ -1,8 +1,9 @@
 //! The bootloader flash sequence of the vendor updater for the `Dev` images (`00:87` read version, `00:04` enter mode 1,
 //! `10:01` erase, `10:02` program, `10:83` read back, `10:05` exit), as recovered statically in DAN-1879 and re-checked in
 //! DAN-1885. It is written against the [`Transport`] trait and nothing else: **no implementation of that trait talks to
-//! a device**, and none is allowed to without a new board decision (phase 2 and 3 of DAN-1878). The only implementations
-//! are the simulated one behind `firmware flash --dry-run` and the recording ones in the tests.
+//! a device**, and none is allowed to without a new board decision (phase 3 of DAN-1878). The only implementations are
+//! the simulated one behind `firmware flash --dry-run` and the recording ones in the tests. The phase-2 bootloader probe
+//! is `crate::probe`: it does not use this trait and cannot send an erase or program frame.
 //!
 //! Quirks the vendor tool has and this code keeps on purpose (pinned by the golden tests): transaction id 0 (not razerctl's
 //! usual 0x1f); the size byte of a Program frame is fixed at 8 whatever it carries; addresses are big-endian; every block
