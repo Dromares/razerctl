@@ -44,20 +44,76 @@ pub const TID: u8 = 0;
 
 /// The dongle in normal mode (Viper Mini SE).
 pub const NORMAL_ID: (u16, u16) = (0x1532, 0x009F);
+/// The mouse on its USB cable (`PID2`, DAN-1932): the same probe with the other starting identity (DAN-1944).
+pub const CABLE_ID: (u16, u16) = (0x1532, 0x009E);
 /// The same dongle in its bootloader.
 pub const BOOTLOADER_ID: (u16, u16) = (0x1532, 0x110E);
-/// The PIDs the `10:80` reply may name for `10:05` to follow: the two bootloader PIDs in Razer's updater resources
-/// (`BCDPID_BL1`, `BCDPID_BL2`; DAN-1932). Its `OpenDevice` refuses the handle for any other.
-pub const QUERY_PIDS: [u16; 2] = [0x009F, 0x009E];
+/// Which of the two normal-mode identities the run started from. The run only ever looks for, and only ever accepts a
+/// `10:80` reply naming, this one (DAN-1944).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Start {
+    /// `1532:009F`: the mouse through its dongle.
+    Dongle,
+    /// `1532:009E`: the mouse on its USB cable.
+    Cable,
+}
+
+impl Start {
+    pub fn of(id: (u16, u16)) -> Option<Start> {
+        match id {
+            NORMAL_ID => Some(Start::Dongle),
+            CABLE_ID => Some(Start::Cable),
+            _ => None,
+        }
+    }
+    pub fn id(self) -> (u16, u16) {
+        match self {
+            Start::Dongle => NORMAL_ID,
+            Start::Cable => CABLE_ID,
+        }
+    }
+    pub fn pid(self) -> u16 {
+        self.id().1
+    }
+    /// `1532:009f`, lower case, as the report writes ids.
+    pub fn id_text(self) -> String {
+        format!("{:04x}:{:04x}", self.id().0, self.id().1)
+    }
+    /// What the run calls the thing the user plugged in.
+    pub fn what(self) -> &'static str {
+        match self {
+            Start::Dongle => "dongle",
+            Start::Cable => "mouse",
+        }
+    }
+    /// The line for the report head: which identity the run used.
+    pub fn label(self) -> String {
+        match self {
+            Start::Dongle => format!("dongle {}", self.id_text()),
+            Start::Cable => format!("cable {}", self.id_text()),
+        }
+    }
+    /// What to tell the user when the device may still be in its bootloader.
+    pub fn replug(self) -> String {
+        let how = match self {
+            Start::Dongle => "Unplug the dongle and plug it back in",
+            Start::Cable => "Unplug the USB cable and plug it back in",
+        };
+        format!(
+            "{how}. The firmware was not erased or written, so the mouse should come back as {}.",
+            self.id_text()
+        )
+    }
+}
 
 /// How long step 3 waits for `1532:110E` before it gives up and tells the user to replug. The board's kernel log has it
 /// enumerated about a second after the enter frame.
 pub const BOOTLOADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long steps 2 and 3d wait for a device to leave the bus after a send that returned an error.
 pub const LEAVE_TIMEOUT: Duration = Duration::from_secs(3);
-/// How long step 4 waits for `1532:009F` to come back, counted from the exit send. If `10:05` works it is back within
+/// How long step 4 waits for the starting identity to come back, counted from the exit send. If `10:05` works it is back within
 /// seconds. Nothing shows that the bootloader ever leaves by itself (the return on the board's first run was a replug),
-/// so a timeout here means the dongle has to be replugged.
+/// so a timeout here means the device has to be replugged.
 pub const RETURN_TIMEOUT: Duration = Duration::from_secs(30);
 /// SET/GET pairs of the `10:80` query: a status other than 0, 1 or 2 (or five GETs without an answer) re-sends the SET.
 pub const QUERY_PAIRS: usize = 3;
@@ -68,7 +124,6 @@ pub const EXIT_PAIRS: usize = 3;
 
 /// What to tell the user when the usbfs node of the bootloader cannot be opened.
 pub const UDEV_HINT: &str = "Reinstall the udev rule, which now has a line for the bootloader (1532:110E): sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger";
-pub const REPLUG: &str = "Unplug the dongle and plug it back in. The firmware was not erased or written, so the mouse should come back as 1532:009F.";
 
 /// `00:87`: read the version. Args 0..3 carry major, minor, patch (DAN-1879; not confirmed on a device).
 pub fn read_version_frame() -> Report {
@@ -127,9 +182,10 @@ impl Decoded {
     }
 }
 
-/// What the gate decides from the `10:80` exchange: `Ok(pid)` = status 2, txn 0, class/id `10:80` and a PID in
-/// [`QUERY_PIDS`] in the **last** reply read, so `10:05` may follow; `Err(why)` = it may not, with the reason for the file.
-pub fn gate(query: &Exchange) -> Result<u16, String> {
+/// What the gate decides from the `10:80` exchange: `Ok(pid)` = status 2, txn 0, class/id `10:80` and a PID **equal to the
+/// starting PID** in the **last** reply read, so `10:05` may follow; `Err(why)` = it may not, with the reason for the file.
+/// (Probe v3 accepted either bootloader PID; v4 wants the one it started from, DAN-1944.)
+pub fn gate(query: &Exchange, start: Start) -> Result<u16, String> {
     if let Some(e) = query.set_error() {
         return Err(format!("the 10:80 SET_REPORT failed: {e}"));
     }
@@ -162,10 +218,11 @@ pub fn gate(query: &Exchange) -> Result<u16, String> {
             d.txn, d.class, d.id
         ));
     }
-    if !QUERY_PIDS.contains(&d.pid) {
+    if d.pid != start.pid() {
         return Err(format!(
-            "the 10:80 reply names PID {:04x}, not 009f or 009e (Razer's updater refuses the handle then)",
-            d.pid
+            "the 10:80 reply names PID {:04x}, not {:04x} (the PID this run started from; nothing more is sent)",
+            d.pid,
+            start.pid()
         ));
     }
     Ok(d.pid)
@@ -178,6 +235,9 @@ pub type Answer = Result<Report, String>;
 /// frame or a control request, so an implementation cannot be asked to send anything but the probe's own.
 pub trait ProbeIo {
     fn now(&self) -> SystemTime;
+    /// Which identity the run started from (`1532:009F` dongle or `1532:009E` cable). Fixed for the whole run: the leave-the-bus
+    /// wait, the gate and the return wait all use it.
+    fn start(&self) -> Start;
     /// Which node and interface the normal-mode commands go through.
     fn describe_device(&self) -> String;
     /// Step 1: send `00:87` and return the reply (a failed exchange is an error).
@@ -185,11 +245,11 @@ pub trait ProbeIo {
     /// Step 2: send `00:04` mode 1. `Err` = the send returned an error (an `EPROTO` here can mean the device left the bus
     /// mid-transfer because it obeyed); `Ok` carries what the follow-up read gave.
     fn enter_bootloader(&mut self) -> Result<Answer, SendError>;
-    /// Step 2, after a send that returned an error: wait up to `timeout` for `1532:009F` to leave the bus. `Some` = it
+    /// Step 2, after a send that returned an error: wait up to `timeout` for the starting identity ([`ProbeIo::start`]) to leave the bus. `Some` = it
     /// left, that long after the call.
     fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration>;
     /// Step 3: watch `/sys/bus/usb/devices` for `1532:110E` for at most `timeout`, then let it settle for at least 1000 ms
-    /// (the wait Razer's updater makes before it opens the device).
+    /// (the wait Razer's updater makes before it opens the device). On a timeout `nodes` lists every `1532` device then present.
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait;
     /// Step 3b: open the bootloader's usbfs node and claim interface 0. `Ok` names the node; `Err` says why not (the
     /// errno is recorded). Sends nothing.
@@ -202,7 +262,7 @@ pub trait ProbeIo {
     fn exit_bootloader(&mut self) -> Exchange;
     /// Step 3d, after an exit request that returned an error: wait up to `timeout` for `1532:110E` to leave the bus.
     fn wait_for_bootloader_gone(&mut self, timeout: Duration) -> Option<Duration>;
-    /// Step 4: watch for `1532:009F` to come back (and no `110E` to be left) for at most `timeout`.
+    /// Step 4: watch for the starting identity to come back (and no `110E` to be left) for at most `timeout`.
     fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait;
 }
 
@@ -232,7 +292,8 @@ pub fn run<I: ProbeIo>(
     build: &Build,
     checkpoint: &mut dyn FnMut(&ProbeLog),
 ) -> ProbeLog {
-    let mut log = ProbeLog::new(build.clone(), io.now(), io.describe_device());
+    let start = io.start();
+    let mut log = ProbeLog::new(build.clone(), io.now(), io.describe_device(), start);
     checkpoint(&log);
 
     // 1. read the version
@@ -271,7 +332,7 @@ pub fn run<I: ProbeIo>(
     log.push(Step::new("1", "read version (00:87)", at, io.now(), detail));
     checkpoint(&log);
 
-    // 2. enter the bootloader. A send that returns an error counts as "entered" only if 1532:009F then leaves the bus:
+    // 2. enter the bootloader. A send that returns an error counts as "entered" only if the starting identity then leaves the bus:
     //    on the board's first run the kernel log showed the disconnect landing in the middle of the transfer, and that
     //    cut-off transfer was the error (EPROTO).
     let at = io.now();
@@ -279,8 +340,10 @@ pub fn run<I: ProbeIo>(
     let detail = match io.enter_bootloader() {
         Err(e) => match io.wait_for_dongle_gone(LEAVE_TIMEOUT) {
             Some(after) => format!(
-                "the send returned {e}; 1532:009F left the bus {} later, so the dongle DID enter the bootloader (the disconnect cut the transfer short)",
-                report::secs(after)
+                "the send returned {e}; {sid} left the bus {} later, so the {what} DID enter the bootloader (the disconnect cut the transfer short)",
+                report::secs(after),
+                sid = start.id_text(),
+                what = start.what()
             ),
             None => {
                 log.push(Step::new(
@@ -289,7 +352,8 @@ pub fn run<I: ProbeIo>(
                     at,
                     io.now(),
                     format!(
-                        "FAILED: the send returned {e}, and 1532:009F did not leave the bus within {} s, so it did not enter",
+                        "FAILED: the send returned {e}, and {} did not leave the bus within {} s, so it did not enter",
+                        start.id_text(),
                         LEAVE_TIMEOUT.as_secs()
                     ),
                 ));
@@ -361,6 +425,7 @@ pub fn run<I: ProbeIo>(
     log.bootloader = wait.device.clone();
     log.appeared_at = wait.appeared_at;
     log.settled_at = wait.settled_at;
+    log.timeout_nodes = wait.nodes;
     checkpoint(&log);
     let Some(device) = wait.device else {
         return finish(log, Outcome::BootloaderNeverAppeared, checkpoint);
@@ -420,7 +485,7 @@ pub fn run<I: ProbeIo>(
     checkpoint(&log);
 
     // 3c. the vendor's own first question, `10:80`, on this handle. Only a reply with status 2, txn 0, class/id 10:80 and
-    //     a PID of 009F or 009E opens the gate; any other reply (or none) ends the run here with nothing further sent.
+    //     a PID equal to the starting PID opens the gate; any other reply (or none) ends the run here with nothing further sent.
     let at = io.now();
     log.query_at = Some(at);
     let query = io.query_bootloader();
@@ -429,7 +494,7 @@ pub fn run<I: ProbeIo>(
         "{} SET_REPORT(s) of up to {QUERY_PAIRS}, {gets} GET_REPORT(s)",
         query.sets()
     );
-    let verdict = gate(&query);
+    let verdict = gate(&query, start);
     log.query = Some(query);
     log.gate = Some(verdict.clone());
     let pid = match verdict {
@@ -451,7 +516,7 @@ pub fn run<I: ProbeIo>(
         at,
         io.now(),
         format!(
-            "{counts}; the reply is status 2, txn 0, class/id 10:80, PID {pid:04x}: gate open, 10:05 follows at once on the same handle"
+            "{counts}; the reply is status 2, txn 0, class/id 10:80, PID {pid:04x} (the starting PID): gate open, 10:05 follows at once on the same handle"
         ),
     ));
 
@@ -516,23 +581,31 @@ pub fn run<I: ProbeIo>(
     ));
     checkpoint(&log);
 
-    // 4. wait for 1532:009F, counted from the exit send
+    // 4. wait for the starting identity, counted from the exit send
     let at = io.now();
     let back = io.wait_for_return(RETURN_TIMEOUT);
     let detail = match back.back_at {
         Some(t) => format!(
-            "1532:009F listed again {} after the 10:05 send",
+            "{} listed again {} after the 10:05 send",
+            start.id_text(),
             report::secs(
                 t.duration_since(log.exit_sent_at.unwrap_or(at))
                     .unwrap_or_default()
             )
         ),
         None => format!(
-            "TIMED OUT: no 1532:009F within {} s of 10:05, so it must be replugged",
+            "TIMED OUT: no {} within {} s of 10:05, so it must be replugged",
+            start.id_text(),
             RETURN_TIMEOUT.as_secs()
         ),
     };
-    log.push(Step::new("4", "wait for 1532:009F", at, io.now(), detail));
+    log.push(Step::new(
+        "4",
+        &format!("wait for {}", start.id_text()),
+        at,
+        io.now(),
+        detail,
+    ));
     log.returned_at = back.back_at;
     log.after_nodes = back.nodes;
     let outcome = if back.back_at.is_some() {
@@ -585,21 +658,21 @@ pub fn refusals(t: &Traffic) -> Vec<String> {
 /// The text printed when `--yes-enter-bootloader` is missing: what would happen, and what could go wrong.
 pub fn plan_text() -> String {
     format!(
-        "razerctl firmware probe-bootloader would, on the Razer dongle 1532:009F:\n\
+        "razerctl firmware probe-bootloader would, on the Razer dongle 1532:009F or on the mouse on its USB cable 1532:009E (exactly one of them must be connected):\n\
          \x20 1. read its version (00:87)\n\
-         \x20 2. send enter-bootloader (00:04, mode 1); an error on that send counts as \"entered\" only if the dongle then leaves the bus\n\
-         \x20 3. wait up to {} s for the dongle to be listed as 1532:110E in /sys/bus/usb/devices, and write down what the kernel\n\
+         \x20 2. send enter-bootloader (00:04, mode 1); an error on that send counts as \"entered\" only if the device then leaves the bus\n\
+         \x20 3. wait up to {} s for the device to be listed as 1532:110E in /sys/bus/usb/devices, and write down what the kernel\n\
          \x20    says about it (bus and device number, bcdDevice, product, driver on interface 0, cached descriptors)\n\
          \x20 3b. after letting it settle for at least {} ms, open its usbfs node (needs the udev rule), claim interface 0 and read its\n\
          \x20    HID report descriptor\n\
          \x20 3c. send the query Razer's updater sends first (10:80) as a HID feature SET_REPORT and read its GET_REPORT (up to 5\n\
          \x20    reads, up to 3 sends); it asks the bootloader for its PID and changes nothing\n\
-         \x20 3d. only if the reply has status 2 and PID 009F or 009E: send exit (10:05) straight away on the same handle (up to 3\n\
+         \x20 3d. only if the reply has status 2 and the PID of the identity it started from (009F for the dongle, 009E for the cable): send exit (10:05) straight away on the same handle (up to 3\n\
          \x20    sends); with any other reply nothing more is sent and you are told to replug\n\
-         \x20 4. wait up to {} s for 1532:009F to come back, and write down how long it took, from 10:05 and from entry\n\
+         \x20 4. wait up to {} s for the identity it started from to come back, and write down how long it took, from 10:05 and from entry\n\
          It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command; the only frames it sends are\n\
          00:87, 00:04, 10:80 and 10:05). While it runs the\n\
-         mouse stops working. Expected worst case: the dongle stays in bootloader mode until you unplug it and plug it back\n\
+         mouse stops working. Expected worst case: the device stays in bootloader mode until you unplug it (the dongle, or the USB cable) and plug it back\n\
          in. If the node cannot be opened,\n\
          or a kernel driver owns interface 0, nothing is sent to the bootloader.\n\
          Nothing was sent. To run it, add --yes-enter-bootloader.",

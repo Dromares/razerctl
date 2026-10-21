@@ -20,7 +20,7 @@ use super::sysfs::{self, UsbDevice};
 use super::usbfs::{self, ControlIo, UsbGuarded, Usbfs};
 use super::{
     enter_frame, permitted, read_version_frame, Answer, Decoded, ProbeIo, Traffic, BOOTLOADER_ID,
-    EXIT_PAIRS, NORMAL_ID, QUERY, QUERY_GETS, QUERY_PAIRS,
+    EXIT_PAIRS, QUERY, QUERY_GETS, QUERY_PAIRS, Start,
 };
 use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{Report, Status, REPORT_LEN};
@@ -225,14 +225,27 @@ pub struct RealProbe {
     node: HidrawNode,
     roots: Roots,
     usb: Option<UsbGuarded<Usbfs>>,
+    start: Start,
 }
 
-/// The nodes of `1532:009F` that exist now.
-pub fn dongle_nodes() -> io::Result<Vec<HidrawNode>> {
+/// The nodes of `1532:009F` and `1532:009E` that exist now.
+pub fn probe_nodes() -> io::Result<Vec<HidrawNode>> {
     Ok(hidraw::enumerate()?
         .into_iter()
-        .filter(|n| (n.vid, n.pid) == NORMAL_ID)
+        .filter(|n| Start::of((n.vid, n.pid)).is_some())
         .collect())
+}
+
+/// Which identity the run starts from: exactly one of the dongle (`009F`) and the cable (`009E`) must be present. Both, or
+/// neither, is a refusal that says which were found; nothing is sent then.
+pub fn select_start(nodes: &[HidrawNode]) -> Result<Start, String> {
+    let has = |s: Start| nodes.iter().any(|n| (n.vid, n.pid) == s.id());
+    match (has(Start::Dongle), has(Start::Cable)) {
+        (true, false) => Ok(Start::Dongle),
+        (false, true) => Ok(Start::Cable),
+        (true, true) => Err("refusing: both the dongle 1532:009F and the mouse on its USB cable 1532:009E are connected (found 1532:009F and 1532:009E); unplug one of them so the probe knows which to use. Nothing was sent".into()),
+        (false, false) => Err("refusing: neither the Razer dongle 1532:009F nor the mouse on its USB cable 1532:009E is connected (found neither); nothing was sent".into()),
+    }
 }
 
 /// The node normal-mode commands go through: interface 0 if it has a feature report, else the first that has one.
@@ -260,16 +273,32 @@ fn poll_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<Durat
 impl RealProbe {
     /// Open the control node of the dongle for read/write. Sends nothing.
     pub fn open(node: &HidrawNode, roots: Roots) -> io::Result<RealProbe> {
+        let start = Start::of((node.vid, node.pid)).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("{:04x}:{:04x} is neither 1532:009F nor 1532:009E", node.vid, node.pid),
+            )
+        })?;
         Ok(RealProbe {
             normal: Guarded(Hidraw::open(&node.dev)?),
             node: node.clone(),
             roots,
             usb: None,
+            start,
         })
     }
 
     fn present(&self, id: (u16, u16)) -> bool {
         sysfs::present(&self.roots.sysfs, id)
+    }
+
+    /// One line per Razer USB device the kernel lists now.
+    fn razer_listing(&self) -> Vec<String> {
+        sysfs::scan(&self.roots.sysfs, SystemTime::now())
+            .iter()
+            .filter(|d| d.vid == hidraw::RAZER_VID)
+            .map(UsbDevice::summary)
+            .collect()
     }
 }
 
@@ -300,6 +329,10 @@ impl ProbeIo for RealProbe {
         SystemTime::now()
     }
 
+    fn start(&self) -> Start {
+        self.start
+    }
+
     fn describe_device(&self) -> String {
         format!(
             "{:04x}:{:04x} {} interface {} ({})",
@@ -320,13 +353,16 @@ impl ProbeIo for RealProbe {
     }
 
     fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration> {
-        poll_until(timeout, || !self.present(NORMAL_ID))
+        poll_until(timeout, || !self.present(self.start.id()))
     }
 
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait {
         let found = poll_until(timeout, || self.present(BOOTLOADER_ID));
         if found.is_none() {
-            return BootloaderWait::default();
+            return BootloaderWait {
+                nodes: self.razer_listing(),
+                ..BootloaderWait::default()
+            };
         }
         let appeared_at = SystemTime::now();
         // the interface directory and the driver link come a moment after the device itself, and the vendor waits 1000 ms
@@ -336,6 +372,7 @@ impl ProbeIo for RealProbe {
             device: sysfs::find(&self.roots.sysfs, BOOTLOADER_ID, settled_at),
             appeared_at: Some(appeared_at),
             settled_at: Some(settled_at),
+            nodes: Vec::new(),
         }
     }
 
@@ -399,7 +436,7 @@ impl ProbeIo for RealProbe {
         let mut back_at = None;
         poll_until(timeout, || {
             let now = sysfs::scan(&self.roots.sysfs, SystemTime::now());
-            let back = now.iter().any(|d| (d.vid, d.pid) == NORMAL_ID)
+            let back = now.iter().any(|d| (d.vid, d.pid) == self.start.id())
                 && !now.iter().any(|d| (d.vid, d.pid) == BOOTLOADER_ID);
             if back {
                 back_at = Some(SystemTime::now());
@@ -408,11 +445,7 @@ impl ProbeIo for RealProbe {
         });
         ReturnWait {
             back_at,
-            nodes: sysfs::scan(&self.roots.sysfs, SystemTime::now())
-                .iter()
-                .filter(|d| d.vid == hidraw::RAZER_VID)
-                .map(UsbDevice::summary)
-                .collect(),
+            nodes: self.razer_listing(),
         }
     }
 }

@@ -5,7 +5,7 @@ use super::sysfs::{Interface0, UsbDevice};
 use super::usbfs::Setup;
 use super::{
     exit_frame, query_frame, Build, Decoded, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
-    QUERY_PAIRS, REPLUG, RETURN_TIMEOUT, UDEV_HINT,
+    QUERY_PAIRS, RETURN_TIMEOUT, Start, UDEV_HINT,
 };
 use crate::protocol::REPORT_LEN;
 use std::fmt::Write as _;
@@ -50,11 +50,14 @@ pub struct BootloaderWait {
     pub appeared_at: Option<SystemTime>,
     /// When the settle wait after that ended: the earliest moment the probe may open usbfs.
     pub settled_at: Option<SystemTime>,
+    /// When it never appeared: one line per `1532` USB device listed at the timeout (VID:PID, port, bcdDevice, product), so
+    /// a bootloader that enumerates under another PID still shows up. Empty when the device appeared.
+    pub nodes: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 pub struct ReturnWait {
-    /// When `1532:009F` was seen again (with no `110E` left).
+    /// When the starting identity (`1532:009F` or `1532:009E`) was seen again (with no `110E` left).
     pub back_at: Option<SystemTime>,
     /// One line per Razer USB device present at the end of the wait.
     pub nodes: Vec<String>,
@@ -129,7 +132,7 @@ impl std::fmt::Display for OpenFailure {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
-    /// Every step ran and `1532:009F` came back.
+    /// Every step ran and the starting identity came back.
     Completed,
     ReadVersionFailed(String),
     EnterFailed(String),
@@ -144,7 +147,7 @@ pub enum Outcome {
     /// Step 3b: a kernel driver owns interface 0. Not detached; nothing was sent.
     DriverBound(String),
     /// Step 3c: the `10:80` query got no answer the gate accepts (no reply, a status other than 2, a different frame
-    /// echoed, or a PID other than `009F`/`009E`), so `10:05` was **not** sent and nothing further was.
+    /// echoed, or a PID other than the starting one), so `10:05` was **not** sent and nothing further was.
     NoExit(String),
     /// Step 3d: the exit request failed and `1532:110E` did not leave the bus.
     ExitFailed(String),
@@ -166,7 +169,7 @@ impl Outcome {
     }
 
     /// What the user should do next, one line each.
-    pub fn next_steps(&self) -> Vec<String> {
+    pub fn next_steps(&self, start: Start) -> Vec<String> {
         let mut out = Vec::new();
         if matches!(
             self,
@@ -178,15 +181,18 @@ impl Outcome {
             out.push(UDEV_HINT.to_string());
         }
         if self.needs_replug() {
-            out.push(REPLUG.to_string());
+            out.push(start.replug());
         }
         out
     }
 
-    fn headline(&self) -> String {
+    fn headline(&self, start: Start) -> String {
         match self {
             Outcome::Completed => {
-                "COMPLETED: every step ran and 1532:009F is listed again (timing below)".into()
+                format!(
+                "COMPLETED: every step ran and {} is listed again (timing below)",
+                start.id_text()
+            )
             }
             Outcome::ReadVersionFailed(w) => {
                 format!("STOPPED at step 1 (read version): {w}. Nothing was sent after it")
@@ -211,7 +217,8 @@ impl Outcome {
                 "STOPPED at step 3d (exit): 10:05 could not be sent: {w}; 1532:110E is still on the bus"
             ),
             Outcome::DidNotReturn => format!(
-                "STEP 4 TIMED OUT: 1532:009F did not come back within {} s of 10:05",
+                "STEP 4 TIMED OUT: {} did not come back within {} s of 10:05",
+                start.id_text(),
                 RETURN_TIMEOUT.as_secs()
             ),
         }
@@ -249,6 +256,8 @@ impl Step {
 #[derive(Debug)]
 pub struct ProbeLog {
     pub build: Build,
+    /// The identity the run started from: the dongle `1532:009F` or the cable `1532:009E`.
+    pub start: Start,
     pub started: SystemTime,
     pub device: String,
     pub steps: Vec<Step>,
@@ -265,6 +274,8 @@ pub struct ProbeLog {
     pub report_descriptor: Option<Result<Vec<u8>, SendError>>,
     /// Step 3: when the settle wait after `1532:110E` appeared ended.
     pub settled_at: Option<SystemTime>,
+    /// Step 3: the `1532` devices listed when `1532:110E` never appeared.
+    pub timeout_nodes: Vec<String>,
     /// Step 3c: the `10:80` query, every SET/GET attempt, and what the gate made of it: `Ok(pid)` = `10:05` may go, `Err` =
     /// the reason it did not.
     pub query: Option<Exchange>,
@@ -284,9 +295,10 @@ fn secs_between(from: SystemTime, to: SystemTime) -> f64 {
 }
 
 impl ProbeLog {
-    pub fn new(build: Build, started: SystemTime, device: String) -> ProbeLog {
+    pub fn new(build: Build, started: SystemTime, device: String, start: Start) -> ProbeLog {
         ProbeLog {
             build,
+            start,
             started,
             device,
             steps: Vec::new(),
@@ -297,6 +309,7 @@ impl ProbeLog {
             usbfs: None,
             report_descriptor: None,
             settled_at: None,
+            timeout_nodes: Vec::new(),
             query: None,
             query_at: None,
             gate: None,
@@ -318,25 +331,26 @@ impl ProbeLog {
 
     pub fn render(&self) -> String {
         let mut o = String::new();
-        let _ = writeln!(o, "razerctl bootloader probe v3 (DAN-1935, for DAN-1878)");
+        let _ = writeln!(o, "razerctl bootloader probe v4 (DAN-1944, for DAN-1878)");
         let _ = writeln!(
             o,
             "razerctl {} git {}",
             self.build.version, self.build.git_sha
         );
         let _ = writeln!(o, "started {}", utc(self.started));
+        let _ = writeln!(o, "started from {}", self.start.label());
         let _ = writeln!(o, "device  {}", self.device);
         let _ = writeln!(
             o,
             "RESULT  {}",
             match &self.outcome {
-                Some(r) => r.headline(),
+                Some(r) => r.headline(self.start),
                 None => "INCOMPLETE: the program stopped before it finished (this is a checkpoint)"
                     .into(),
             }
         );
         if let Some(r) = &self.outcome {
-            for n in r.next_steps() {
+            for n in r.next_steps(self.start) {
                 let _ = writeln!(o, "NEXT    {n}");
             }
         }
@@ -372,6 +386,14 @@ impl ProbeLog {
         let _ = writeln!(o, "\n1532:110E in /sys/bus/usb/devices (step 3)");
         let Some(d) = &self.bootloader else {
             let _ = writeln!(o, "  never listed");
+            let _ = writeln!(
+                o,
+                "  Razer USB devices (1532) listed at the timeout ({})",
+                self.timeout_nodes.len()
+            );
+            for n in &self.timeout_nodes {
+                let _ = writeln!(o, "    {n}");
+            }
             return;
         };
         let _ = writeln!(
@@ -579,7 +601,8 @@ impl ProbeLog {
     fn render_return(&self, o: &mut String) {
         let _ = writeln!(
             o,
-            "\n1532:009F after 10:05: {}",
+            "\n{} after 10:05: {}",
+            self.start.id_text(),
             match self.returned_at {
                 Some(back) => {
                     let mut s = String::new();
