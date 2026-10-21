@@ -119,6 +119,10 @@ fn run() -> Result<(), Fail> {
         return cli::macros_cmd(rest).map_err(Fail::from);
     }
 
+    if command == "firmware" {
+        return razerctl::firmware::cli(rest).map_err(Fail::from);
+    }
+
     if command == "update" {
         let stdin = std::io::stdin();
         return update::cli::run(

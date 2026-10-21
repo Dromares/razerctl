@@ -4,6 +4,7 @@
 pub mod battery;
 pub mod cli;
 pub mod device;
+pub mod firmware;
 pub mod hidraw;
 pub mod macros;
 pub mod onboard;

@@ -1,0 +1,189 @@
+//! `razerctl firmware`: look inside the vendor's firmware updater and rehearse a flash on paper. Nothing in here opens a
+//! device (DAN-1885, phase 1 of DAN-1878): `inspect` reads a `.exe` the user supplies, `flash --dry-run` drives the DFU
+//! state machine against a simulated device and prints the frames. Razer's firmware is never stored in this repository;
+//! it is extracted from the user's own copy of the updater at run time.
+
+pub mod ihex;
+pub mod resources;
+pub mod zip;
+
+use std::collections::HashMap;
+
+/// Name of the resource set inside the updater's ZIP that holds the config and the Intel-HEX text.
+const RESOURCE_SET: &str = "DeviceUpdater.resources";
+const LINE_COUNT_SUFFIX: &str = "FWLineNum";
+
+/// One firmware image of the updater, rebuilt and checked.
+#[derive(Debug)]
+pub struct FirmwareImage {
+    /// The updater's name for it: `Dev1`, `Flash1`, `Dev2`.
+    pub name: String,
+    pub vid: u16,
+    /// Normal-mode product id the image is for.
+    pub pid: u16,
+    pub version: String,
+    pub image: ihex::Image,
+    pub sha256: String,
+    /// Intel-HEX records read (all checksums verified).
+    pub records: usize,
+    /// Bootloader the image is written through, when the config names one (`BLVID`/`BLPID`/`BLVER`/`BCDPID_BL`).
+    pub bootloader: Option<Bootloader>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bootloader {
+    pub vid: u16,
+    pub pid: u16,
+    pub version: String,
+    /// `bcdDevice` the bootloader must report: the normal-mode PID of the device the image belongs to.
+    pub bcd: u16,
+}
+
+#[derive(Debug)]
+pub struct Inspection {
+    pub file_len: usize,
+    pub zip_offset: usize,
+    pub zip_members: usize,
+    pub resource_bytes: usize,
+    pub images: Vec<FirmwareImage>,
+}
+
+fn hex16(cfg: &HashMap<String, String>, key: &str) -> Result<u16, String> {
+    let v = cfg
+        .get(key)
+        .ok_or_else(|| format!("unknown resource layout: config entry '{key}' is missing"))?;
+    u16::from_str_radix(v.trim(), 16)
+        .map_err(|_| format!("config entry '{key}' = '{v}' is not a 4-digit hex id"))
+}
+
+/// Everything `inspect` reports, from the bytes of an updater `.exe`.
+pub fn inspect(exe: &[u8]) -> Result<Inspection, String> {
+    let z = zip::Zip::find(exe)?;
+    let entry = z
+        .entry(RESOURCE_SET)
+        .ok_or_else(|| format!("the updater's ZIP has no {RESOURCE_SET} member"))?;
+    let raw = z.read(entry)?;
+    let cfg = resources::parse(&raw).map_err(|e| format!("{RESOURCE_SET}: {e}"))?;
+
+    let mut names: Vec<&str> = cfg
+        .keys()
+        .filter_map(|k| k.strip_suffix(LINE_COUNT_SUFFIX))
+        .collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        return Err(format!(
+            "unknown resource layout: {RESOURCE_SET} has no <image>{LINE_COUNT_SUFFIX} entry, so no firmware image"
+        ));
+    }
+    let mut images = Vec::new();
+    for name in names {
+        let key = format!("{name}{LINE_COUNT_SUFFIX}");
+        let want: usize = cfg[&key]
+            .trim()
+            .parse()
+            .map_err(|_| format!("{key} = '{}' is not a line count", cfg[&key]))?;
+        let kind = name.trim_end_matches(|c: char| c.is_ascii_digit());
+        let n = &name[kind.len()..];
+        if kind.is_empty() || n.is_empty() {
+            return Err(format!(
+                "unknown resource layout: image name '{name}' is not <Kind><number>"
+            ));
+        }
+        let labels: Vec<String> = (0..want).map(|i| format!("{name}FWLine{i}")).collect();
+        let mut lines = Vec::with_capacity(want);
+        for l in &labels {
+            let t = cfg
+                .get(l)
+                .ok_or_else(|| format!("{name}: {l} is missing ({key} says {want} lines)"))?;
+            lines.push((l.as_str(), t.as_str()));
+        }
+        let image = ihex::assemble(lines).map_err(|e| format!("{name}: {e}"))?;
+        let version_key = format!("{kind}FWVer{n}");
+        let version = cfg
+            .get(&version_key)
+            .ok_or_else(|| {
+                format!("unknown resource layout: config entry '{version_key}' is missing")
+            })?
+            .trim()
+            .to_string();
+        // Only the `Dev` images go through the bootloader; the `Flash` image is sent through the running device (class 0x0A).
+        let bootloader = match cfg.get(&format!("BLPID{n}")) {
+            Some(_) if kind == "Dev" => Some(Bootloader {
+                vid: hex16(&cfg, &format!("BLVID{n}"))?,
+                pid: hex16(&cfg, &format!("BLPID{n}"))?,
+                version: cfg.get(&format!("BLVER{n}")).cloned().unwrap_or_default(),
+                bcd: hex16(&cfg, &format!("BCDPID_BL{n}"))?,
+            }),
+            _ => None,
+        };
+        images.push(FirmwareImage {
+            name: name.to_string(),
+            vid: hex16(&cfg, &format!("VID{n}"))?,
+            pid: hex16(&cfg, &format!("PID{n}"))?,
+            version,
+            sha256: crate::sha256::hex_digest(&image.data[..]).map_err(|e| e.to_string())?,
+            image,
+            records: want,
+            bootloader,
+        });
+    }
+    Ok(Inspection {
+        file_len: exe.len(),
+        zip_offset: z.offset,
+        zip_members: z.entries.len(),
+        resource_bytes: raw.len(),
+        images,
+    })
+}
+
+/// The lines `firmware inspect` prints.
+pub fn describe(path: &str, file_sha256: &str, ins: &Inspection) -> Vec<String> {
+    let mut out = vec![
+        format!("{path}: {} bytes, sha256 {file_sha256}", ins.file_len),
+        format!(
+            "ZIP at offset {} ({} members); {RESOURCE_SET} is {} bytes",
+            ins.zip_offset, ins.zip_members, ins.resource_bytes
+        ),
+    ];
+    for f in &ins.images {
+        out.push(format!(
+            "image {:<7} target {:04x}:{:04x}  version {}  {:#010x}-{:#010x}  {} bytes  sha256 {}  ({} records, all checksums ok)",
+            f.name,
+            f.vid,
+            f.pid,
+            f.version,
+            f.image.start,
+            f.image.end(),
+            f.image.data.len(),
+            f.sha256,
+            f.records
+        ));
+        match &f.bootloader {
+            Some(b) => out.push(format!(
+                "  written via bootloader {:04x}:{:04x} (bcdDevice {:04x}, protocol {})",
+                b.vid, b.pid, b.bcd, b.version
+            )),
+            None => out.push(
+                "  not a bootloader image (the vendor sends it through the running device)".into(),
+            ),
+        }
+    }
+    out
+}
+
+/// `razerctl firmware inspect <updater.exe>`.
+pub fn cli(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: firmware inspect UPDATER.EXE";
+    match args {
+        [sub, path] if sub == "inspect" => {
+            let exe = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+            let ins = inspect(&exe).map_err(|e| format!("{path}: {e}"))?;
+            let sha = crate::sha256::hex_digest(&exe[..]).map_err(|e| e.to_string())?;
+            for l in describe(path, &sha, &ins) {
+                println!("{l}");
+            }
+            Ok(())
+        }
+        _ => Err(USAGE.into()),
+    }
+}
