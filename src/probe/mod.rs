@@ -1,5 +1,5 @@
-//! `razerctl firmware probe-bootloader` (DAN-1908 phase 2, DAN-1929 phase 2b, DAN-1935 phase 2d of DAN-1878): put the
-//! dongle into its bootloader, look at how the bootloader shows up on Linux, ask it the one question Razer's updater asks
+//! `razerctl firmware probe-bootloader` (DAN-1908 phase 2, DAN-1929 phase 2b, DAN-1935 phase 2d, DAN-1944 phase 2e of DAN-1878):
+//! put the mouse, from the dongle `1532:009F` or from its USB cable `1532:009E` ([`Start`]), into its bootloader, look at how the bootloader shows up on Linux, ask it the one question Razer's updater asks
 //! (`10:80`), and, only if the answer is the expected one, take it out again. **It never erases and never writes**: the
 //! only frames this module can emit are the four below, and everything else is refused structurally.
 //!
@@ -10,7 +10,7 @@
 //!   exactly three control requests: the HID report descriptor read, the feature SET_REPORT (carrying `10:80` or `10:05`,
 //!   byte for byte) and its GET_REPORT. [`usbfs::UsbGuarded`] refuses anything else before the ioctl, so `10:01` (erase),
 //!   `10:02` (program), a class `0x0A` frame and every other class `0x10` frame cannot get out.
-//! * `10:05` goes out only after a `10:80` reply with status 2 and a PID of `009F` or `009E` ([`gate`]); [`run`] sends
+//! * `10:05` goes out only after a `10:80` reply with status 2 and a PID equal to the starting PID ([`gate`]); [`run`] sends
 //!   nothing after any other reply.
 //! * The DFU trait of phase 1 (`firmware::dfu::Transport`: erase, program, verify) is not implemented by anything in
 //!   here, and nothing in `probe` names `firmware::dfu`, `firmware::flash` or the erase/program/class `0x0A` commands.
