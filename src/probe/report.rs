@@ -3,7 +3,11 @@
 
 use super::sysfs::{Interface0, UsbDevice};
 use super::usbfs::Setup;
-use super::{Answer, Build, BOOTLOADER_TIMEOUT, REPLUG, RETURN_TIMEOUT, UDEV_HINT};
+use super::{
+    exit_frame, query_frame, Build, Decoded, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
+    QUERY_PAIRS, REPLUG, RETURN_TIMEOUT, UDEV_HINT,
+};
+use crate::protocol::REPORT_LEN;
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,6 +48,8 @@ pub struct BootloaderWait {
     pub device: Option<UsbDevice>,
     /// When it was first seen.
     pub appeared_at: Option<SystemTime>,
+    /// When the settle wait after that ended: the earliest moment the probe may open usbfs.
+    pub settled_at: Option<SystemTime>,
 }
 
 #[derive(Debug, Default)]
@@ -54,13 +60,43 @@ pub struct ReturnWait {
     pub nodes: Vec<String>,
 }
 
-/// What the exit request produced.
+/// One GET_REPORT: when it was issued, and the 90 bytes it returned or why there were none.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExitResult {
-    /// The SET_REPORT carrying `10:05`.
-    pub sent: Result<(), SendError>,
-    /// The GET_REPORT that reads its status; `None` if the SET_REPORT failed and it was not tried.
-    pub status: Option<Answer>,
+pub struct Get {
+    pub at: SystemTime,
+    pub reply: Result<Vec<u8>, SendError>,
+}
+
+/// One SET_REPORT and the GET_REPORTs that followed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pair {
+    pub set_at: SystemTime,
+    pub set: Result<(), SendError>,
+    /// Empty if the SET_REPORT failed and no GET was tried.
+    pub gets: Vec<Get>,
+}
+
+/// Everything one frame (`10:80` or `10:05`) put on the wire: up to three SET/GET pairs, in order.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Exchange {
+    pub pairs: Vec<Pair>,
+}
+
+impl Exchange {
+    /// The error of the last SET_REPORT, if it failed. After one the device may have left the bus, so nothing was retried.
+    pub fn set_error(&self) -> Option<&SendError> {
+        self.pairs.last()?.set.as_ref().err()
+    }
+
+    /// The last GET_REPORT of the last pair: the reply that decides what comes next.
+    pub fn last_get(&self) -> Option<&Get> {
+        self.pairs.last()?.gets.last()
+    }
+
+    /// How many SET_REPORTs went out.
+    pub fn sets(&self) -> usize {
+        self.pairs.len()
+    }
 }
 
 /// Why the bootloader's usbfs node could not be opened. `errno` is recorded as the kernel gave it.
@@ -107,7 +143,10 @@ pub enum Outcome {
     },
     /// Step 3b: a kernel driver owns interface 0. Not detached; nothing was sent.
     DriverBound(String),
-    /// Step 3c: the exit request failed and `1532:110E` did not leave the bus.
+    /// Step 3c: the `10:80` query got no answer the gate accepts (no reply, a status other than 2, a different frame
+    /// echoed, or a PID other than `009F`/`009E`), so `10:05` was **not** sent and nothing further was.
+    NoExit(String),
+    /// Step 3d: the exit request failed and `1532:110E` did not leave the bus.
     ExitFailed(String),
     /// Step 4 timed out.
     DidNotReturn,
@@ -165,8 +204,11 @@ impl Outcome {
             Outcome::DriverBound(w) => format!(
                 "STOPPED at step 3b (usbfs): {w}. Not detached; nothing was sent to the bootloader"
             ),
+            Outcome::NoExit(w) => format!(
+                "STOPPED at step 3c (10:80 query): {w}. 10:05 was NOT sent and nothing further was sent"
+            ),
             Outcome::ExitFailed(w) => format!(
-                "STOPPED at step 3c (exit): 10:05 could not be sent: {w}; 1532:110E is still on the bus"
+                "STOPPED at step 3d (exit): 10:05 could not be sent: {w}; 1532:110E is still on the bus"
             ),
             Outcome::DidNotReturn => format!(
                 "STEP 4 TIMED OUT: 1532:009F did not come back within {} s of 10:05",
@@ -178,7 +220,7 @@ impl Outcome {
 
 #[derive(Debug, Clone)]
 pub struct Step {
-    /// `1`, `2`, `3`, `3b`, `3c`, `4`.
+    /// `1`, `2`, `3`, `3b`, `3c`, `3d`, `4`.
     pub id: &'static str,
     pub what: String,
     pub started: SystemTime,
@@ -221,9 +263,16 @@ pub struct ProbeLog {
     pub usbfs: Option<Result<String, OpenFailure>>,
     /// Step 3b: the HID report descriptor of interface 0, or the errno of the read.
     pub report_descriptor: Option<Result<Vec<u8>, SendError>>,
-    /// Step 3c: when `10:05` was sent, and what came of it.
+    /// Step 3: when the settle wait after `1532:110E` appeared ended.
+    pub settled_at: Option<SystemTime>,
+    /// Step 3c: the `10:80` query, every SET/GET attempt, and what the gate made of it: `Ok(pid)` = `10:05` may go, `Err` =
+    /// the reason it did not.
+    pub query: Option<Exchange>,
+    pub query_at: Option<SystemTime>,
+    pub gate: Option<Result<u16, String>>,
+    /// Step 3d: when `10:05` was sent, and what came of it.
     pub exit_sent_at: Option<SystemTime>,
-    pub exit: Option<ExitResult>,
+    pub exit: Option<Exchange>,
     /// Step 4.
     pub returned_at: Option<SystemTime>,
     pub after_nodes: Vec<String>,
@@ -247,6 +296,10 @@ impl ProbeLog {
             appeared_at: None,
             usbfs: None,
             report_descriptor: None,
+            settled_at: None,
+            query: None,
+            query_at: None,
+            gate: None,
             exit_sent_at: None,
             exit: None,
             returned_at: None,
@@ -265,7 +318,7 @@ impl ProbeLog {
 
     pub fn render(&self) -> String {
         let mut o = String::new();
-        let _ = writeln!(o, "razerctl bootloader probe (DAN-1929, for DAN-1878)");
+        let _ = writeln!(o, "razerctl bootloader probe v3 (DAN-1935, for DAN-1878)");
         let _ = writeln!(
             o,
             "razerctl {} git {}",
@@ -307,6 +360,7 @@ impl ProbeLog {
         }
         self.render_bootloader(&mut o);
         self.render_usbfs(&mut o);
+        self.render_query(&mut o);
         self.render_exit(&mut o);
         if self.has_step("4") {
             self.render_return(&mut o);
@@ -328,6 +382,16 @@ impl ProbeLog {
             d.dev.map_or("?".into(), |n| n.to_string()),
             utc(d.seen_at)
         );
+        if let Some(s) = self.settled_at {
+            let _ = writeln!(
+                o,
+                "  settled {} after it was first seen, at {}; usbfs was opened after this",
+                self.appeared_at.map_or("?".into(), |a| secs(
+                    s.duration_since(a).unwrap_or_default()
+                )),
+                utc(s)
+            );
+        }
         let _ = writeln!(
             o,
             "  bcdDevice {}  product {}",
@@ -395,30 +459,120 @@ impl ProbeLog {
         }
     }
 
-    fn render_exit(&self, o: &mut String) {
-        let Some(x) = &self.exit else { return };
-        let set = setup_hex(&Setup::set_report_feature());
-        let get = setup_hex(&Setup::get_report_feature());
-        match &x.sent {
-            Ok(()) => {
-                let _ = writeln!(o, "exit 10:05, SET_REPORT {set}: accepted");
-            }
-            Err(e) => {
-                let _ = writeln!(o, "exit 10:05, SET_REPORT {set}: {e}");
-            }
-        }
-        match &x.status {
-            Some(Ok(r)) => {
+    /// The `10:80` query (step 3c): every SET/GET attempt, what the reply decodes to, and the gate's decision.
+    fn render_query(&self, o: &mut String) {
+        let Some(x) = &self.query else { return };
+        let _ = writeln!(
+            o,
+            "\nquery 10:80 (step 3c), sent {}: payload ({} bytes) {}",
+            self.query_at.map_or("?".into(), utc),
+            REPORT_LEN,
+            hex(&query_frame().to_bytes())
+        );
+        self.render_exchange(o, "query 10:80", QUERY, QUERY_PAIRS, x);
+        match &self.gate {
+            Some(Ok(pid)) => {
                 let _ = writeln!(
                     o,
-                    "status read, GET_REPORT {get}: command {:02x}:{:02x} status byte {:#04x}",
-                    r.command_class, r.command_id, r.status
+                    "gate: OPEN. The reply is status 2, txn 0, class/id 10:80 and PID {pid:04x}, so 10:05 was sent next"
                 );
             }
-            Some(Err(e)) => {
-                let _ = writeln!(o, "status read, GET_REPORT {get}: {e}");
+            Some(Err(why)) => {
+                let _ = writeln!(o, "gate: CLOSED. {why}. 10:05 was NOT sent");
             }
             None => {}
+        }
+    }
+
+    fn render_exit(&self, o: &mut String) {
+        let Some(x) = &self.exit else { return };
+        let _ = writeln!(
+            o,
+            "\nexit 10:05 (step 3d), sent {}: payload ({} bytes) {}",
+            self.exit_sent_at.map_or("?".into(), utc),
+            REPORT_LEN,
+            hex(&exit_frame().to_bytes())
+        );
+        self.render_exchange(o, "exit 10:05", EXIT, EXIT_PAIRS, x);
+    }
+
+    /// One line per SET_REPORT and per GET_REPORT, in the order they went out.
+    fn render_exchange(
+        &self,
+        o: &mut String,
+        label: &str,
+        sent: (u8, u8),
+        max_pairs: usize,
+        x: &Exchange,
+    ) {
+        let set = setup_hex(&Setup::set_report_feature());
+        let get = setup_hex(&Setup::get_report_feature());
+        for (i, p) in x.pairs.iter().enumerate() {
+            let n = i + 1;
+            match &p.set {
+                Ok(()) => {
+                    let _ = writeln!(
+                        o,
+                        "{label}, SET_REPORT {set}: accepted (attempt {n} of up to {max_pairs}, at {})",
+                        utc(p.set_at)
+                    );
+                }
+                Err(e) => {
+                    let _ = writeln!(
+                        o,
+                        "{label}, SET_REPORT {set}: {e} (attempt {n} of up to {max_pairs}, at {})",
+                        utc(p.set_at)
+                    );
+                }
+            }
+            for (j, g) in p.gets.iter().enumerate() {
+                let at = utc(g.at);
+                match &g.reply {
+                    Ok(raw) => {
+                        let d = Decoded::of(raw);
+                        let _ = match &d {
+                            Some(d) => writeln!(
+                                o,
+                                "status read, GET_REPORT {get}: command {:02x}:{:02x} status byte {:#04x} (read {} of attempt {n}, at {at})",
+                                d.class,
+                                d.id,
+                                d.status,
+                                j + 1
+                            ),
+                            None => writeln!(
+                                o,
+                                "status read, GET_REPORT {get}: a reply of {} bytes, not {REPORT_LEN} (read {} of attempt {n}, at {at})",
+                                raw.len(),
+                                j + 1
+                            ),
+                        };
+                        let _ = writeln!(o, "  reply ({} bytes): {}", raw.len(), hex(raw));
+                        if let Some(d) = d {
+                            let _ = writeln!(
+                                o,
+                                "  decoded: status {:#04x} txn {:#04x} class/id {:02x}:{:02x} PID {:04x}{}",
+                                d.status,
+                                d.txn,
+                                d.class,
+                                d.id,
+                                d.pid,
+                                if d.echoes(sent) {
+                                    ""
+                                } else {
+                                    " (txn/class/id are not those of the frame sent)"
+                                }
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        let _ = writeln!(
+                            o,
+                            "status read, GET_REPORT {get}: {e} (read {} of attempt {n}, at {at})",
+                            j + 1
+                        );
+                    }
+                }
+            }
         }
     }
 
