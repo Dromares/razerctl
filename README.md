@@ -238,7 +238,7 @@ waits up to 30 s for `1532:009F` to come back. Everything goes into a text file 
 `razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
 
 * **It never erases or writes firmware.** The command can send exactly three frames (`00:87`, `00:04` mode 1 and `10:05`);
-  no erase, program or Flash-stream frame exists in it, and a test fails the build if one is added.
+  no erase, program or Flash-stream frame exists in it, and `cargo test` fails if one is added.
 * Without `--yes-enter-bootloader` it only prints what it would do and exits with an error; nothing is sent.
 * It refuses to start while another razerctl (the remap or battery service, the GUI, another command) or openrazer
   (`openrazer-daemon`, or the `razermouse` kernel driver bound to the dongle) is using the device, or anything else has its
