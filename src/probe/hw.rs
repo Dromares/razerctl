@@ -6,8 +6,8 @@
 //!
 //! 1. [`RealProbe`] implements [`ProbeIo`] and nothing else of ours. `ProbeIo` has no method that takes a frame or a
 //!    control request, so a caller cannot ask it to send one; the methods that write ([`ProbeIo::read_version`],
-//!    [`ProbeIo::enter_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from the constructors in
-//!    `probe/mod.rs`.
+//!    [`ProbeIo::enter_bootloader`], [`ProbeIo::query_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from
+//!    the constructors in `probe/mod.rs`.
 //! 2. Every hidraw write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not one of the
 //!    two normal-mode probe frames ([`super::permitted`]); every usbfs request goes through
 //!    [`super::usbfs::UsbGuarded`], which refuses all but its three. Both are runtime checks at the last point before the
@@ -15,12 +15,12 @@
 //! 3. This file does not name the phase-1 DFU module, its trait or its erase/program constructors; the fence test reads
 //!    the source for that.
 
-use super::report::{BootloaderWait, ExitResult, OpenFailure, ReturnWait, SendError};
+use super::report::{BootloaderWait, Exchange, Get, OpenFailure, Pair, ReturnWait, SendError};
 use super::sysfs::{self, UsbDevice};
 use super::usbfs::{self, ControlIo, UsbGuarded, Usbfs};
 use super::{
-    enter_frame, permitted, read_version_frame, Answer, ProbeIo, Traffic, BOOTLOADER_ID, EXIT,
-    NORMAL_ID,
+    enter_frame, permitted, read_version_frame, Answer, Decoded, ProbeIo, Traffic, BOOTLOADER_ID,
+    EXIT_PAIRS, NORMAL_ID, QUERY, QUERY_GETS, QUERY_PAIRS,
 };
 use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
 use crate::protocol::{Report, Status, REPORT_LEN};
@@ -31,12 +31,15 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// How often the device list is polled while waiting for a device to appear or leave.
 const POLL: Duration = Duration::from_millis(100);
-/// After `1532:110E` first shows up, wait this long for its interface directory and the udev ACL before reading it.
-const SETTLE: Duration = Duration::from_millis(500);
+/// After `1532:110E` first shows up, wait this long for its interface directory and the udev ACL before reading it, and
+/// before anything is sent to it: Razer's updater sleeps 1000 ms there (`Sleep(1000)`, DAN-1932); probe v2 waited 500 ms.
+pub const SETTLE: Duration = Duration::from_millis(1000);
+/// The pause Razer's sender makes before every SET_REPORT and every GET_REPORT.
+const PRE_DELAY: Duration = Duration::from_millis(2);
 /// A usbfs node that exists but is not yet readable is retried this long (udev applies the ACL just after the node
 /// appears). Any other error, or the same error after this, is final.
 const OPEN_RETRY: Duration = Duration::from_millis(2000);
-/// Follow-up reads of the reply after a send: `ATTEMPTS` polls, `STEP` apart.
+/// Follow-up reads of the reply after a hidraw send: `ATTEMPTS` polls, `STEP` apart.
 const REPLY_ATTEMPTS: usize = 5;
 const REPLY_STEP: Duration = Duration::from_millis(20);
 
@@ -101,41 +104,103 @@ pub fn enter_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, SendError> {
     send_and_listen(io, &enter_frame())
 }
 
-/// Step 3c on any guarded usbfs channel: `10:05` as a feature SET_REPORT, then the GET_REPORT that reads its status.
-/// `status` is `None` if the SET_REPORT failed.
-pub fn exit_via<T: ControlIo>(io: &UsbGuarded<T>) -> ExitResult {
-    if let Err(e) = usbfs::send_exit(io) {
-        return ExitResult {
-            sent: Err(e.into()),
-            status: None,
-        };
+/// One reply read for the report: the 90 bytes, or the error (the errno is kept).
+fn read_get<T: ControlIo>(io: &UsbGuarded<T>) -> Get {
+    std::thread::sleep(PRE_DELAY);
+    let at = SystemTime::now();
+    Get {
+        at,
+        reply: usbfs::read_reply(io).map_err(SendError::from),
     }
-    let mut last = Err("no reply".to_string());
-    for _ in 0..REPLY_ATTEMPTS {
-        std::thread::sleep(REPLY_STEP);
-        match usbfs::read_status(io) {
-            Ok(r)
-                if matches!(
-                    r.status_for(EXIT),
-                    Status::NewCommand | Status::Busy | Status::Mismatch
-                ) =>
-            {
-                last = Ok(r)
-            }
-            Ok(r) => {
-                last = Ok(r);
-                break;
-            }
-            Err(e) => {
-                last = Err(e.to_string());
-                break;
+}
+
+/// One SET_REPORT, after the vendor sender's pre-delay. `gets` is empty; the caller fills it.
+fn send_set<T: ControlIo>(io: &UsbGuarded<T>, send: fn(&UsbGuarded<T>) -> io::Result<()>) -> Pair {
+    std::thread::sleep(PRE_DELAY);
+    let set_at = SystemTime::now();
+    Pair {
+        set_at,
+        set: send(io).map_err(SendError::from),
+        gets: Vec::new(),
+    }
+}
+
+/// What a `10:80` reply means for the polling loop (the vendor sender, DAN-1932).
+enum Poll {
+    /// Status 2, txn 0, class/id `10:80`: this is the answer.
+    Answer,
+    /// Status 0 or 1, or a status 2 for another frame: ask again.
+    Again,
+    /// Any other status: send the SET again.
+    Resend,
+}
+
+fn poll_query(raw: &[u8]) -> Poll {
+    match Decoded::of(raw) {
+        Some(d) if d.status == 2 && d.echoes(QUERY) => Poll::Answer,
+        Some(d) if !matches!(d.status, 0..=2) => Poll::Resend,
+        _ => Poll::Again,
+    }
+}
+
+/// Step 3c on any guarded usbfs channel: `10:80` as a feature SET_REPORT, then up to [`QUERY_GETS`] GET_REPORTs, each after
+/// [`PRE_DELAY`]. Status 0 or 1, a failed GET and a reply to another frame are polled again; any other status re-sends the
+/// SET at once, and so do five GETs without an answer. At most [`QUERY_PAIRS`] SET/GET pairs. A SET that fails ends it
+/// (the device may have left the bus). The caller decides what the last reply means ([`super::gate`]).
+pub fn query_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
+    let mut x = Exchange::default();
+    for _ in 0..QUERY_PAIRS {
+        let mut pair = send_set(io, usbfs::send_query);
+        if pair.set.is_err() {
+            x.pairs.push(pair);
+            return x;
+        }
+        let mut answered = false;
+        for _ in 0..QUERY_GETS {
+            let get = read_get(io);
+            let next = match &get.reply {
+                Ok(raw) => poll_query(raw),
+                Err(_) => Poll::Again,
+            };
+            pair.gets.push(get);
+            match next {
+                Poll::Answer => {
+                    answered = true;
+                    break;
+                }
+                Poll::Again => {}
+                Poll::Resend => break,
             }
         }
+        x.pairs.push(pair);
+        if answered {
+            break;
+        }
     }
-    ExitResult {
-        sent: Ok(()),
-        status: Some(last),
+    x
+}
+
+/// Step 3d on any guarded usbfs channel: `10:05` as a feature SET_REPORT, then one GET_REPORT, each after [`PRE_DELAY`].
+/// A failed GET or a status other than 2 re-sends the same SET, up to [`EXIT_PAIRS`] SET/GET pairs; the result is logged and
+/// never an error of its own, as in the vendor's updater. A SET that fails ends it: the device leaving the bus in the
+/// middle of the transfer is the shape of the exit working, which the caller checks for.
+pub fn exit_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
+    let mut x = Exchange::default();
+    for _ in 0..EXIT_PAIRS {
+        let mut pair = send_set(io, usbfs::send_exit);
+        if pair.set.is_err() {
+            x.pairs.push(pair);
+            return x;
+        }
+        let get = read_get(io);
+        let accepted = matches!(&get.reply, Ok(raw) if raw.first() == Some(&2));
+        pair.gets.push(get);
+        x.pairs.push(pair);
+        if accepted {
+            break;
+        }
     }
+    x
 }
 
 /// Where the probe looks: the kernel's USB device list and the usbfs nodes. The tests point both at a fixture tree.
@@ -208,6 +273,20 @@ impl RealProbe {
     }
 }
 
+/// What a frame that was asked for without an open usbfs node produced: a failed SET, nothing on the wire.
+fn never_opened() -> Exchange {
+    Exchange {
+        pairs: vec![Pair {
+            set_at: SystemTime::now(),
+            set: Err(SendError {
+                errno: None,
+                message: "the usbfs node was never opened".into(),
+            }),
+            gets: Vec::new(),
+        }],
+    }
+}
+
 fn open_failure(node: &Path, e: &io::Error) -> OpenFailure {
     OpenFailure {
         node: node.display().to_string(),
@@ -250,11 +329,13 @@ impl ProbeIo for RealProbe {
             return BootloaderWait::default();
         }
         let appeared_at = SystemTime::now();
-        // the interface directory and the driver link come a moment after the device itself
+        // the interface directory and the driver link come a moment after the device itself, and the vendor waits 1000 ms
         std::thread::sleep(SETTLE);
+        let settled_at = SystemTime::now();
         BootloaderWait {
-            device: sysfs::find(&self.roots.sysfs, BOOTLOADER_ID, SystemTime::now()),
+            device: sysfs::find(&self.roots.sysfs, BOOTLOADER_ID, settled_at),
             appeared_at: Some(appeared_at),
+            settled_at: Some(settled_at),
         }
     }
 
@@ -296,16 +377,17 @@ impl ProbeIo for RealProbe {
         usbfs::read_report_descriptor(usb).map_err(SendError::from)
     }
 
-    fn exit_bootloader(&mut self) -> ExitResult {
+    fn query_bootloader(&mut self) -> Exchange {
+        match &self.usb {
+            Some(usb) => query_via(usb),
+            None => never_opened(),
+        }
+    }
+
+    fn exit_bootloader(&mut self) -> Exchange {
         match &self.usb {
             Some(usb) => exit_via(usb),
-            None => ExitResult {
-                sent: Err(SendError {
-                    errno: None,
-                    message: "the usbfs node was never opened".into(),
-                }),
-                status: None,
-            },
+            None => never_opened(),
         }
     }
 

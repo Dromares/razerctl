@@ -56,7 +56,8 @@ COMMANDS:
                              Flashing a real device is not supported yet
     firmware probe-bootloader [--yes-enter-bootloader] [--out FILE]
                              Put the Viper Mini SE dongle into its bootloader (1532:110E), record how it
-                             enumerates on Linux (sysfs + usbfs, needs the updated udev rule), and take it out again.
+                             enumerates on Linux (sysfs + usbfs, needs the updated udev rule), ask it the query Razer's
+                             updater asks first (10:80) and, only if the reply is the expected one, try the exit frame.
                              Never erases or writes firmware; without the flag it only prints what it would do.
                              The mouse is dead while it runs. Worst case: replug the dongle
     update [--check]         Ask GitHub whether a newer release exists (only when you run this).

@@ -235,9 +235,13 @@ It is a measurement for a later update feature. It reads the Viper Mini SE dongl
 bootloader (`00:04`, mode 1). The bootloader enumerates as `1532:110E` and the kernel makes **no hidraw node** for it, so the
 probe finds it in `/sys/bus/usb/devices` (reading sysfs sends nothing) and writes down the bus and device number,
 `bcdDevice`, product string, any driver bound to interface 0 and the kernel's cached descriptors. It then opens the
-bootloader's `/dev/bus/usb/BBB/DDD` node, reads its HID report descriptor, sends exit (`10:05`) as a HID feature
-SET_REPORT and reads the GET_REPORT that answers it, and waits up to 30 s for `1532:009F` to come back, recording how long
-that took from the `10:05` send and from entry (which tells whether `10:05` is what brought it back). An error on the enter send counts as
+bootloader's `/dev/bus/usb/BBB/DDD` node (at least 1000 ms after it appears, the wait Razer's updater makes), reads its
+HID report descriptor and sends the query frame `10:80` that Razer's updater sends first on every bootloader open. `10:80` asks
+the bootloader for its PID and changes nothing. Only if the reply has status 2 and a PID of `009F` or `009E` does the probe
+send exit (`10:05`), straight away on the same handle, as a HID feature SET_REPORT; any other reply (or none) ends the run
+there, nothing more is sent and it tells you to replug. It then waits up to 30 s for `1532:009F` to come back, recording how
+long that took from the `10:05` send and from entry (which tells whether `10:05` is what brought it back). Whether
+`10:05` makes the bootloader exit is not known: on the first run it was accepted and the dongle stayed in the bootloader until it was replugged. An error on the enter send counts as
 "entered" only if the dongle then leaves the USB bus. Everything goes into a text file (`--out FILE`, default
 `razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
 
@@ -249,8 +253,8 @@ sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --relo
 ```
 
 * **It never erases or writes firmware.** Over hidraw the command can send exactly two frames (`00:87` and `00:04`
-  mode 1). Over usbfs it can send three control requests: the HID report descriptor read, `10:05` as a feature SET_REPORT,
-  and the GET_REPORT that reads its status; the only ioctls it issues are `USBDEVFS_CONTROL` and
+  mode 1). Over usbfs it can send three control requests: the HID report descriptor read, a feature SET_REPORT that
+  carries `10:80` or `10:05` byte for byte (and nothing else), and the GET_REPORT that reads its status; the only ioctls it issues are `USBDEVFS_CONTROL` and
   `USBDEVFS_CLAIMINTERFACE`. No erase, program or Flash-stream frame exists in it, and `cargo test` fails if one is added.
 * Without `--yes-enter-bootloader` it only prints what it would do and exits with an error; nothing is sent.
 * If the bootloader's usbfs node cannot be opened (no udev rule), or a kernel driver owns interface 0, it sends nothing to the

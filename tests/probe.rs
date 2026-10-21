@@ -8,16 +8,17 @@ use razerctl::hidraw::FeatureIo;
 use razerctl::probe::cli;
 use razerctl::probe::hw::{self, Guarded, RealProbe, Roots};
 use razerctl::probe::report::{
-    utc, BootloaderWait, ExitResult, OpenFailure, Outcome, ProbeLog, ReturnWait, SendError,
+    utc, BootloaderWait, Exchange, Get, OpenFailure, Outcome, Pair, ProbeLog, ReturnWait, SendError,
 };
 use razerctl::probe::sysfs::{self, Interface0, UsbDevice};
 use razerctl::probe::usbfs::{self, ControlIo, Setup, UsbGuarded};
 use razerctl::probe::{
-    self, enter_frame, exit_frame, permitted, read_version_frame, Answer, Build, ProbeIo, Traffic,
-    BOOTLOADER_ID, NORMAL_ID,
+    self, enter_frame, exit_frame, gate, permitted, query_frame, read_version_frame, Answer, Build,
+    Decoded, ProbeIo, Traffic, BOOTLOADER_ID, NORMAL_ID,
 };
 use razerctl::protocol::{Report, REPORT_LEN};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -67,10 +68,46 @@ fn golden_exit_bootloader_frame() {
 }
 
 #[test]
+fn golden_query_frame() {
+    // DAN-1932 / the ticket, byte for byte: status 0, tid 0, packets 0, protocol 0, size 9, 10:80, 80 zero args, then
+    // xor(9, 0x10, 0x80) = 0x99 and a pad byte
+    let mut want = [0u8; REPORT_LEN];
+    want[..8].copy_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x10, 0x80]);
+    want[88] = 0x99;
+    assert_eq!(query_frame().to_bytes(), want);
+    assert_eq!(query_frame().to_bytes(), golden(9, 0x10, 0x80, &[]));
+    assert_eq!(0x09u8 ^ 0x10 ^ 0x80, 0x99);
+    assert!(query_frame().to_bytes()[8..88].iter().all(|&b| b == 0));
+    assert_eq!(query_frame().to_bytes()[89], 0);
+}
+
+#[test]
 fn the_probe_frames_are_the_ones_phase_one_pinned() {
     assert_eq!(read_version_frame(), dfu::read_version_frame());
     assert_eq!(enter_frame(), dfu::enter_frame());
     assert_eq!(exit_frame(), dfu::exit_frame());
+}
+
+#[test]
+fn the_reply_fields_are_read_from_the_offsets_the_recon_names() {
+    // status [0], txn [1], class/id [6..8], PID = [16] | [15] << 8 (vendor buf[17] | buf[16] << 8, with the report id)
+    let mut raw = [0u8; REPORT_LEN];
+    raw[0] = 2;
+    raw[6] = 0x10;
+    raw[7] = 0x80;
+    raw[15] = 0x00;
+    raw[16] = 0x9F;
+    let d = Decoded::of(&raw).unwrap();
+    assert_eq!((d.status, d.txn, d.class, d.id), (2, 0, 0x10, 0x80));
+    assert_eq!(d.pid, 0x009F);
+    assert!(d.echoes((0x10, 0x80)) && !d.echoes((0x10, 0x05)));
+    // the high byte is [15], not [17]: a byte at [14] or [17] is not the PID
+    raw[15] = 0x11;
+    raw[16] = 0x0E;
+    raw[14] = 0xEE;
+    raw[17] = 0xEE;
+    assert_eq!(Decoded::of(&raw).unwrap().pid, 0x110E);
+    assert!(Decoded::of(&raw[..89]).is_none() && Decoded::of(&[0u8; 91]).is_none());
 }
 
 #[test]
@@ -79,7 +116,8 @@ fn only_the_two_normal_mode_frames_are_permitted_over_hidraw() {
         assert!(permitted(&f.to_bytes()), "{f:?}");
     }
     let refused: Vec<(&str, Report)> = vec![
-        // 10:05 is the usbfs transport's frame: the bootloader has no hidraw node, so hidraw never carries it
+        // 10:80 and 10:05 are the usbfs transport's frames: the bootloader has no hidraw node, so hidraw never carries them
+        ("query 10:80", query_frame()),
         ("exit 10:05", exit_frame()),
         ("erase 10:01", dfu::erase_frame(0x1000, 0x2000)),
         ("program 10:02", dfu::program_frame(0x1000, &[1, 2, 3])),
@@ -184,6 +222,7 @@ fn an_errno_on_the_enter_send_reaches_the_caller_as_an_errno() {
 fn the_guard_stops_every_other_frame_before_the_device() {
     let g = Guarded(SimFeature::new());
     let forbidden = [
+        query_frame(),
         exit_frame(),
         dfu::erase_frame(0x1000, 0x2000),
         dfu::program_frame(0x1000, &[0xAA; 64]),
@@ -236,22 +275,61 @@ fn golden_ioctl_numbers() {
     assert_eq!(usbfs::USBDEVFS_CLAIMINTERFACE, 0x8004_550F);
 }
 
-/// A usbfs device that records every request that reaches it: the setup packet and, for a write, the payload.
+/// A `10:80`-shaped or `10:05`-shaped reply as the device returns it: 90 bytes, status as given, the PID at `[15..17]`.
+fn reply_bytes(cmd: (u8, u8), status: u8, pid: u16) -> Vec<u8> {
+    let mut r = Report::new(cmd, 0, 0);
+    r.status = status;
+    r.args[7] = (pid >> 8) as u8;
+    r.args[8] = pid as u8;
+    r.to_bytes().to_vec()
+}
+
+/// A usbfs device that records every request that reaches it: the setup packet and, for a write, the payload, and when it
+/// arrived. GET_REPORTs are answered from `gets` in order; with none scripted the device answers the last SET_REPORT with
+/// status 2 (and PID 009F to a `10:80`).
 struct SimUsb {
     requests: RefCell<Vec<(Setup, Vec<u8>)>>,
+    arrived: RefCell<Vec<std::time::Instant>>,
     claimed: RefCell<Vec<u8>>,
     descriptor: Vec<u8>,
     set_errno: Option<i32>,
+    /// `Err(errno)` = that GET_REPORT fails with it.
+    gets: RefCell<VecDeque<Result<Vec<u8>, i32>>>,
+    last_set: RefCell<Option<Vec<u8>>>,
 }
 
 impl SimUsb {
     fn new() -> SimUsb {
         SimUsb {
             requests: RefCell::new(Vec::new()),
+            arrived: RefCell::new(Vec::new()),
             claimed: RefCell::new(Vec::new()),
             descriptor: DESC.to_vec(),
             set_errno: None,
+            gets: RefCell::new(VecDeque::new()),
+            last_set: RefCell::new(None),
         }
+    }
+    fn scripted(gets: Vec<Result<Vec<u8>, i32>>) -> SimUsb {
+        let s = SimUsb::new();
+        *s.gets.borrow_mut() = gets.into();
+        s
+    }
+    /// The payloads of the SET_REPORTs that reached the device, in order.
+    fn sets(&self) -> Vec<Vec<u8>> {
+        self.requests
+            .borrow()
+            .iter()
+            .filter(|(s, _)| *s == Setup::set_report_feature())
+            .map(|(_, p)| p.clone())
+            .collect()
+    }
+    fn gets_seen(&self) -> usize {
+        self.requests
+            .borrow()
+            .iter()
+            .filter(|(s, _)| *s == Setup::get_report_feature())
+            .count()
     }
 }
 
@@ -267,38 +345,56 @@ impl ControlIo for SimUsb {
             data.to_vec()
         };
         self.requests.borrow_mut().push((*setup, payload));
+        self.arrived.borrow_mut().push(std::time::Instant::now());
         if *setup == Setup::get_report_descriptor() {
             data[..self.descriptor.len()].copy_from_slice(&self.descriptor);
             Ok(self.descriptor.len())
         } else if *setup == Setup::set_report_feature() {
+            *self.last_set.borrow_mut() = Some(data.to_vec());
             match self.set_errno {
                 Some(e) => Err(io::Error::from_raw_os_error(e)),
                 None => Ok(data.len()),
             }
         } else {
-            let mut r = Report::new((0x10, 0x05), 0, 0);
-            r.status = 2;
-            data.copy_from_slice(&r.to_bytes());
-            Ok(data.len())
+            let scripted = self.gets.borrow_mut().pop_front();
+            let bytes = match scripted {
+                Some(Err(e)) => return Err(io::Error::from_raw_os_error(e)),
+                Some(Ok(b)) => b,
+                None => {
+                    let sent = self.last_set.borrow().clone().expect("GET before any SET");
+                    let cmd = (sent[6], sent[7]);
+                    reply_bytes(cmd, 2, if cmd == (0x10, 0x80) { 0x009F } else { 0 })
+                }
+            };
+            data[..bytes.len()].copy_from_slice(&bytes);
+            Ok(bytes.len())
         }
     }
 }
 
+const ETIMEDOUT: i32 = 110;
+
 #[test]
-fn the_usbfs_path_sends_exactly_the_three_requests() {
+fn the_usbfs_path_sends_the_query_then_the_exit_on_one_handle_and_nothing_else() {
     let g = UsbGuarded(SimUsb::new());
     g.claim_interface(usbfs::INTERFACE).unwrap();
     assert_eq!(usbfs::read_report_descriptor(&g).unwrap(), DESC.to_vec());
+    let q = hw::query_via(&g);
+    assert_eq!(gate(&q), Ok(0x009F));
     let x = hw::exit_via(&g);
-    assert_eq!(x.sent, Ok(()));
-    let status = x.status.unwrap().unwrap();
-    assert_eq!((status.command_class, status.command_id), (0x10, 0x05));
-    assert_eq!(status.status, 2);
+    assert_eq!(x.set_error(), None);
+    let status = Decoded::of(x.last_get().unwrap().reply.as_ref().unwrap()).unwrap();
+    assert_eq!((status.class, status.id, status.status), (0x10, 0x05, 2));
     assert_eq!(*g.0.claimed.borrow(), [0]);
     assert_eq!(
         *g.0.requests.borrow(),
         vec![
             (Setup::get_report_descriptor(), Vec::new()),
+            (
+                Setup::set_report_feature(),
+                golden(9, 0x10, 0x80, &[]).to_vec()
+            ),
+            (Setup::get_report_feature(), Vec::new()),
             (
                 Setup::set_report_feature(),
                 golden(0, 0x10, 0x05, &[]).to_vec()
@@ -309,17 +405,226 @@ fn the_usbfs_path_sends_exactly_the_three_requests() {
 }
 
 #[test]
+fn the_query_set_and_get_are_the_golden_setup_packets_and_payload() {
+    let g = UsbGuarded(SimUsb::new());
+    let _ = hw::query_via(&g);
+    let reqs = g.0.requests.borrow();
+    assert_eq!(reqs.len(), 2);
+    assert_eq!(
+        reqs[0].0.to_bytes(),
+        [0x21, 0x09, 0x00, 0x03, 0x00, 0x00, 0x5a, 0x00]
+    );
+    assert_eq!(
+        reqs[1].0.to_bytes(),
+        [0xA1, 0x01, 0x00, 0x03, 0x00, 0x00, 0x5a, 0x00]
+    );
+    let mut want = vec![0u8; REPORT_LEN];
+    want[5] = 0x09;
+    want[6] = 0x10;
+    want[7] = 0x80;
+    want[88] = 0x99;
+    assert_eq!(reqs[0].1, want);
+}
+
+#[test]
 fn a_failed_set_report_is_reported_with_its_errno_and_no_status_read() {
     let mut sim = SimUsb::new();
     sim.set_errno = Some(71);
     let g = UsbGuarded(sim);
     let x = hw::exit_via(&g);
-    assert_eq!(x.sent.as_ref().unwrap_err().errno, Some(71));
+    assert_eq!(x.set_error().unwrap().errno, Some(71));
     assert!(
-        x.status.is_none(),
+        x.last_get().is_none(),
         "no GET_REPORT after a failed SET_REPORT"
     );
     assert_eq!(g.0.requests.borrow().len(), 1);
+    // and the same for the query: the device may have left the bus, so nothing is re-sent
+    let mut sim = SimUsb::new();
+    sim.set_errno = Some(71);
+    let g = UsbGuarded(sim);
+    let q = hw::query_via(&g);
+    assert_eq!(q.set_error().unwrap().errno, Some(71));
+    assert_eq!(g.0.requests.borrow().len(), 1);
+    assert!(gate(&q).unwrap_err().contains("SET_REPORT failed"));
+}
+
+// --- the query's polling and re-sends (the vendor sender, DAN-1932) -----------------------------------------------------
+
+fn ok(cmd: (u8, u8), status: u8, pid: u16) -> Result<Vec<u8>, i32> {
+    Ok(reply_bytes(cmd, status, pid))
+}
+const Q: (u8, u8) = (0x10, 0x80);
+
+#[test]
+fn status_zero_and_one_are_polled_not_resent() {
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        ok(Q, 0, 0),
+        ok(Q, 1, 0),
+        ok(Q, 2, 0x009F),
+    ]));
+    let q = hw::query_via(&g);
+    assert_eq!(g.0.sets().len(), 1, "one SET");
+    assert_eq!(g.0.gets_seen(), 3);
+    assert_eq!((q.sets(), q.pairs[0].gets.len()), (1, 3));
+    assert_eq!(gate(&q), Ok(0x009F));
+}
+
+#[test]
+fn a_failed_get_and_a_reply_to_another_frame_are_polled_again() {
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        Err(ETIMEDOUT),
+        ok((0x10, 0x05), 2, 0x009F), // status 2, but for another frame
+        ok(Q, 2, 0x009E),
+    ]));
+    let q = hw::query_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen()), (1, 3));
+    assert_eq!(
+        gate(&q),
+        Ok(0x009E),
+        "009E is the second PID the vendor takes"
+    );
+}
+
+#[test]
+fn a_txn_mismatch_is_not_an_answer() {
+    let mut bad = reply_bytes(Q, 2, 0x009F);
+    bad[1] = 5;
+    let g = UsbGuarded(SimUsb::scripted(vec![Ok(bad), ok(Q, 2, 0x009F)]));
+    let q = hw::query_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen()), (1, 2));
+    assert_eq!(gate(&q), Ok(0x009F));
+}
+
+#[test]
+fn a_short_get_is_a_failed_get() {
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        Ok(reply_bytes(Q, 2, 0x009F)[..89].to_vec()),
+        ok(Q, 2, 0x009F),
+    ]));
+    let q = hw::query_via(&g);
+    assert_eq!(g.0.gets_seen(), 2);
+    assert!(q.pairs[0].gets[0].reply.is_err());
+    assert_eq!(gate(&q), Ok(0x009F));
+}
+
+#[test]
+fn any_other_status_resends_the_query_up_to_three_pairs_in_all() {
+    // 3, 4 and 5 re-send at once
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        ok(Q, 3, 0),
+        ok(Q, 4, 0),
+        ok(Q, 2, 0x009F),
+    ]));
+    let q = hw::query_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen()), (3, 3));
+    assert!(g.0.sets().iter().all(|s| *s == golden(9, 0x10, 0x80, &[])));
+    assert_eq!(gate(&q), Ok(0x009F));
+    // and never a fourth pair
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        ok(Q, 5, 0),
+        ok(Q, 5, 0),
+        ok(Q, 5, 0),
+        ok(Q, 2, 0x009F),
+    ]));
+    let q = hw::query_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen()), (3, 3));
+    assert!(gate(&q).unwrap_err().contains("status 0x05"), "{q:?}");
+}
+
+#[test]
+fn five_gets_without_an_answer_resend_the_query_and_then_stop() {
+    // the GET times out every time (the board's second run): five reads per SET, three SETs
+    let g = UsbGuarded(SimUsb::scripted(vec![Err(ETIMEDOUT); 20]));
+    let q = hw::query_via(&g);
+    assert_eq!(g.0.sets().len(), 3);
+    assert_eq!(g.0.gets_seen(), 15);
+    assert_eq!(
+        q.pairs.iter().map(|p| p.gets.len()).collect::<Vec<_>>(),
+        [5, 5, 5]
+    );
+    let why = gate(&q).unwrap_err();
+    assert!(why.contains("errno 110"), "{why}");
+}
+
+// --- the exit's re-sends -----------------------------------------------------------------------------------------------
+
+#[test]
+fn the_exit_is_resent_after_a_failed_get_up_to_three_times() {
+    let exit = golden(0, 0x10, 0x05, &[]).to_vec();
+    // the GET times out every time: three SET/GET pairs, one GET each, the same SET each time
+    let g = UsbGuarded(SimUsb::scripted(vec![Err(ETIMEDOUT); 5]));
+    let x = hw::exit_via(&g);
+    assert_eq!(g.0.sets(), vec![exit.clone(); 3]);
+    assert_eq!(g.0.gets_seen(), 3);
+    assert_eq!(x.sets(), 3);
+    assert_eq!(x.set_error(), None);
+    // accepted on the second try: two pairs
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        Err(ETIMEDOUT),
+        ok((0x10, 0x05), 2, 0),
+    ]));
+    let x = hw::exit_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen(), x.sets()), (2, 2, 2));
+    // accepted at once: one pair
+    let g = UsbGuarded(SimUsb::new());
+    let x = hw::exit_via(&g);
+    assert_eq!((g.0.sets().len(), g.0.gets_seen(), x.sets()), (1, 1, 1));
+}
+
+#[test]
+fn the_exit_is_resent_after_any_status_but_two() {
+    for status in [0u8, 1, 3, 4, 5] {
+        let g = UsbGuarded(SimUsb::scripted(vec![ok((0x10, 0x05), status, 0); 5]));
+        let x = hw::exit_via(&g);
+        assert_eq!(g.0.sets().len(), 3, "status {status}");
+        assert_eq!(g.0.gets_seen(), 3, "status {status}: one GET per SET");
+        assert_eq!(x.pairs.len(), 3);
+    }
+}
+
+#[test]
+fn a_set_that_fails_on_a_resend_ends_the_exit() {
+    // the first GET fails; the second SET is cut off (the device left the bus): no third pair, the errno is kept
+    struct CutOff(SimUsb);
+    impl ControlIo for CutOff {
+        fn claim_interface(&self, i: u8) -> io::Result<()> {
+            self.0.claim_interface(i)
+        }
+        fn control(&self, s: &Setup, d: &mut [u8]) -> io::Result<usize> {
+            if *s == Setup::set_report_feature() && self.0.sets().len() == 1 {
+                self.0.requests.borrow_mut().push((*s, d.to_vec()));
+                return Err(io::Error::from_raw_os_error(71));
+            }
+            self.0.control(s, d)
+        }
+    }
+    let g = UsbGuarded(CutOff(SimUsb::scripted(vec![Err(ETIMEDOUT)])));
+    let x = hw::exit_via(&g);
+    assert_eq!(x.pairs.len(), 2);
+    assert_eq!(x.set_error().unwrap().errno, Some(71));
+    assert!(x.pairs[1].gets.is_empty());
+}
+
+#[test]
+fn two_milliseconds_before_every_set_and_every_get_and_no_other_pause() {
+    let g = UsbGuarded(SimUsb::scripted(vec![
+        ok(Q, 1, 0),
+        ok(Q, 2, 0x009F),
+        Err(ETIMEDOUT),
+        ok((0x10, 0x05), 2, 0),
+    ]));
+    let _ = hw::query_via(&g);
+    let query_done = g.0.arrived.borrow().len();
+    let _ = hw::exit_via(&g);
+    let t = g.0.arrived.borrow().clone();
+    assert_eq!(t.len(), 3 + 4);
+    // [SET, GET, GET] [SET, GET, SET, GET]: each request comes at least 2 ms after the one before it
+    for w in t.windows(2) {
+        assert!(w[1] - w[0] >= Duration::from_millis(2), "{:?}", w[1] - w[0]);
+    }
+    // and the exit follows the query's last read without a sleep of its own: the vendor gap is the 2 ms pre-delay
+    let gap = t[query_done] - t[query_done - 1];
+    assert!(gap < Duration::from_millis(500), "gap {gap:?}");
 }
 
 fn set_report(value: u16, index: u16, length: u16) -> Setup {
@@ -543,13 +848,79 @@ fn the_usbfs_guard_stops_every_other_request_before_the_device() {
         g.0.requests.borrow().is_empty() && g.0.claimed.borrow().is_empty(),
         "something reached the device"
     );
-    // and the three that are allowed do get through
+    // and the ones that are allowed do get through: the two reads, and the SET_REPORT with the query or the exit
     assert!(usbfs::permitted(
         &Setup::get_report_descriptor(),
         &[0; 1024]
     ));
     assert!(usbfs::permitted(&Setup::set_report_feature(), &exit));
+    assert!(usbfs::permitted(
+        &Setup::set_report_feature(),
+        &golden(9, 0x10, 0x80, &[])
+    ));
     assert!(usbfs::permitted(&Setup::get_report_feature(), &[0; 90]));
+}
+
+#[test]
+fn the_usbfs_guard_refuses_every_frame_but_the_query_and_the_exit() {
+    // every (class, id) with the sizes the vendor frames use, and the two permitted ids with a changed size or argument
+    let allowed = [(0x10u8, 0x80u8, 9u8), (0x10, 0x05, 0)];
+    let mut tried = 0;
+    for class in 0..=255u8 {
+        for id in 0..=255u8 {
+            for size in [0u8, 2, 8, 9, 80] {
+                let f = Report::new((class, id), size, 0).to_bytes();
+                let want = allowed.contains(&(class, id, size));
+                assert_eq!(
+                    usbfs::permitted(&Setup::set_report_feature(), &f),
+                    want,
+                    "{class:02x}:{id:02x} size {size}"
+                );
+                tried += 1;
+            }
+        }
+    }
+    assert_eq!(tried, 256 * 256 * 5);
+    for (what, f) in [
+        ("query with an argument", {
+            let mut b = golden(9, 0x10, 0x80, &[]);
+            b[8] = 1;
+            b
+        }),
+        ("query with a bad checksum", {
+            let mut b = golden(9, 0x10, 0x80, &[]);
+            b[88] = 0;
+            b
+        }),
+        ("query with a transaction id", {
+            let mut b = golden(9, 0x10, 0x80, &[]);
+            b[1] = 0x1f;
+            b
+        }),
+        ("erase 10:01", dfu::erase_frame(0x1000, 0x2000).to_bytes()),
+        ("program 10:02", dfu::program_frame(0x1000, &[1]).to_bytes()),
+        ("verify 10:83", dfu::verify_frame(0x1000).to_bytes()),
+        ("flash 0a:00", Report::new(flash::ENTER, 0, 0).to_bytes()),
+    ] {
+        assert!(
+            !usbfs::permitted(&Setup::set_report_feature(), &f),
+            "{what}"
+        );
+    }
+    // the query is a SET_REPORT only: not under a read setup, not as another report
+    let q = golden(9, 0x10, 0x80, &[]);
+    for (what, s) in [
+        ("as report id 1", set_report(0x0301, 0, 90)),
+        ("on interface 1", set_report(0x0300, 1, 90)),
+        ("short", set_report(0x0300, 0, 89)),
+    ] {
+        let data = if s.length as usize == q.len() {
+            q.to_vec()
+        } else {
+            vec![0; s.length as usize]
+        };
+        assert!(!usbfs::permitted(&s, &data), "query {what}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -598,10 +969,52 @@ struct Sim {
     bootloader: Option<UsbDevice>,
     open: Result<String, OpenFailure>,
     descriptor: Result<Vec<u8>, SendError>,
-    exit: ExitResult,
+    query: Exchange,
+    exit: Exchange,
     bootloader_left: Option<Duration>,
     /// Seconds after the end of the step-4 call at which 1532:009F is listed again.
     back: Option<u64>,
+}
+
+/// One SET_REPORT and one GET_REPORT that returned a 90-byte reply.
+fn exchange_ok(cmd: (u8, u8), status: u8, pid: u16) -> Exchange {
+    Exchange {
+        pairs: vec![Pair {
+            set_at: at(0),
+            set: Ok(()),
+            gets: vec![Get {
+                at: at(0),
+                reply: Ok(reply_bytes(cmd, status, pid)),
+            }],
+        }],
+    }
+}
+
+/// A SET_REPORT that went out and GET_REPORTs that all failed with `errno`.
+fn exchange_get_failed(gets: usize, n: i32) -> Exchange {
+    Exchange {
+        pairs: vec![Pair {
+            set_at: at(0),
+            set: Ok(()),
+            gets: (0..gets)
+                .map(|_| Get {
+                    at: at(0),
+                    reply: Err(errno(n)),
+                })
+                .collect(),
+        }],
+    }
+}
+
+/// A SET_REPORT that failed with `errno`: nothing was read.
+fn exchange_set_failed(n: i32) -> Exchange {
+    Exchange {
+        pairs: vec![Pair {
+            set_at: at(0),
+            set: Err(errno(n)),
+            gets: Vec::new(),
+        }],
+    }
 }
 
 fn reply(cmd: (u8, u8), status: u8) -> Report {
@@ -623,10 +1036,8 @@ impl Sim {
             bootloader: Some(bootloader_device(Interface0::Unbound)),
             open: Ok("/dev/bus/usb/008/005".into()),
             descriptor: Ok(DESC.to_vec()),
-            exit: ExitResult {
-                sent: Ok(()),
-                status: Some(Ok(reply((0x10, 0x05), 2))),
-            },
+            query: exchange_ok(Q, 2, 0x009F),
+            exit: exchange_ok((0x10, 0x05), 2, 0),
             bootloader_left: Some(Duration::from_millis(200)),
             back: Some(2),
         }
@@ -664,6 +1075,7 @@ impl ProbeIo for Sim {
             Some(device) => BootloaderWait {
                 device: Some(device),
                 appeared_at: Some(at(self.clock)),
+                settled_at: Some(at(self.clock + 1)),
             },
             None => BootloaderWait::default(),
         }
@@ -677,7 +1089,11 @@ impl ProbeIo for Sim {
         self.tick("read_report_descriptor");
         self.descriptor.clone()
     }
-    fn exit_bootloader(&mut self) -> ExitResult {
+    fn query_bootloader(&mut self) -> Exchange {
+        self.tick("query_bootloader");
+        self.query.clone()
+    }
+    fn exit_bootloader(&mut self) -> Exchange {
         self.tick("exit_bootloader");
         self.exit.clone()
     }
@@ -712,12 +1128,13 @@ fn run(sim: &mut Sim) -> (ProbeLog, usize) {
     (log, checkpoints)
 }
 
-const HAPPY_CALLS: [&str; 7] = [
+const HAPPY_CALLS: [&str; 8] = [
     "read_version",
     "enter_bootloader",
     "wait_for_bootloader",
     "open_usbfs",
     "read_report_descriptor",
+    "query_bootloader",
     "exit_bootloader",
     "wait_for_return",
 ];
@@ -732,7 +1149,7 @@ fn a_full_run_goes_through_the_steps_in_order() {
     assert_eq!(log.version_read.as_deref(), Some("1.04.00"));
     assert_eq!(log.bootloader.as_ref().unwrap().name, "8-3");
     assert_eq!(log.report_descriptor, Some(Ok(DESC.to_vec())));
-    assert_eq!(log.returned_at, Some(at(9)));
+    assert_eq!(log.returned_at, Some(at(10)));
     // one checkpoint at the start, one after each step's first half, and the final one
     assert!(checkpoints >= 7, "{checkpoints}");
 }
@@ -763,12 +1180,17 @@ fn the_report_is_self_explanatory() {
         "3b. usbfs: open the node, read the report descriptor",
         "usbfs (step 3b): opened /dev/bus/usb/008/005 as the current user, root was not needed, interface 0 claimed",
         "GET_DESCRIPTOR 81 06 00 22 00 00 00 04 (12 bytes): 06 00 ff 09 01 a1 01 95 5a b1 02 c0",
-        "3c. exit bootloader (10:05)",
+        "3c. query the bootloader (10:80)",
+        "gate: OPEN. The reply is status 2, txn 0, class/id 10:80 and PID 009f, so 10:05 was sent next",
+        "query 10:80, SET_REPORT 21 09 00 03 00 00 5a 00: accepted (attempt 1 of up to 3",
+        "decoded: status 0x02 txn 0x00 class/id 10:80 PID 009f",
+        "settled 1.00 s after it was first seen",
+        "3d. exit bootloader (10:05)",
         "exit 10:05, SET_REPORT 21 09 00 03 00 00 5a 00: accepted",
         "GET_REPORT a1 01 00 03 00 00 5a 00: command 10:05 status byte 0x02",
         "4. wait for 1532:009F",
         "1532:009F listed again 4.00 s after the 10:05 send",
-        "1532:009F after 10:05: came back 4.00 s after the 10:05 send, 8.00 s after the enter-bootloader send (step 2), 6.00 s after 1532:110E appeared (step 3); back at 2026-10-1",
+        "1532:009F after 10:05: came back 4.00 s after the 10:05 send, 9.00 s after the enter-bootloader send (step 2), 7.00 s after 1532:110E appeared (step 3); back at 2026-10-1",
         "Razer USB devices at the end of step 4 (1)",
         "1532:009f 8-3 bus 8 device 6 bcdDevice 0101",
     ] {
@@ -802,6 +1224,7 @@ fn an_eproto_on_the_enter_send_with_the_dongle_leaving_counts_as_entered_and_goe
             "wait_for_bootloader",
             "open_usbfs",
             "read_report_descriptor",
+            "query_bootloader",
             "exit_bootloader",
             "wait_for_return"
         ]
@@ -1023,15 +1446,398 @@ fn a_report_descriptor_that_cannot_be_read_is_recorded_and_the_exit_still_goes()
     );
 }
 
-// --- step 3c: exit ----------------------------------------------------------------------------------------------------
+// --- step 3c / 3d: the 10:80 query and the gate in front of 10:05 (DAN-1935) -------------------------------------------
+
+fn pos(calls: &[&str], what: &str) -> usize {
+    calls
+        .iter()
+        .position(|c| *c == what)
+        .unwrap_or_else(|| panic!("`{what}` was never called: {calls:?}"))
+}
+
+#[test]
+fn the_query_is_sent_before_the_exit_with_nothing_between_them() {
+    let mut sim = Sim::happy();
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+    assert_eq!(
+        pos(&sim.calls, "query_bootloader") + 1,
+        pos(&sim.calls, "exit_bootloader"),
+        "no call between the 10:80 round trip and 10:05: {:?}",
+        sim.calls
+    );
+    assert!(pos(&sim.calls, "read_report_descriptor") < pos(&sim.calls, "query_bootloader"));
+    assert_eq!(log.gate, Some(Ok(0x009F)));
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+}
+
+#[test]
+fn outcome_a_the_query_get_times_out_and_no_exit_is_sent() {
+    // the board's second run, if the 10:80 GET fails as the 10:05 GET did: five reads, none answered
+    let mut sim = Sim::happy();
+    sim.query = exchange_get_failed(5, ETIMEDOUT);
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls.last(),
+        Some(&"query_bootloader"),
+        "{:?}",
+        sim.calls
+    );
+    assert!(!sim.calls.contains(&"exit_bootloader"));
+    assert!(!sim.calls.contains(&"wait_for_return"));
+    assert!(log.exit.is_none() && log.exit_sent_at.is_none());
+    assert!(matches!(log.outcome, Some(Outcome::NoExit(_))));
+    assert!(log.outcome.as_ref().unwrap().needs_replug());
+    assert!(!log.outcome.as_ref().unwrap().is_success());
+    let text = log.render();
+    assert!(text.contains("STOPPED at step 3c (10:80 query)"), "{text}");
+    assert!(text.contains("errno 110"), "{text}");
+    assert!(text.contains("gate: CLOSED"), "{text}");
+    assert!(text.contains("10:05 was NOT sent"), "{text}");
+    assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
+    assert!(!text.contains("exit 10:05"), "no exit lines: {text}");
+    // everything learnt is in the file: the frame, the attempt and the failed read
+    assert!(text.contains("query 10:80 (step 3c)"), "{text}");
+    assert!(
+        text.contains(
+            "query 10:80, SET_REPORT 21 09 00 03 00 00 5a 00: accepted (attempt 1 of up to 3"
+        ),
+        "{text}"
+    );
+    assert!(
+        text.contains("status read, GET_REPORT a1 01 00 03 00 00 5a 00: errno 110"),
+        "{text}"
+    );
+}
+
+#[test]
+fn outcome_b_status_2_pid_009f_then_009f_returns() {
+    let mut sim = Sim::happy();
+    sim.query = exchange_ok(Q, 2, 0x009F);
+    sim.back = Some(3);
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    assert!(!log.outcome.as_ref().unwrap().needs_replug());
+    let text = log.render();
+    assert!(
+        text.contains("gate: OPEN. The reply is status 2, txn 0, class/id 10:80 and PID 009f, so 10:05 was sent next"),
+        "{text}"
+    );
+    assert!(text.contains("exit 10:05, SET_REPORT"), "{text}");
+    assert!(text.contains("1532:009F after 10:05: came back"), "{text}");
+    assert!(!text.contains("NEXT"), "{text}");
+}
+
+#[test]
+fn outcome_c_status_2_pid_009f_and_009f_never_returns() {
+    let mut sim = Sim::happy();
+    sim.back = None;
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls, HAPPY_CALLS,
+        "the exit was sent after the open gate"
+    );
+    assert_eq!(log.outcome, Some(Outcome::DidNotReturn));
+    assert!(log.outcome.as_ref().unwrap().needs_replug());
+    let text = log.render();
+    assert!(text.contains("STEP 4 TIMED OUT"), "{text}");
+    assert!(text.contains("so it must be replugged"), "{text}");
+    assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
+    // the query, the gate, the exit and the 30 s wait are all in the file
+    for needle in [
+        "gate: OPEN",
+        "exit 10:05, SET_REPORT",
+        "did not come back within 30 s",
+    ] {
+        assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
+    }
+    assert!(!text.contains("by itself"), "{text}");
+}
+
+#[test]
+fn outcome_d_a_pid_other_than_009f_or_009e_sends_no_exit() {
+    for pid in [0x110Eu16, 0x0000, 0x009D, 0x00A0, 0x9F00, 0x009F | 0x0100] {
+        let mut sim = Sim::happy();
+        sim.query = exchange_ok(Q, 2, pid);
+        let (log, _) = run(&mut sim);
+        assert_eq!(
+            sim.calls.last(),
+            Some(&"query_bootloader"),
+            "pid {pid:04x}: {:?}",
+            sim.calls
+        );
+        assert!(!sim.calls.contains(&"exit_bootloader"), "pid {pid:04x}");
+        assert!(
+            matches!(log.outcome, Some(Outcome::NoExit(_))),
+            "pid {pid:04x}"
+        );
+        assert!(log.outcome.as_ref().unwrap().needs_replug());
+        assert!(log.exit.is_none());
+        let text = log.render();
+        assert!(
+            text.contains(&format!(
+                "the 10:80 reply names PID {pid:04x}, not 009f or 009e"
+            )),
+            "{text}"
+        );
+        assert!(text.contains("10:05 was NOT sent"), "{text}");
+        assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
+    }
+}
+
+#[test]
+fn pid_009e_is_the_second_pid_the_gate_accepts() {
+    let mut sim = Sim::happy();
+    sim.query = exchange_ok(Q, 2, 0x009E);
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+    assert_eq!(log.gate, Some(Ok(0x009E)));
+}
+
+#[test]
+fn a_failed_query_set_or_no_reads_at_all_send_no_exit() {
+    for (what, query) in [
+        ("SET failed", exchange_set_failed(71)),
+        ("no pairs", Exchange::default()),
+        (
+            "SET ok, no GET tried",
+            Exchange {
+                pairs: vec![Pair {
+                    set_at: at(0),
+                    set: Ok(()),
+                    gets: Vec::new(),
+                }],
+            },
+        ),
+    ] {
+        let mut sim = Sim::happy();
+        sim.query = query;
+        let (log, _) = run(&mut sim);
+        assert!(!sim.calls.contains(&"exit_bootloader"), "{what}");
+        assert!(matches!(log.outcome, Some(Outcome::NoExit(_))), "{what}");
+        assert!(log.render().contains("10:05 was NOT sent"), "{what}");
+    }
+}
+
+#[test]
+fn the_gate_wants_status_2_txn_0_class_id_10_80_and_a_good_pid_in_the_last_reply() {
+    let one = |raw: Vec<u8>| Exchange {
+        pairs: vec![Pair {
+            set_at: at(0),
+            set: Ok(()),
+            gets: vec![Get {
+                at: at(0),
+                reply: Ok(raw),
+            }],
+        }],
+    };
+    assert_eq!(gate(&one(reply_bytes(Q, 2, 0x009F))), Ok(0x009F));
+    for status in [0u8, 1, 3, 4, 5, 0x7f] {
+        let e = gate(&one(reply_bytes(Q, status, 0x009F))).unwrap_err();
+        assert!(e.contains("status"), "status {status}: {e}");
+    }
+    let e = gate(&one(reply_bytes((0x10, 0x05), 2, 0x009F))).unwrap_err();
+    assert!(e.contains("class/id 10:05"), "{e}");
+    let e = gate(&one(reply_bytes((0x00, 0x80), 2, 0x009F))).unwrap_err();
+    assert!(e.contains("class/id 00:80"), "{e}");
+    let mut t = reply_bytes(Q, 2, 0x009F);
+    t[1] = 1;
+    assert!(gate(&one(t)).unwrap_err().contains("txn 0x01"));
+    let e = gate(&one(reply_bytes(Q, 2, 0x009F)[..89].to_vec())).unwrap_err();
+    assert!(e.contains("89 bytes"), "{e}");
+    // the PID bytes are [15] (high) and [16] (low): [14] and [17] do not count
+    let mut p = reply_bytes(Q, 2, 0x009F);
+    p[14] = 0x11;
+    p[17] = 0x0E;
+    assert_eq!(gate(&one(p)), Ok(0x009F));
+    // the last reply decides: an earlier status 3 followed by a good answer opens it, and the reverse does not
+    let mut two = one(reply_bytes(Q, 3, 0));
+    two.pairs.extend(one(reply_bytes(Q, 2, 0x009F)).pairs);
+    assert_eq!(gate(&two), Ok(0x009F));
+    let mut two = one(reply_bytes(Q, 2, 0x009F));
+    two.pairs.extend(one(reply_bytes(Q, 3, 0)).pairs);
+    assert!(gate(&two).is_err());
+}
+
+#[test]
+fn every_attempt_and_every_reply_byte_is_in_the_report() {
+    let mut sim = Sim::happy();
+    let first = reply_bytes(Q, 3, 0);
+    let second = reply_bytes(Q, 2, 0x009F);
+    sim.query = Exchange {
+        pairs: vec![
+            Pair {
+                set_at: at(1),
+                set: Ok(()),
+                gets: vec![Get {
+                    at: at(1),
+                    reply: Ok(first.clone()),
+                }],
+            },
+            Pair {
+                set_at: at(2),
+                set: Ok(()),
+                gets: vec![
+                    Get {
+                        at: at(2),
+                        reply: Err(errno(110)),
+                    },
+                    Get {
+                        at: at(2),
+                        reply: Ok(second.clone()),
+                    },
+                ],
+            },
+        ],
+    };
+    sim.exit = Exchange {
+        pairs: vec![
+            Pair {
+                set_at: at(3),
+                set: Ok(()),
+                gets: vec![Get {
+                    at: at(3),
+                    reply: Err(errno(110)),
+                }],
+            },
+            Pair {
+                set_at: at(4),
+                set: Ok(()),
+                gets: vec![Get {
+                    at: at(4),
+                    reply: Ok(reply_bytes((0x10, 0x05), 2, 0)),
+                }],
+            },
+        ],
+    };
+    let (log, _) = run(&mut sim);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    let text = log.render();
+    let hex = |b: &[u8]| {
+        b.iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    for needle in [
+        "query 10:80 (step 3c), sent",
+        "payload (90 bytes) 00 00 00 00 00 09 10 80 00",
+        "query 10:80, SET_REPORT 21 09 00 03 00 00 5a 00: accepted (attempt 1 of up to 3",
+        "query 10:80, SET_REPORT 21 09 00 03 00 00 5a 00: accepted (attempt 2 of up to 3",
+        "(read 1 of attempt 1,",
+        "(read 2 of attempt 2,",
+        "decoded: status 0x03 txn 0x00 class/id 10:80 PID 0000",
+        "decoded: status 0x02 txn 0x00 class/id 10:80 PID 009f",
+        "exit 10:05 (step 3d), sent",
+        "exit 10:05, SET_REPORT 21 09 00 03 00 00 5a 00: accepted (attempt 2 of up to 3",
+        "2 SET_REPORT(s) of up to 3, 3 GET_REPORT(s)",
+        "2 SET_REPORTs of up to 3; the last: SET_REPORT accepted; GET_REPORT answered",
+    ] {
+        assert!(text.contains(needle), "missing `{needle}` in:\n{text}");
+    }
+    // all 90 bytes of each reply, not a summary
+    assert!(
+        text.contains(&format!("reply (90 bytes): {}", hex(&first))),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("reply (90 bytes): {}", hex(&second))),
+        "{text}"
+    );
+    assert_eq!(hex(&second).split(' ').count(), 90);
+    // order: query lines, then the gate, then the exit lines, then step 4
+    let at = |n: &str| text.find(n).unwrap_or_else(|| panic!("`{n}` missing"));
+    assert!(at("query 10:80 (step 3c)") < at("gate: OPEN"));
+    assert!(at("gate: OPEN") < at("exit 10:05 (step 3d)"));
+    assert!(at("exit 10:05 (step 3d)") < at("1532:009F after 10:05"));
+}
+
+// --- the 1000 ms settle -------------------------------------------------------------------------------------------------
+
+#[test]
+fn the_probe_waits_at_least_1000_ms_after_the_bootloader_appears_before_it_returns() {
+    // the device is already listed, so the poll finds it at once: everything after that is the settle. The vendor sleeps
+    // 1000 ms there (probe v2 waited 500 ms)
+    let (base, roots) = fixture_roots("settle1000");
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x009f,
+        "RAZER BOOTLOADER",
+        (8, 5),
+        Some(None),
+    );
+    let mut p = fixture_probe(roots);
+    let start = std::time::Instant::now();
+    let w = p.wait_for_bootloader(Duration::from_secs(5));
+    let took = start.elapsed();
+    assert!(w.device.is_some());
+    assert!(
+        took >= Duration::from_millis(1000),
+        "returned after {took:?}: usbfs would be opened before the vendor's 1000 ms"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn the_settle_timestamp_is_recorded_and_is_at_least_1000_ms_after_it_appeared() {
+    let (base, roots) = fixture_roots("settlestamp");
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x009f,
+        "RAZER BOOTLOADER",
+        (8, 5),
+        Some(None),
+    );
+    let mut p = fixture_probe(roots);
+    let w = p.wait_for_bootloader(Duration::from_secs(5));
+    let (seen, settled) = (w.appeared_at.unwrap(), w.settled_at.unwrap());
+    assert!(
+        settled.duration_since(seen).unwrap() >= Duration::from_millis(1000),
+        "{:?}",
+        settled.duration_since(seen)
+    );
+    assert!(hw::SETTLE >= Duration::from_millis(1000));
+    // the device is read after the settle, not before
+    assert!(w.device.unwrap().seen_at >= settled);
+    // a timeout has no settle time
+    let (base2, roots2) = fixture_roots("settlenone");
+    let mut p2 = fixture_probe(roots2);
+    assert_eq!(
+        p2.wait_for_bootloader(Duration::from_millis(200))
+            .settled_at,
+        None
+    );
+    let _ = std::fs::remove_dir_all(base);
+    let _ = std::fs::remove_dir_all(base2);
+}
+
+#[test]
+fn the_report_says_when_the_settle_ended() {
+    let mut sim = Sim::happy();
+    let (log, _) = run(&mut sim);
+    let text = log.render();
+    assert!(
+        text.contains("settled 1.00 s after it was first seen, at 2026-10-1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("; settled 1.00 s later, at 2026-10-1"),
+        "{text}"
+    );
+    assert!(log.settled_at.is_some());
+}
+
+// --- step 3d: exit ----------------------------------------------------------------------------------------------------
 
 #[test]
 fn a_disconnect_during_the_exit_is_the_expected_shape_and_the_run_goes_on() {
     let mut sim = Sim::happy();
-    sim.exit = ExitResult {
-        sent: Err(errno(71)),
-        status: None,
-    };
+    sim.exit = exchange_set_failed(71);
     let (log, _) = run(&mut sim);
     assert_eq!(
         sim.calls,
@@ -1041,6 +1847,7 @@ fn a_disconnect_during_the_exit_is_the_expected_shape_and_the_run_goes_on() {
             "wait_for_bootloader",
             "open_usbfs",
             "read_report_descriptor",
+            "query_bootloader",
             "exit_bootloader",
             "wait_for_bootloader_gone",
             "wait_for_return"
@@ -1061,20 +1868,17 @@ fn a_disconnect_during_the_exit_is_the_expected_shape_and_the_run_goes_on() {
 #[test]
 fn a_status_read_that_fails_after_an_accepted_exit_is_recorded_not_fatal() {
     let mut sim = Sim::happy();
-    sim.exit = ExitResult {
-        sent: Ok(()),
-        status: Some(Err("No such device (os error 19)".into())),
-    };
+    sim.exit = exchange_get_failed(1, 19);
     let (log, _) = run(&mut sim);
     assert_eq!(log.outcome, Some(Outcome::Completed));
     assert!(!sim.calls.contains(&"wait_for_bootloader_gone"));
     let text = log.render();
     assert!(
-        text.contains("GET_REPORT read nothing (No such device"),
+        text.contains("GET_REPORT read nothing (errno 19 (No such device"),
         "{text}"
     );
     assert!(
-        text.contains("GET_REPORT a1 01 00 03 00 00 5a 00: No such device"),
+        text.contains("GET_REPORT a1 01 00 03 00 00 5a 00: errno 19 (No such device"),
         "{text}"
     );
 }
@@ -1082,10 +1886,7 @@ fn a_status_read_that_fails_after_an_accepted_exit_is_recorded_not_fatal() {
 #[test]
 fn an_exit_that_failed_with_the_bootloader_still_there_stops_and_says_replug() {
     let mut sim = Sim::happy();
-    sim.exit = ExitResult {
-        sent: Err(errno(32)),
-        status: None,
-    };
+    sim.exit = exchange_set_failed(32);
     sim.bootloader_left = None;
     let (log, _) = run(&mut sim);
     assert_eq!(
@@ -1096,7 +1897,7 @@ fn an_exit_that_failed_with_the_bootloader_still_there_stops_and_says_replug() {
     assert!(matches!(log.outcome, Some(Outcome::ExitFailed(_))));
     assert!(log.outcome.as_ref().unwrap().needs_replug());
     let text = log.render();
-    assert!(text.contains("STOPPED at step 3c"), "{text}");
+    assert!(text.contains("STOPPED at step 3d"), "{text}");
     assert!(text.contains("errno 32"), "{text}");
     assert!(text.contains("1532:110E is still on the bus"), "{text}");
     assert!(text.contains("NEXT    Unplug the dongle"), "{text}");
@@ -1135,7 +1936,7 @@ fn the_return_is_timed_from_the_exit_and_from_the_entry() {
     let (log, _) = run(&mut sim);
     let text = log.render();
     assert!(
-        text.contains("came back 22.00 s after the 10:05 send, 26.00 s after the enter-bootloader send (step 2), 24.00 s after 1532:110E appeared"),
+        text.contains("came back 22.00 s after the 10:05 send, 27.00 s after the enter-bootloader send (step 2), 25.00 s after 1532:110E appeared"),
         "{text}"
     );
 }
@@ -1193,6 +1994,12 @@ fn ids_and_timeouts_are_the_ones_the_plan_names() {
     assert_eq!(probe::LEAVE_TIMEOUT, Duration::from_secs(3));
     // the wait for the return starts after the exit send; nothing shows the bootloader leaves by itself, so it is short
     assert_eq!(probe::RETURN_TIMEOUT, Duration::from_secs(30));
+    // the vendor sender's retry counts (DAN-1932): 3 sends of the query with 5 reads each, 3 sends of the exit with 1 read
+    assert_eq!(
+        (probe::QUERY_PAIRS, probe::QUERY_GETS, probe::EXIT_PAIRS),
+        (3, 5, 3)
+    );
+    assert_eq!(probe::QUERY_PIDS, [0x009F, 0x009E]);
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
@@ -1525,8 +2332,9 @@ fn a_missing_usbfs_node_is_an_open_failure_with_its_errno() {
     assert_eq!(f.errno, Some(2));
     assert!(f.node.ends_with("008/005"), "{f}");
     // nothing was opened, so nothing can be sent
-    let x = p.exit_bootloader();
-    assert!(x.sent.is_err() && x.status.is_none());
+    for x in [p.query_bootloader(), p.exit_bootloader()] {
+        assert!(x.set_error().is_some() && x.last_get().is_none());
+    }
     assert!(p.read_report_descriptor().is_err());
     let _ = std::fs::remove_dir_all(base);
 }
@@ -1563,11 +2371,12 @@ fn a_node_that_opens_but_cannot_be_claimed_is_an_open_failure_and_is_not_kept() 
     let mut p = fixture_probe(roots);
     let f = p.open_usbfs(&fixture_bootloader()).unwrap_err();
     assert_eq!(f.errno, Some(25), "{f}");
-    let x = p.exit_bootloader();
-    assert!(
-        x.sent.unwrap_err().message.contains("never opened"),
-        "an interface that could not be claimed must not be used"
-    );
+    for x in [p.query_bootloader(), p.exit_bootloader()] {
+        assert!(
+            x.set_error().unwrap().message.contains("never opened"),
+            "an interface that could not be claimed must not be used"
+        );
+    }
     let _ = std::fs::remove_dir_all(base);
 }
 
@@ -1813,7 +2622,10 @@ fn without_the_flag_it_prints_the_plan_and_exits_non_zero() {
         "1. read its version (00:87)",
         "2. send enter-bootloader (00:04, mode 1)",
         "3. wait up to 10 s",
-        "3c. send exit (10:05)",
+        "3b. after letting it settle for at least 1000 ms",
+        "3c. send the query Razer's updater sends first (10:80)",
+        "3d. only if the reply has status 2 and PID 009F or 009E: send exit (10:05) straight away",
+        "00:87, 00:04, 10:80 and 10:05",
         "4. wait up to 30 s",
         "never erases or writes firmware",
         "Nothing was sent",
@@ -1974,7 +2786,7 @@ fn fence_probe_cannot_name_the_dfu_code_or_a_destructive_command() {
 }
 
 #[test]
-fn fence_only_three_frames_are_constructed_and_only_in_the_probe_root() {
+fn fence_only_four_frames_are_constructed_and_only_in_the_probe_root() {
     let files = src_files();
     let mut news = Vec::new();
     for (name, src) in files.iter().filter(|(n, _)| n.starts_with("src/probe/")) {
@@ -1989,9 +2801,10 @@ fn fence_only_three_frames_are_constructed_and_only_in_the_probe_root() {
         [
             "src/probe/mod.rs: Report::new(READ_VERSION, 8, TID)",
             "src/probe/mod.rs: Report::new(ENTER_MODE, 2, TID).with_args(&[1, 0])",
+            "src/probe/mod.rs: Report::new(QUERY, 9, TID)",
             "src/probe/mod.rs: Report::new(EXIT, 0, TID)",
         ],
-        "a probe module builds a frame other than the three"
+        "a probe module builds a frame other than the four"
     );
 }
 

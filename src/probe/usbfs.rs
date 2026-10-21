@@ -2,20 +2,21 @@
 //! (`/dev/bus/usb/BBB/DDD`). The bootloader (`1532:110E`) has no interrupt endpoint, so the kernel makes no hidraw node
 //! for it and the hidraw transport cannot reach it. HID feature reports are plain control requests, which usbfs can send.
 //!
-//! **It can send three requests and nothing else.** The fence, in the same three layers as `hw.rs`:
+//! **It can send three requests and nothing else**: the report descriptor read, the feature SET_REPORT (which may carry
+//! the `10:80` query or the `10:05` exit, byte for byte) and its GET_REPORT. The fence, in the same three layers as `hw.rs`:
 //!
 //! 1. The only ioctls in this file are [`USBDEVFS_CONTROL`] and [`USBDEVFS_CLAIMINTERFACE`], both issued from the single
 //!    private [`Usbfs::ioctl`]. No reset, no set-configuration, no driver disconnect or detach, no bulk or interrupt
 //!    transfer exists here. `tests/probe.rs` reads this file for exactly that.
 //! 2. [`Usbfs`] cannot be built except as the inside of a [`UsbGuarded`] (see [`Usbfs::open`]), and the guard refuses,
 //!    before the ioctl, every control request that is not in [`permitted`]: matched on (bmRequestType, bRequest, wValue,
-//!    wIndex) and wLength, and for the one that writes, on the payload being the `10:05` exit frame byte for byte.
+//!    wIndex) and wLength, and for the one that writes, on the payload being the `10:80` query frame or the `10:05` exit frame byte for byte.
 //!    Interface claims are limited to interface 0.
 //! 3. Nothing here names the phase-1 DFU module, its trait or the erase/program/class `0x0A` commands, and no DFU trait is
 //!    implemented for the usbfs types. The fence tests read the source for all of it.
 
-use super::exit_frame;
-use crate::protocol::{Report, REPORT_LEN};
+use super::{exit_frame, query_frame};
+use crate::protocol::REPORT_LEN;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::io::AsRawFd;
@@ -101,7 +102,8 @@ impl Setup {
 }
 
 /// The whole allow-list. A request is permitted when (bmRequestType, bRequest, wValue, wIndex) and wLength are one of
-/// the three below, and, for the one that writes, `data` is the `10:05` exit frame byte for byte. For the two reads
+/// the three below, and, for the one that writes, `data` is the `10:80` query frame or the `10:05` exit frame byte for
+/// byte (no other frame, so no `10:01` erase, no `10:02` program, no class `0x0A` frame and no other class `0x10` frame). For the two reads
 /// `data` is only the buffer the answer lands in.
 pub fn permitted(setup: &Setup, data: &[u8]) -> bool {
     let key = (
@@ -118,7 +120,8 @@ pub fn permitted(setup: &Setup, data: &[u8]) -> bool {
     if key == k(Setup::get_report_descriptor()) || key == k(Setup::get_report_feature()) {
         return true;
     }
-    key == k(Setup::set_report_feature()) && data == exit_frame().to_bytes()
+    key == k(Setup::set_report_feature())
+        && (data == query_frame().to_bytes() || data == exit_frame().to_bytes())
 }
 
 /// A device handle that can carry control requests and claim an interface. The real one is [`Usbfs`]; the tests put a
@@ -130,7 +133,7 @@ pub trait ControlIo {
     fn control(&self, setup: &Setup, data: &mut [u8]) -> io::Result<usize>;
 }
 
-/// A control channel that can only carry the three requests of [`permitted`].
+/// A control channel that can only carry the requests of [`permitted`].
 pub struct UsbGuarded<T: ControlIo>(pub T);
 
 impl<T: ControlIo> ControlIo for UsbGuarded<T> {
@@ -147,7 +150,7 @@ impl<T: ControlIo> ControlIo for UsbGuarded<T> {
         if !permitted(setup, data) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "refused: the bootloader probe may only read the HID report descriptor, send 10:05 as a feature SET_REPORT and read its GET_REPORT",
+                "refused: the bootloader probe may only read the HID report descriptor, send 10:80 or 10:05 as a feature SET_REPORT and read its GET_REPORT",
             ));
         }
         self.0.control(setup, data)
@@ -162,6 +165,13 @@ pub fn read_report_descriptor<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<Ve
     Ok(buf)
 }
 
+/// Send the query frame (`10:80`) as a feature SET_REPORT.
+pub fn send_query<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<()> {
+    let mut payload = query_frame().to_bytes();
+    io.control(&Setup::set_report_feature(), &mut payload)
+        .map(|_| ())
+}
+
 /// Send the exit frame (`10:05`) as a feature SET_REPORT.
 pub fn send_exit<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<()> {
     let mut payload = exit_frame().to_bytes();
@@ -169,11 +179,17 @@ pub fn send_exit<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<()> {
         .map(|_| ())
 }
 
-/// Read the 90-byte feature report that answers the last SET_REPORT.
-pub fn read_status<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<Report> {
+/// Read the feature report that answers the last SET_REPORT, as the 90 bytes the device returned. A reply of any other
+/// length is an error: nothing downstream reads fields out of a short buffer.
+pub fn read_reply<T: ControlIo>(io: &UsbGuarded<T>) -> io::Result<Vec<u8>> {
     let mut buf = [0u8; REPORT_LEN];
     let n = io.control(&Setup::get_report_feature(), &mut buf)?;
-    Report::parse(&buf[..n]).map_err(io::Error::other)
+    if n != REPORT_LEN {
+        return Err(io::Error::other(format!(
+            "the GET_REPORT returned {n} bytes, not {REPORT_LEN}"
+        )));
+    }
+    Ok(buf.to_vec())
 }
 
 // _IOC(dir, 'U', nr, size) from <linux/usbdevice_fs.h>

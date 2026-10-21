@@ -1,21 +1,25 @@
-//! `razerctl firmware probe-bootloader` (DAN-1908 phase 2, DAN-1929 phase 2b of DAN-1878): put the dongle into its
-//! bootloader, look at how the bootloader shows up on Linux, and take it out again. **It never erases and never writes**:
-//! the only frames this module can emit are the three below, and everything else is refused structurally.
+//! `razerctl firmware probe-bootloader` (DAN-1908 phase 2, DAN-1929 phase 2b, DAN-1935 phase 2d of DAN-1878): put the
+//! dongle into its bootloader, look at how the bootloader shows up on Linux, ask it the one question Razer's updater asks
+//! (`10:80`), and, only if the answer is the expected one, take it out again. **It never erases and never writes**: the
+//! only frames this module can emit are the four below, and everything else is refused structurally.
 //!
 //! * [`read_version_frame`] `00:87` and [`enter_frame`] `00:04` mode 1 go out through hidraw (`hw.rs`): [`permitted`]
 //!   accepts exactly these two byte-for-byte, and [`hw::Guarded`] refuses anything else before it reaches the kernel.
-//! * [`exit_frame`] `10:05` goes out through usbfs (`usbfs.rs`), because the bootloader (`1532:110E`) has no interrupt
-//!   endpoint and the kernel makes no hidraw node for it. [`usbfs::permitted`] accepts exactly three control requests: the
-//!   HID report descriptor read, the `10:05` feature SET_REPORT and its GET_REPORT. [`usbfs::UsbGuarded`] refuses
-//!   anything else before the ioctl.
+//! * [`query_frame`] `10:80` and [`exit_frame`] `10:05` go out through usbfs (`usbfs.rs`), because the bootloader
+//!   (`1532:110E`) has no interrupt endpoint and the kernel makes no hidraw node for it. [`usbfs::permitted`] accepts
+//!   exactly three control requests: the HID report descriptor read, the feature SET_REPORT (carrying `10:80` or `10:05`,
+//!   byte for byte) and its GET_REPORT. [`usbfs::UsbGuarded`] refuses anything else before the ioctl, so `10:01` (erase),
+//!   `10:02` (program), a class `0x0A` frame and every other class `0x10` frame cannot get out.
+//! * `10:05` goes out only after a `10:80` reply with status 2 and a PID of `009F` or `009E` ([`gate`]); [`run`] sends
+//!   nothing after any other reply.
 //! * The DFU trait of phase 1 (`firmware::dfu::Transport`: erase, program, verify) is not implemented by anything in
 //!   here, and nothing in `probe` names `firmware::dfu`, `firmware::flash` or the erase/program/class `0x0A` commands.
 //!   `cargo test` fails (`tests/probe.rs`) if a real-transport module could reach them.
 //! * The orchestration ([`run`]) is written against [`ProbeIo`]; the tests drive it with a simulated device only.
 //!
-//! Layout: `mod.rs` (frames, [`ProbeIo`], [`run`], the refusal rules), `report.rs` (the file the board pastes onto
-//! DAN-1878), `sysfs.rs` (read-only look at `/sys/bus/usb/devices`), `usbfs.rs` (the control-transfer transport and its
-//! allow-list), `hw.rs` (the real [`ProbeIo`]), `cli.rs` (argument handling, refusals, output file).
+//! Layout: `mod.rs` (frames, [`ProbeIo`], [`run`], the gate, the refusal rules), `report.rs` (the file the board pastes
+//! onto DAN-1878), `sysfs.rs` (read-only look at `/sys/bus/usb/devices`), `usbfs.rs` (the control-transfer transport and
+//! its allow-list), `hw.rs` (the real [`ProbeIo`]), `cli.rs` (argument handling, refusals, output file).
 
 pub mod cli;
 pub mod hw;
@@ -25,13 +29,15 @@ pub mod usbfs;
 
 use crate::protocol::{Report, Status, REPORT_LEN};
 use report::{
-    BootloaderWait, ExitResult, OpenFailure, Outcome, ProbeLog, ReturnWait, SendError, Step,
+    BootloaderWait, Exchange, OpenFailure, Outcome, ProbeLog, ReturnWait, SendError, Step,
 };
 use std::time::{Duration, SystemTime};
 use sysfs::{Interface0, UsbDevice};
 
 pub const READ_VERSION: (u8, u8) = (0x00, 0x87);
 pub const ENTER_MODE: (u8, u8) = (0x00, 0x04);
+/// `10:80`: the query Razer's updater sends on every bootloader open (DAN-1932). It cannot erase or program.
+pub const QUERY: (u8, u8) = (0x10, 0x80);
 pub const EXIT: (u8, u8) = (0x10, 0x05);
 /// Transaction id of every frame: the vendor updater never writes the byte (same as phase 1).
 pub const TID: u8 = 0;
@@ -40,16 +46,25 @@ pub const TID: u8 = 0;
 pub const NORMAL_ID: (u16, u16) = (0x1532, 0x009F);
 /// The same dongle in its bootloader.
 pub const BOOTLOADER_ID: (u16, u16) = (0x1532, 0x110E);
+/// The PIDs the `10:80` reply may name for `10:05` to follow: the two bootloader PIDs in Razer's updater resources
+/// (`BCDPID_BL1`, `BCDPID_BL2`; DAN-1932). Its `OpenDevice` refuses the handle for any other.
+pub const QUERY_PIDS: [u16; 2] = [0x009F, 0x009E];
 
 /// How long step 3 waits for `1532:110E` before it gives up and tells the user to replug. The board's kernel log has it
 /// enumerated about a second after the enter frame.
 pub const BOOTLOADER_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long steps 2 and 3c wait for a device to leave the bus after a send that returned an error.
+/// How long steps 2 and 3d wait for a device to leave the bus after a send that returned an error.
 pub const LEAVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long step 4 waits for `1532:009F` to come back, counted from the exit send. If `10:05` works it is back within
 /// seconds. Nothing shows that the bootloader ever leaves by itself (the return on the board's first run was a replug),
 /// so a timeout here means the dongle has to be replugged.
 pub const RETURN_TIMEOUT: Duration = Duration::from_secs(30);
+/// SET/GET pairs of the `10:80` query: a status other than 0, 1 or 2 (or five GETs without an answer) re-sends the SET.
+pub const QUERY_PAIRS: usize = 3;
+/// GETs per `10:80` SET: status 0 or 1, a failed GET or a reply to another frame is polled again.
+pub const QUERY_GETS: usize = 5;
+/// SET/GET pairs of the `10:05` exit: one GET per SET, and a failed GET or a status other than 2 re-sends the SET.
+pub const EXIT_PAIRS: usize = 3;
 
 /// What to tell the user when the usbfs node of the bootloader cannot be opened.
 pub const UDEV_HINT: &str = "Reinstall the udev rule, which now has a line for the bootloader (1532:110E): sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --reload && sudo udevadm trigger";
@@ -63,17 +78,97 @@ pub fn read_version_frame() -> Report {
 pub fn enter_frame() -> Report {
     Report::new(ENTER_MODE, 2, TID).with_args(&[1, 0])
 }
+/// `10:80`: ask the bootloader what it is. Size 9, no arguments; the reply carries its PID.
+pub fn query_frame() -> Report {
+    Report::new(QUERY, 9, TID)
+}
 /// `10:05`: leave the bootloader.
 pub fn exit_frame() -> Report {
     Report::new(EXIT, 0, TID)
 }
 
-/// The hidraw allow-list: the two normal-mode frames, byte for byte. (`10:05` is not on it: the bootloader has no hidraw
-/// node, so it only goes out through [`usbfs`].)
+/// The hidraw allow-list: the two normal-mode frames, byte for byte. (`10:80` and `10:05` are not on it: the bootloader
+/// has no hidraw node, so they only go out through [`usbfs`].)
 pub fn permitted(bytes: &[u8; REPORT_LEN]) -> bool {
     [read_version_frame(), enter_frame()]
         .iter()
         .any(|f| f.to_bytes() == *bytes)
+}
+
+/// The fields of a 90-byte reply that the probe reads (no report id): status `[0]`, transaction id `[1]`, command class
+/// and id `[6]`, `[7]`, and, in the answer to `10:80`, the bootloader's PID as `[16] | [15] << 8` (DAN-1932).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decoded {
+    pub status: u8,
+    pub txn: u8,
+    pub class: u8,
+    pub id: u8,
+    pub pid: u16,
+}
+
+impl Decoded {
+    /// `None` unless the reply is exactly [`REPORT_LEN`] bytes.
+    pub fn of(raw: &[u8]) -> Option<Decoded> {
+        if raw.len() != REPORT_LEN {
+            return None;
+        }
+        Some(Decoded {
+            status: raw[0],
+            txn: raw[1],
+            class: raw[6],
+            id: raw[7],
+            pid: u16::from(raw[16]) | u16::from(raw[15]) << 8,
+        })
+    }
+
+    /// Transaction id 0 and the class/id of the frame that was sent: the reply is to that frame.
+    pub fn echoes(&self, sent: (u8, u8)) -> bool {
+        self.txn == TID && (self.class, self.id) == sent
+    }
+}
+
+/// What the gate decides from the `10:80` exchange: `Ok(pid)` = status 2, txn 0, class/id `10:80` and a PID in
+/// [`QUERY_PIDS`] in the **last** reply read, so `10:05` may follow; `Err(why)` = it may not, with the reason for the file.
+pub fn gate(query: &Exchange) -> Result<u16, String> {
+    if let Some(e) = query.set_error() {
+        return Err(format!("the 10:80 SET_REPORT failed: {e}"));
+    }
+    let Some(last) = query.last_get() else {
+        return Err("no 10:80 GET_REPORT was read".into());
+    };
+    let raw = match &last.reply {
+        Ok(raw) => raw,
+        Err(e) => {
+            return Err(format!(
+                "the 10:80 got no reply: the last GET_REPORT failed with {e}"
+            ))
+        }
+    };
+    let Some(d) = Decoded::of(raw) else {
+        return Err(format!(
+            "the 10:80 reply is {} bytes, not {REPORT_LEN}",
+            raw.len()
+        ));
+    };
+    if d.status != 2 {
+        return Err(format!(
+            "the 10:80 reply has status {:#04x}, not 2",
+            d.status
+        ));
+    }
+    if !d.echoes(QUERY) {
+        return Err(format!(
+            "the 10:80 reply has txn {:#04x} and class/id {:02x}:{:02x}, not txn 0 and 10:80",
+            d.txn, d.class, d.id
+        ));
+    }
+    if !QUERY_PIDS.contains(&d.pid) {
+        return Err(format!(
+            "the 10:80 reply names PID {:04x}, not 009f or 009e (Razer's updater refuses the handle then)",
+            d.pid
+        ));
+    }
+    Ok(d.pid)
 }
 
 /// What the follow-up read after a send produced: the device's answer, or why there was none.
@@ -93,16 +188,19 @@ pub trait ProbeIo {
     /// Step 2, after a send that returned an error: wait up to `timeout` for `1532:009F` to leave the bus. `Some` = it
     /// left, that long after the call.
     fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration>;
-    /// Step 3: watch `/sys/bus/usb/devices` for `1532:110E` for at most `timeout`.
+    /// Step 3: watch `/sys/bus/usb/devices` for `1532:110E` for at most `timeout`, then let it settle for at least 1000 ms
+    /// (the wait Razer's updater makes before it opens the device).
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait;
     /// Step 3b: open the bootloader's usbfs node and claim interface 0. `Ok` names the node; `Err` says why not (the
     /// errno is recorded). Sends nothing.
     fn open_usbfs(&mut self, device: &UsbDevice) -> Result<String, OpenFailure>;
     /// Step 3b: read the HID report descriptor of interface 0 (a standard GET_DESCRIPTOR).
     fn read_report_descriptor(&mut self) -> Result<Vec<u8>, SendError>;
-    /// Step 3c: send `10:05` as a feature SET_REPORT, then read its GET_REPORT.
-    fn exit_bootloader(&mut self) -> ExitResult;
-    /// Step 3c, after an exit request that returned an error: wait up to `timeout` for `1532:110E` to leave the bus.
+    /// Step 3c: send `10:80` as a feature SET_REPORT and read its GET_REPORT, with the vendor's polling and re-sends.
+    fn query_bootloader(&mut self) -> Exchange;
+    /// Step 3d: send `10:05` as a feature SET_REPORT and read its GET_REPORT, re-sending up to three times.
+    fn exit_bootloader(&mut self) -> Exchange;
+    /// Step 3d, after an exit request that returned an error: wait up to `timeout` for `1532:110E` to leave the bus.
     fn wait_for_bootloader_gone(&mut self, timeout: Duration) -> Option<Duration>;
     /// Step 4: watch for `1532:009F` to come back (and no `110E` to be left) for at most `timeout`.
     fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait;
@@ -236,9 +334,17 @@ pub fn run<I: ProbeIo>(
     let wait = io.wait_for_bootloader(BOOTLOADER_TIMEOUT);
     let detail = match (&wait.device, wait.appeared_at) {
         (Some(d), Some(seen)) => format!(
-            "1532:110E listed as {} {} after the wait began",
+            "1532:110E listed as {} {} after the wait began{}",
             d.name,
-            report::secs(seen.duration_since(at).unwrap_or_default())
+            report::secs(seen.duration_since(at).unwrap_or_default()),
+            match wait.settled_at {
+                Some(t) => format!(
+                    "; settled {} later, at {}, before usbfs is opened",
+                    report::secs(t.duration_since(seen).unwrap_or_default()),
+                    report::utc(t)
+                ),
+                None => String::new(),
+            }
         ),
         _ => format!(
             "TIMED OUT: no 1532:110E within {} s. Nothing further was sent",
@@ -254,6 +360,7 @@ pub fn run<I: ProbeIo>(
     ));
     log.bootloader = wait.device.clone();
     log.appeared_at = wait.appeared_at;
+    log.settled_at = wait.settled_at;
     checkpoint(&log);
     let Some(device) = wait.device else {
         return finish(log, Outcome::BootloaderNeverAppeared, checkpoint);
@@ -312,38 +419,88 @@ pub fn run<I: ProbeIo>(
     ));
     checkpoint(&log);
 
-    // 3c. exit. As in step 2, an error on the send is the expected shape if the device leaves the bus in the middle of
-    //     it, so it counts as sent only if 1532:110E then leaves.
+    // 3c. the vendor's own first question, `10:80`, on this handle. Only a reply with status 2, txn 0, class/id 10:80 and
+    //     a PID of 009F or 009E opens the gate; any other reply (or none) ends the run here with nothing further sent.
+    let at = io.now();
+    log.query_at = Some(at);
+    let query = io.query_bootloader();
+    let gets: usize = query.pairs.iter().map(|p| p.gets.len()).sum();
+    let counts = format!(
+        "{} SET_REPORT(s) of up to {QUERY_PAIRS}, {gets} GET_REPORT(s)",
+        query.sets()
+    );
+    let verdict = gate(&query);
+    log.query = Some(query);
+    log.gate = Some(verdict.clone());
+    let pid = match verdict {
+        Ok(pid) => pid,
+        Err(why) => {
+            log.push(Step::new(
+                "3c",
+                "query the bootloader (10:80)",
+                at,
+                io.now(),
+                format!("{counts}; GATE CLOSED: {why}. 10:05 is NOT sent and nothing further is"),
+            ));
+            return finish(log, Outcome::NoExit(why), checkpoint);
+        }
+    };
+    log.push(Step::new(
+        "3c",
+        "query the bootloader (10:80)",
+        at,
+        io.now(),
+        format!(
+            "{counts}; the reply is status 2, txn 0, class/id 10:80, PID {pid:04x}: gate open, 10:05 follows at once on the same handle"
+        ),
+    ));
+
+    // 3d. exit, straight away: no checkpoint and no other call between the query and this (the vendor sends `10:05` within
+    //     milliseconds of the `10:80` round trip, on the same handle). As in step 2, an error on the send is the expected
+    //     shape if the device leaves the bus in the middle of it, so it counts as sent only if 1532:110E then leaves.
     let at = io.now();
     log.exit_sent_at = Some(at);
     let exit = io.exit_bootloader();
-    let detail = match &exit.sent {
-        Ok(()) => match &exit.status {
-            Some(Ok(r)) => format!(
-                "SET_REPORT accepted; GET_REPORT answered {} args {}",
-                status_name(r, EXIT),
-                args_hex(r, 2)
-            ),
-            Some(Err(e)) => format!("SET_REPORT accepted; GET_REPORT read nothing ({e})"),
-            None => "SET_REPORT accepted".into(),
+    let tries = if exit.sets() > 1 {
+        format!(
+            "{} SET_REPORTs of up to {EXIT_PAIRS}; the last: ",
+            exit.sets()
+        )
+    } else {
+        String::new()
+    };
+    let detail = match exit.set_error() {
+        None => match exit.last_get() {
+            Some(g) => match &g.reply {
+                Ok(raw) => match Report::parse(raw) {
+                    Ok(r) => format!(
+                        "{tries}SET_REPORT accepted; GET_REPORT answered {} args {}",
+                        status_name(&r, EXIT),
+                        args_hex(&r, 2)
+                    ),
+                    Err(e) => format!("{tries}SET_REPORT accepted; GET_REPORT read {e}"),
+                },
+                Err(e) => format!("{tries}SET_REPORT accepted; GET_REPORT read nothing ({e})"),
+            },
+            None => format!("{tries}SET_REPORT accepted"),
         },
-        Err(e) => match io.wait_for_bootloader_gone(LEAVE_TIMEOUT) {
+        Some(e) => match io.wait_for_bootloader_gone(LEAVE_TIMEOUT) {
             Some(after) => format!(
-                "SET_REPORT returned {e}; 1532:110E left the bus {} later, so the exit took effect",
+                "{tries}SET_REPORT returned {e}; 1532:110E left the bus {} later, so the exit took effect",
                 report::secs(after)
             ),
             None => {
+                let why = e.to_string();
                 log.push(Step::new(
-                    "3c",
+                    "3d",
                     "exit bootloader (10:05)",
                     at,
                     io.now(),
                     format!(
-                        "FAILED: SET_REPORT returned {e}, and 1532:110E did not leave the bus within {} s",
+                        "FAILED: {tries}SET_REPORT returned {e}, and 1532:110E did not leave the bus within {} s",
                         LEAVE_TIMEOUT.as_secs()
                     ),
                 ));
-                let why = e.to_string();
                 log.exit = Some(exit);
                 return finish(log, Outcome::ExitFailed(why), checkpoint);
             }
@@ -351,7 +508,7 @@ pub fn run<I: ProbeIo>(
     };
     log.exit = Some(exit);
     log.push(Step::new(
-        "3c",
+        "3d",
         "exit bootloader (10:05)",
         at,
         io.now(),
@@ -433,15 +590,21 @@ pub fn plan_text() -> String {
          \x20 2. send enter-bootloader (00:04, mode 1); an error on that send counts as \"entered\" only if the dongle then leaves the bus\n\
          \x20 3. wait up to {} s for the dongle to be listed as 1532:110E in /sys/bus/usb/devices, and write down what the kernel\n\
          \x20    says about it (bus and device number, bcdDevice, product, driver on interface 0, cached descriptors)\n\
-         \x20 3b. open its usbfs node (needs the udev rule), claim interface 0 and read its HID report descriptor\n\
-         \x20 3c. send exit (10:05) as a HID feature SET_REPORT and read its GET_REPORT\n\
+         \x20 3b. after letting it settle for at least {} ms, open its usbfs node (needs the udev rule), claim interface 0 and read its\n\
+         \x20    HID report descriptor\n\
+         \x20 3c. send the query Razer's updater sends first (10:80) as a HID feature SET_REPORT and read its GET_REPORT (up to 5\n\
+         \x20    reads, up to 3 sends); it asks the bootloader for its PID and changes nothing\n\
+         \x20 3d. only if the reply has status 2 and PID 009F or 009E: send exit (10:05) straight away on the same handle (up to 3\n\
+         \x20    sends); with any other reply nothing more is sent and you are told to replug\n\
          \x20 4. wait up to {} s for 1532:009F to come back, and write down how long it took, from 10:05 and from entry\n\
-         It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command). While it runs the\n\
+         It never erases or writes firmware (no 10:01, 10:02 or class 0x0A frame exists in this command; the only frames it sends are\n\
+         00:87, 00:04, 10:80 and 10:05). While it runs the\n\
          mouse stops working. Expected worst case: the dongle stays in bootloader mode until you unplug it and plug it back\n\
          in. If the node cannot be opened,\n\
          or a kernel driver owns interface 0, nothing is sent to the bootloader.\n\
          Nothing was sent. To run it, add --yes-enter-bootloader.",
         BOOTLOADER_TIMEOUT.as_secs(),
+        hw::SETTLE.as_millis(),
         RETURN_TIMEOUT.as_secs()
     )
 }
