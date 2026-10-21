@@ -7,7 +7,7 @@
 //!   before it reaches the kernel.
 //! * The DFU trait of phase 1 (`firmware::dfu::Transport`: erase, program, verify) is not implemented by anything in
 //!   here, and nothing in `probe` names `firmware::dfu`, `firmware::flash` or the erase/program/class `0x0A` commands.
-//!   `tests/probe.rs` fails the build if a real-transport module could reach them.
+//!   `cargo test` fails (`tests/probe.rs`) if a real-transport module could reach them.
 //! * The orchestration ([`run`]) is written against [`ProbeIo`]; the tests drive it with a simulated device only.
 //!
 //! Layout: `mod.rs` (frames, the guard, [`ProbeIo`], [`run`], the refusal rules), `report.rs` (the file the board pastes
