@@ -8,3 +8,6 @@ KERNEL=="hidraw*", ATTRS{idVendor}=="1532", TAG+="uaccess", MODE="0660"
 # Without OpenRazer the mouse's /dev/input nodes are root:input; razerctl's button
 # tester and software remapper read them, so grant the desktop user access there too.
 SUBSYSTEM=="input", KERNEL=="event*", ATTRS{idVendor}=="1532", TAG+="uaccess"
+# The dongle's bootloader (razerctl firmware probe-bootloader) enumerates as 1532:110E with no hidraw node, so razerctl
+# talks to it through its /dev/bus/usb node. Without this line the node is root-only and the probe sends nothing to it.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1532", ATTR{idProduct}=="110e", TAG+="uaccess"
