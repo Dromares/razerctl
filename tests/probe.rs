@@ -963,7 +963,10 @@ fn a_usbfs_node_that_needs_root_is_recorded_and_not_escalated() {
         ],
         "neither the descriptor read nor 10:05 may be attempted without an open node"
     );
-    assert!(matches!(log.outcome, Some(Outcome::UsbfsUnavailable(_))));
+    assert!(matches!(
+        log.outcome,
+        Some(Outcome::UsbfsUnavailable { .. })
+    ));
     assert!(log.outcome.as_ref().unwrap().needs_replug());
     let text = log.render();
     assert!(text.contains("STOPPED at step 3b (usbfs)"), "{text}");
@@ -995,6 +998,12 @@ fn a_failed_open_that_is_not_a_permission_error_says_so() {
     let (log, _) = run(&mut sim);
     assert!(log.render().contains("errno 16"));
     assert!(log.render().contains("this is not a permission error"));
+    assert!(
+        !log.render().contains("NEXT    Reinstall the udev rule"),
+        "the udev line is for a permission error: {}",
+        log.render()
+    );
+    assert!(log.render().contains("NEXT    Unplug the dongle"));
     assert_eq!(sim.calls.last(), Some(&"open_usbfs"));
 }
 

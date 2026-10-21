@@ -281,9 +281,13 @@ pub fn run<I: ProbeIo>(
                 io.now(),
                 format!("FAILED: {f}. Not escalated; nothing was sent to the bootloader"),
             ));
-            let why = f.to_string();
+            let (why, permission) = (f.to_string(), f.is_permission_error());
             log.usbfs = Some(Err(f));
-            return finish(log, Outcome::UsbfsUnavailable(why), checkpoint);
+            return finish(
+                log,
+                Outcome::UsbfsUnavailable { why, permission },
+                checkpoint,
+            );
         }
         Ok(node) => log.usbfs = Some(Ok(node)),
     }

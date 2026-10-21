@@ -71,6 +71,13 @@ pub struct OpenFailure {
     pub message: String,
 }
 
+impl OpenFailure {
+    /// EACCES or EPERM: the user may not open the node, which the udev rule is for.
+    pub fn is_permission_error(&self) -> bool {
+        matches!(self.errno, Some(libc::EACCES) | Some(libc::EPERM))
+    }
+}
+
 impl std::fmt::Display for OpenFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.errno {
@@ -92,8 +99,12 @@ pub enum Outcome {
     EnterFailed(String),
     /// Step 3 timed out: nothing further was sent.
     BootloaderNeverAppeared,
-    /// Step 3b: the usbfs node could not be opened, or interface 0 could not be claimed. Nothing was sent.
-    UsbfsUnavailable(String),
+    /// Step 3b: the usbfs node could not be opened, or interface 0 could not be claimed. Nothing was sent. `permission`: the
+    /// error was EACCES or EPERM, so the udev rule is the thing to fix.
+    UsbfsUnavailable {
+        why: String,
+        permission: bool,
+    },
     /// Step 3b: a kernel driver owns interface 0. Not detached; nothing was sent.
     DriverBound(String),
     /// Step 3c: the exit request failed and `1532:110E` did not leave the bus.
@@ -118,7 +129,13 @@ impl Outcome {
     /// What the user should do next, one line each.
     pub fn next_steps(&self) -> Vec<String> {
         let mut out = Vec::new();
-        if matches!(self, Outcome::UsbfsUnavailable(_)) {
+        if matches!(
+            self,
+            Outcome::UsbfsUnavailable {
+                permission: true,
+                ..
+            }
+        ) {
             out.push(UDEV_HINT.to_string());
         }
         if self.needs_replug() {
@@ -142,7 +159,7 @@ impl Outcome {
                 "STEP 3 TIMED OUT: 1532:110E did not appear in /sys/bus/usb/devices within {} s. Nothing further was sent",
                 BOOTLOADER_TIMEOUT.as_secs()
             ),
-            Outcome::UsbfsUnavailable(w) => {
+            Outcome::UsbfsUnavailable { why: w, .. } => {
                 format!("STOPPED at step 3b (usbfs): {w}. Nothing was sent to the bootloader")
             }
             Outcome::DriverBound(w) => format!(
@@ -344,7 +361,7 @@ impl ProbeLog {
                 let _ = writeln!(o, "\nusbfs (step 3b): opened {node} as the current user, root was not needed, interface 0 claimed");
             }
             Some(Err(f)) => {
-                let need_root = matches!(f.errno, Some(libc::EACCES) | Some(libc::EPERM));
+                let need_root = f.is_permission_error();
                 let _ = writeln!(
                     o,
                     "\nusbfs (step 3b): FAILED, {f}; {}. Not escalated, nothing was sent.",
