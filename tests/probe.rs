@@ -778,6 +778,8 @@ fn the_report_is_self_explanatory() {
         !text.contains("NEXT"),
         "no replug instruction after a clean run"
     );
+    // the board unplugged the dongle on the first run: nothing shows it ever returns on its own
+    assert!(!text.contains("by itself"), "{text}");
     // every step carries a start and an end time
     assert!(text.matches("Z ->").count() >= 6, "{text}");
 }
