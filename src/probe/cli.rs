@@ -49,7 +49,7 @@ fn default_out() -> PathBuf {
 }
 
 /// Create the report file, refusing to overwrite one.
-fn create_out(path: &Path) -> Result<(), String> {
+pub fn create_out(path: &Path) -> Result<(), String> {
     fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -71,19 +71,29 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     }
     let devices: std::collections::HashSet<_> = nodes
         .iter()
-        .filter_map(|n| fs::canonicalize(&n.sysfs).ok()?.parent()?.parent().map(Path::to_path_buf))
+        .filter_map(|n| {
+            fs::canonicalize(&n.sysfs)
+                .ok()?
+                .parent()?
+                .parent()
+                .map(Path::to_path_buf)
+        })
         .collect();
     if devices.len() > 1 {
         return Err("refusing: more than one 1532:009F device is connected; unplug the others. Nothing was sent".into());
     }
     let Some(control) = hw::control_node(&nodes) else {
-        return Err("refusing: no 1532:009F interface with a feature report was found; nothing was sent".into());
+        return Err(
+            "refusing: no 1532:009F interface with a feature report was found; nothing was sent"
+                .into(),
+        );
     };
 
     let (traffic, unchecked) = hw::collect_traffic(Path::new("/proc"), &nodes, std::process::id());
     let why = refusals(&traffic);
     if !why.is_empty() {
-        let mut msg = String::from("refusing: other programs are using the device; nothing was sent\n");
+        let mut msg =
+            String::from("refusing: other programs are using the device; nothing was sent\n");
         for w in why {
             msg.push_str(&format!("  - {w}\n"));
         }
@@ -114,7 +124,10 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     let log = run(&mut probe, &build(), &mut |l: &ProbeLog| {
         if let Err(e) = fs::write(&out, l.render()) {
             if !write_failed {
-                eprintln!("warning: cannot write {}: {e}; the report will be printed below", out.display());
+                eprintln!(
+                    "warning: cannot write {}: {e}; the report will be printed below",
+                    out.display()
+                );
             }
             write_failed = true;
         }
@@ -122,7 +135,10 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     let text = log.render();
     println!("{text}");
     if !write_failed {
-        println!("report written to {}; paste it onto DAN-1878", out.display());
+        println!(
+            "report written to {}; paste it onto DAN-1878",
+            out.display()
+        );
     }
     let _ = std::io::stdout().flush();
     let outcome = log.outcome.as_ref();

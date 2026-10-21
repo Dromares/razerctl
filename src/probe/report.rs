@@ -46,7 +46,11 @@ pub struct OpenFailure {
 impl std::fmt::Display for OpenFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.errno {
-            Some(n) => write!(f, "open {} failed with errno {n} ({})", self.node, self.message),
+            Some(n) => write!(
+                f,
+                "open {} failed with errno {n} ({})",
+                self.node, self.message
+            ),
             None => write!(f, "open {} failed ({})", self.node, self.message),
         }
     }
@@ -81,9 +85,15 @@ impl Outcome {
 
     fn headline(&self) -> String {
         match self {
-            Outcome::Completed => "COMPLETED: all five steps ran and 1532:009F came back by itself".into(),
-            Outcome::ReadVersionFailed(w) => format!("STOPPED at step 1 (read version): {w}. Nothing was sent after it"),
-            Outcome::EnterFailed(w) => format!("STOPPED at step 2 (enter bootloader): {w}. Nothing was sent after it"),
+            Outcome::Completed => {
+                "COMPLETED: all five steps ran and 1532:009F came back by itself".into()
+            }
+            Outcome::ReadVersionFailed(w) => {
+                format!("STOPPED at step 1 (read version): {w}. Nothing was sent after it")
+            }
+            Outcome::EnterFailed(w) => {
+                format!("STOPPED at step 2 (enter bootloader): {w}. Nothing was sent after it")
+            }
             Outcome::BootloaderNeverAppeared => format!(
                 "STEP 3 TIMED OUT: 1532:110E did not appear within {} s. Nothing further was sent",
                 BOOTLOADER_TIMEOUT.as_secs()
@@ -162,7 +172,11 @@ impl ProbeLog {
     pub fn render(&self) -> String {
         let mut o = String::new();
         let _ = writeln!(o, "razerctl bootloader probe (DAN-1908, for DAN-1878)");
-        let _ = writeln!(o, "razerctl {} git {}", self.build.version, self.build.git_sha);
+        let _ = writeln!(
+            o,
+            "razerctl {} git {}",
+            self.build.version, self.build.git_sha
+        );
         let _ = writeln!(o, "started {}", utc(self.started));
         let _ = writeln!(o, "device  {}", self.device);
         let _ = writeln!(
@@ -170,7 +184,8 @@ impl ProbeLog {
             "RESULT  {}",
             match &self.outcome {
                 Some(r) => r.headline(),
-                None => "INCOMPLETE: the program stopped before it finished (this is a checkpoint)".into(),
+                None => "INCOMPLETE: the program stopped before it finished (this is a checkpoint)"
+                    .into(),
             }
         );
         if self.outcome.as_ref().is_some_and(Outcome::needs_replug) {
@@ -194,7 +209,11 @@ impl ProbeLog {
         if !self.steps.iter().any(|s| s.n == 3) {
             return o;
         }
-        let _ = writeln!(o, "\nenumerations observed in step 3 ({})", self.enumerations.len());
+        let _ = writeln!(
+            o,
+            "\nenumerations observed in step 3 ({})",
+            self.enumerations.len()
+        );
         if self.enumerations.is_empty() {
             let _ = writeln!(o, "  none");
         }
@@ -238,7 +257,11 @@ impl ProbeLog {
             }
             None => {}
         }
-        if self.steps.iter().any(|s| s.n == 5 && s.what.starts_with("wait")) {
+        if self
+            .steps
+            .iter()
+            .any(|s| s.n == 5 && s.what.starts_with("wait"))
+        {
             let _ = writeln!(
                 o,
                 "\n1532:009F after 10:05: {}",
@@ -247,7 +270,11 @@ impl ProbeLog {
                     None => format!("did not come back within {} s", RETURN_TIMEOUT.as_secs()),
                 }
             );
-            let _ = writeln!(o, "Razer nodes at the end of step 5 ({})", self.after_nodes.len());
+            let _ = writeln!(
+                o,
+                "Razer nodes at the end of step 5 ({})",
+                self.after_nodes.len()
+            );
             for n in &self.after_nodes {
                 let _ = writeln!(o, "  {n}");
             }
@@ -257,7 +284,10 @@ impl ProbeLog {
 }
 
 pub fn hex(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// `2026-10-21T09:53:07.123Z`.

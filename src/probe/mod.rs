@@ -113,17 +113,32 @@ pub fn run<I: ProbeIo>(
     let at = io.now();
     let (detail, version) = match io.read_version() {
         Err(e) => {
-            log.push(Step::new(1, "read version (00:87)", at, io.now(), format!("FAILED: {e}")));
+            log.push(Step::new(
+                1,
+                "read version (00:87)",
+                at,
+                io.now(),
+                format!("FAILED: {e}"),
+            ));
             return finish(log, Outcome::ReadVersionFailed(e), checkpoint);
         }
         Ok(r) if r.status_for(READ_VERSION) != Status::Success => {
             let why = status_name(&r, READ_VERSION);
-            log.push(Step::new(1, "read version (00:87)", at, io.now(), format!("FAILED: the device answered {why}")));
+            log.push(Step::new(
+                1,
+                "read version (00:87)",
+                at,
+                io.now(),
+                format!("FAILED: the device answered {why}"),
+            ));
             return finish(log, Outcome::ReadVersionFailed(why), checkpoint);
         }
         Ok(r) => {
             let v = format!("{}.{:02}.{:02}", r.args[0], r.args[1], r.args[2]);
-            (format!("ok, version {v} (reply args {})", args_hex(&r, 8)), v)
+            (
+                format!("ok, version {v} (reply args {})", args_hex(&r, 8)),
+                v,
+            )
         }
     };
     log.version_read = Some(version);
@@ -134,19 +149,46 @@ pub fn run<I: ProbeIo>(
     let at = io.now();
     let detail = match io.enter_bootloader() {
         Err(e) => {
-            log.push(Step::new(2, "enter bootloader (00:04 mode 1)", at, io.now(), format!("FAILED to send: {e}")));
+            log.push(Step::new(
+                2,
+                "enter bootloader (00:04 mode 1)",
+                at,
+                io.now(),
+                format!("FAILED to send: {e}"),
+            ));
             return finish(log, Outcome::EnterFailed(e), checkpoint);
         }
-        Ok(Ok(r)) if matches!(r.status_for(ENTER_MODE), Status::Failed | Status::NotSupported | Status::Timeout) => {
+        Ok(Ok(r))
+            if matches!(
+                r.status_for(ENTER_MODE),
+                Status::Failed | Status::NotSupported | Status::Timeout
+            ) =>
+        {
             let why = status_name(&r, ENTER_MODE);
-            log.push(Step::new(2, "enter bootloader (00:04 mode 1)", at, io.now(), format!("sent; the device answered {why}")));
+            log.push(Step::new(
+                2,
+                "enter bootloader (00:04 mode 1)",
+                at,
+                io.now(),
+                format!("sent; the device answered {why}"),
+            ));
             return finish(log, Outcome::EnterFailed(why), checkpoint);
         }
-        Ok(Ok(r)) => format!("sent; reply {} args {}", status_name(&r, ENTER_MODE), args_hex(&r, 2)),
+        Ok(Ok(r)) => format!(
+            "sent; reply {} args {}",
+            status_name(&r, ENTER_MODE),
+            args_hex(&r, 2)
+        ),
         // a device that resets straight away often has no reply to give
         Ok(Err(e)) => format!("sent; no reply read ({e})"),
     };
-    log.push(Step::new(2, "enter bootloader (00:04 mode 1)", at, io.now(), detail));
+    log.push(Step::new(
+        2,
+        "enter bootloader (00:04 mode 1)",
+        at,
+        io.now(),
+        detail,
+    ));
     checkpoint(&log);
 
     // 3. wait for 1532:110E
@@ -154,7 +196,10 @@ pub fn run<I: ProbeIo>(
     let wait = io.wait_for_bootloader(BOOTLOADER_TIMEOUT);
     let appeared = wait.seen.iter().any(|e| (e.vid, e.pid) == BOOTLOADER_ID);
     let detail = match wait.appeared_after {
-        Some(d) if appeared => format!("1532:110E appeared {:.2} s after the wait began", d.as_secs_f64()),
+        Some(d) if appeared => format!(
+            "1532:110E appeared {:.2} s after the wait began",
+            d.as_secs_f64()
+        ),
         _ => format!(
             "TIMED OUT: no 1532:110E within {} s. Nothing further was sent",
             BOOTLOADER_TIMEOUT.as_secs()
@@ -174,14 +219,26 @@ pub fn run<I: ProbeIo>(
     match io.open_bootloader() {
         Err(f) => {
             let detail = format!("FAILED: {f}. Not escalated; nothing was sent to the bootloader");
-            log.push(Step::new(4, "open the 1532:110E node", at, io.now(), detail));
+            log.push(Step::new(
+                4,
+                "open the 1532:110E node",
+                at,
+                io.now(),
+                detail,
+            ));
             let why = f.to_string();
             log.open = Some(Err(f));
             return finish(log, Outcome::OpenFailed(why), checkpoint);
         }
         Ok(node) => {
             let detail = format!("ok, opened {node} as the current user (no root needed)");
-            log.push(Step::new(4, "open the 1532:110E node", at, io.now(), detail));
+            log.push(Step::new(
+                4,
+                "open the 1532:110E node",
+                at,
+                io.now(),
+                detail,
+            ));
             log.open = Some(Ok(node));
         }
     }
@@ -191,19 +248,38 @@ pub fn run<I: ProbeIo>(
     let at = io.now();
     let detail = match io.exit_bootloader() {
         Err(e) => {
-            log.push(Step::new(5, "exit bootloader (10:05)", at, io.now(), format!("FAILED to send: {e}")));
+            log.push(Step::new(
+                5,
+                "exit bootloader (10:05)",
+                at,
+                io.now(),
+                format!("FAILED to send: {e}"),
+            ));
             return finish(log, Outcome::ExitFailed(e), checkpoint);
         }
-        Ok(Ok(r)) => format!("sent; reply {} args {}", status_name(&r, EXIT), args_hex(&r, 2)),
+        Ok(Ok(r)) => format!(
+            "sent; reply {} args {}",
+            status_name(&r, EXIT),
+            args_hex(&r, 2)
+        ),
         Ok(Err(e)) => format!("sent; no reply read ({e})"),
     };
-    log.push(Step::new(5, "exit bootloader (10:05)", at, io.now(), detail));
+    log.push(Step::new(
+        5,
+        "exit bootloader (10:05)",
+        at,
+        io.now(),
+        detail,
+    ));
     checkpoint(&log);
 
     let at = io.now();
     let back = io.wait_for_return(RETURN_TIMEOUT);
     let detail = match back.after {
-        Some(d) => format!("1532:009F came back by itself {:.2} s after 10:05 was sent", d.as_secs_f64()),
+        Some(d) => format!(
+            "1532:009F came back by itself {:.2} s after 10:05 was sent",
+            d.as_secs_f64()
+        ),
         None => format!(
             "TIMED OUT: no 1532:009F within {} s of 10:05, so it did NOT come back by itself",
             RETURN_TIMEOUT.as_secs()
@@ -246,7 +322,9 @@ pub fn refusals(t: &Traffic) -> Vec<String> {
         out.push(format!("another razerctl is running: pid {pid} `{cmd}` (stop the remap/battery services and close the GUI)"));
     }
     for (pid, cmd) in &t.openrazer_daemons {
-        out.push(format!("openrazer-daemon is running: pid {pid} `{cmd}` (stop it first)"));
+        out.push(format!(
+            "openrazer-daemon is running: pid {pid} `{cmd}` (stop it first)"
+        ));
     }
     for (node, driver) in &t.openrazer_drivers {
         out.push(format!("the openrazer kernel driver `{driver}` is bound to {node} (unbind it or unload the module first)"));

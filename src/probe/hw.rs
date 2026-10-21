@@ -55,15 +55,25 @@ impl<T: FeatureIo> FeatureIo for Guarded<T> {
 
 /// Send one probe frame, then read for its answer a few times. `Err` only if the frame could not be written; the
 /// answer is best effort because a device that resets straight away often has none to give.
-fn send_and_listen<T: FeatureIo>(io: &Guarded<T>, frame: &Report) -> Result<Answer, String> {
-    io.send_feature(&frame.to_bytes()).map_err(|e| e.to_string())?;
+pub fn send_and_listen<T: FeatureIo>(io: &Guarded<T>, frame: &Report) -> Result<Answer, String> {
+    io.send_feature(&frame.to_bytes())
+        .map_err(|e| e.to_string())?;
     let sent = (frame.command_class, frame.command_id);
     let mut last = Err("no reply".to_string());
     for _ in 0..REPLY_ATTEMPTS {
         std::thread::sleep(REPLY_STEP);
-        match io.get_feature().map_err(|e| e.to_string()).and_then(|raw| Report::parse(&raw)) {
+        match io
+            .get_feature()
+            .map_err(|e| e.to_string())
+            .and_then(|raw| Report::parse(&raw))
+        {
             // busy / not-yet-answered / someone else's answer: keep listening
-            Ok(r) if matches!(r.status_for(sent), Status::NewCommand | Status::Busy | Status::Mismatch) => {
+            Ok(r)
+                if matches!(
+                    r.status_for(sent),
+                    Status::NewCommand | Status::Busy | Status::Mismatch
+                ) =>
+            {
                 last = Ok(r)
             }
             Ok(r) => return Ok(Ok(r)),
@@ -74,6 +84,21 @@ fn send_and_listen<T: FeatureIo>(io: &Guarded<T>, frame: &Report) -> Result<Answ
         }
     }
     Ok(last)
+}
+
+/// Step 1 on any guarded channel: `00:87`, with the busy / collision handling every razerctl read has.
+pub fn read_version_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Report, String> {
+    transact_on(io, &read_version_frame()).map_err(|e| e.to_string())
+}
+
+/// Step 2: `00:04` mode 1.
+pub fn enter_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, String> {
+    send_and_listen(io, &enter_frame())
+}
+
+/// Step 5: `10:05`.
+pub fn exit_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, String> {
+    send_and_listen(io, &exit_frame())
 }
 
 /// Every Razer HID interface the kernel lists now, with its USB `bcdDevice` and report descriptor.
@@ -164,13 +189,13 @@ impl ProbeIo for RealProbe {
     }
 
     fn read_version(&mut self) -> Result<Report, String> {
-        transact_on(&self.normal, &read_version_frame()).map_err(|e| e.to_string())
+        read_version_via(&self.normal)
     }
 
     fn enter_bootloader(&mut self) -> Result<Answer, String> {
         // what exists now, so that step 3 can tell the bootloader's interfaces from the ones that were already there
         self.before = enumerate_razer().iter().map(key).collect();
-        send_and_listen(&self.normal, &enter_frame())
+        enter_via(&self.normal)
     }
 
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait {
@@ -243,7 +268,7 @@ impl ProbeIo for RealProbe {
             .bootloader
             .as_ref()
             .ok_or("the bootloader node was never opened")?;
-        send_and_listen(io, &exit_frame()).map_err(|e| format!("{node}: {e}"))
+        exit_via(io).map_err(|e| format!("{node}: {e}"))
     }
 
     fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait {
