@@ -48,6 +48,12 @@ COMMANDS:
     macros play NAME --dry-run
                              Print the exact frames and sleeps a press would send
                              (live playback only via remap; no device is opened)
+    firmware inspect UPDATER.EXE
+                             Read a Razer firmware updater you downloaded yourself and list the images in it
+                             (offline; opens no device; razerctl does not ship or fetch Razer's firmware)
+    firmware flash UPDATER.EXE --image NAME --dry-run [--device-version X.YY.ZZ] [--allow-reflash]
+                             Print every frame a flash would send, against a simulated device.
+                             Flashing a real device is not supported yet
     update [--check]         Ask GitHub whether a newer release exists (only when you run this).
                              Without --check: show what is new, then ask y/N before replacing an
                              AppImage; other installs get the release link or the package command
@@ -117,6 +123,10 @@ fn run() -> Result<(), Fail> {
 
     if command == "macros" {
         return cli::macros_cmd(rest).map_err(Fail::from);
+    }
+
+    if command == "firmware" {
+        return razerctl::firmware::cli(rest).map_err(Fail::from);
     }
 
     if command == "update" {

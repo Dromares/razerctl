@@ -2648,6 +2648,7 @@ dependencies = [
  "evdev",
  "ksni",
  "libc",
+ "miniz_oxide 0.8.9",
  "ureq",
 ]
 
