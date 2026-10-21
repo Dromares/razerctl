@@ -598,6 +598,14 @@ fn inspect_refuses_unknown_layouts() {
         err.contains("Dev1FWLine") && err.contains("missing"),
         "{err}"
     );
+    // a line count no resource set could hold (would otherwise be walked, or allocated, line by line)
+    let mut e = sy.entries();
+    replace(&mut e, "Dev1FWLineNum", Val::Int(100_000));
+    let err = inspect(&sy.exe_with(&e, 100)).unwrap_err();
+    assert!(
+        err.contains("Dev1FWLineNum = 100000") && err.contains("more lines than"),
+        "{err}"
+    );
     // a config entry the target needs is missing
     let e: Vec<_> = sy
         .entries()

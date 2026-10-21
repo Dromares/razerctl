@@ -89,6 +89,12 @@ pub fn inspect(exe: &[u8]) -> Result<Inspection, String> {
             .trim()
             .parse()
             .map_err(|_| format!("{key} = '{}' is not a line count", cfg[&key]))?;
+        if want > cfg.len() {
+            return Err(format!(
+                "{key} = {want}, more lines than the whole resource set has entries ({})",
+                cfg.len()
+            ));
+        }
         let kind = name.trim_end_matches(|c: char| c.is_ascii_digit());
         let n = &name[kind.len()..];
         if kind.is_empty() || n.is_empty() {
