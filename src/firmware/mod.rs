@@ -3,9 +3,11 @@
 //! state machine against a simulated device and prints the frames. Razer's firmware is never stored in this repository;
 //! it is extracted from the user's own copy of the updater at run time.
 
+pub mod dfu;
 pub mod flash;
 pub mod ihex;
 pub mod resources;
+pub mod sim;
 pub mod zip;
 
 use std::collections::HashMap;
@@ -190,19 +192,95 @@ pub fn describe(path: &str, file_sha256: &str, ins: &Inspection) -> Vec<String> 
     out
 }
 
-/// `razerctl firmware inspect <updater.exe>`.
+const USAGE: &str = "usage: firmware inspect UPDATER.EXE
+       firmware flash UPDATER.EXE --image NAME --dry-run [--device-version X.YY.ZZ] [--allow-reflash]";
+
+fn read_updater(path: &str) -> Result<(Vec<u8>, Inspection), String> {
+    let exe = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    let ins = inspect(&exe).map_err(|e| format!("{path}: {e}"))?;
+    Ok((exe, ins))
+}
+
+/// `firmware flash UPDATER.EXE --image NAME --dry-run`: run the DFU state machine against the simulated device and print
+/// every frame. Without `--dry-run` it refuses before it reads anything.
+fn flash_cmd(args: &[String]) -> Result<(), String> {
+    let (mut path, mut image, mut dry, mut version, mut reflash) = (None, None, false, None, false);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--dry-run" => dry = true,
+            "--allow-reflash" => reflash = true,
+            "--image" => image = Some(it.next().ok_or("--image needs a name")?.as_str()),
+            "--device-version" => {
+                version = Some(it.next().ok_or("--device-version needs X.YY.ZZ")?.as_str())
+            }
+            o if o.starts_with('-') => return Err(format!("unexpected argument '{o}'\n{USAGE}")),
+            o if path.is_none() => path = Some(o),
+            _ => return Err(USAGE.into()),
+        }
+    }
+    if !dry {
+        return Err("flashing is not supported yet: `firmware flash` only rehearses, with --dry-run, against a simulated \
+                    device, and nothing is sent to any real device"
+            .into());
+    }
+    let (path, image) = (
+        path.ok_or(USAGE)?,
+        image.ok_or("--image NAME is needed (see `firmware inspect`)")?,
+    );
+    let device_version = match version {
+        None => dfu::Version(1, 4, 0),
+        Some(v) => dfu::Version::parse(v)
+            .ok_or_else(|| format!("--device-version '{v}' is not X.YY.ZZ"))?,
+    };
+    let (_, ins) = read_updater(path)?;
+    let img = ins.images.iter().find(|i| i.name == image).ok_or_else(|| {
+        let names: Vec<&str> = ins.images.iter().map(|i| i.name.as_str()).collect();
+        format!(
+            "{path}: no image named '{image}' (it has {})",
+            names.join(", ")
+        )
+    })?;
+    eprintln!(
+        "{}: dry run of {} ({:04x}:{:04x}, {} bytes, version {}) against a simulated device reporting {device_version}; \
+         every line below is a frame that WOULD be sent (trailing 00 bytes of the args are left out), and nothing is sent to anything",
+        path,
+        img.name,
+        img.vid,
+        img.pid,
+        img.image.data.len(),
+        img.version
+    );
+    let mut sim = sim::DryRun::new(std::io::stdout(), (img.vid, img.pid), device_version);
+    let outcome = dfu::flash(
+        &mut sim,
+        img,
+        &dfu::Options {
+            allow_reflash: reflash,
+        },
+    )
+    .map_err(|e| format!("dry run stopped: {e}"))?;
+    eprintln!(
+        "dry run complete: {} frames, {} packets programmed and {} read back (simulated device; nothing was sent)",
+        sim.frames_sent(),
+        outcome.programmed,
+        outcome.verified
+    );
+    Ok(())
+}
+
+/// `razerctl firmware inspect|flash ...`. Offline: no device is opened.
 pub fn cli(args: &[String]) -> Result<(), String> {
-    const USAGE: &str = "usage: firmware inspect UPDATER.EXE";
     match args {
         [sub, path] if sub == "inspect" => {
-            let exe = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-            let ins = inspect(&exe).map_err(|e| format!("{path}: {e}"))?;
+            let (exe, ins) = read_updater(path)?;
             let sha = crate::sha256::hex_digest(&exe[..]).map_err(|e| e.to_string())?;
             for l in describe(path, &sha, &ins) {
                 println!("{l}");
             }
             Ok(())
         }
+        [sub, rest @ ..] if sub == "flash" => flash_cmd(rest),
         _ => Err(USAGE.into()),
     }
 }
