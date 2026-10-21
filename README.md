@@ -233,7 +233,8 @@ of the updater. **Flashing a real device is not supported yet**; without `--dry-
 `probe-bootloader` is the one firmware command that talks to a device, and it only runs when you ask for it with `--yes-enter-bootloader`.
 It is a measurement for a later update feature. It reads the Viper Mini SE's version (`00:87`) and puts it into its
 bootloader (`00:04`, mode 1). It starts either from the dongle (`1532:009F`) or from the mouse on its USB cable
-(`1532:009E`); exactly one of them must be connected, and the report says which one it used. The bootloader enumerates as `1532:110E` and the kernel makes **no hidraw node** for it, so the
+(`1532:009E`); exactly one of them must be connected, and the report says which one it used. The bootloader enumerates as `1532:110E` when it enumerates at all (on the board's two probe v3 runs through the dongle it did
+not, and whether the cable's bootloader shows up as `1532:110E` is not known yet) and the kernel makes **no hidraw node** for it, so the
 probe finds it in `/sys/bus/usb/devices` (reading sysfs sends nothing) and writes down the bus and device number,
 `bcdDevice`, product string, any driver bound to interface 0 and the kernel's cached descriptors. It then opens the
 bootloader's `/dev/bus/usb/BBB/DDD` node (at least 1000 ms after it appears, the wait Razer's updater makes), reads its
