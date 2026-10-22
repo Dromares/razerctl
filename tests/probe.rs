@@ -5053,3 +5053,28 @@ fn fence_hidboot_is_a_device_file_and_the_other_fences_cover_it() {
         }
     }
 }
+
+#[test]
+fn a_hidraw_node_that_does_not_say_it_is_the_bootloader_is_refused_before_anything_is_sent() {
+    let node = Path::new("/dev/hidraw1");
+    let info = |vendor, product| RawInfo {
+        bustype: 3,
+        vendor,
+        product,
+    };
+    assert_eq!(
+        hw::check_node_is_bootloader(node, &info(0x1532, 0x110E)),
+        Ok(())
+    );
+    for (v, p) in [(0x1532, 0x009E), (0x1532, 0x009F), (0x046d, 0x110E), (0, 0)] {
+        let f = hw::check_node_is_bootloader(node, &info(v, p)).unwrap_err();
+        assert_eq!(f.node, "/dev/hidraw1");
+        assert!(
+            f.message.contains(&format!(
+                "HIDIOCGRAWINFO says {v:04x}:{p:04x}, not 1532:110E"
+            )),
+            "{f}"
+        );
+        assert!(!f.is_permission_error());
+    }
+}

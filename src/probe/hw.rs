@@ -26,7 +26,7 @@ use super::{
     enter_frame, permitted, read_version_frame, Answer, Decoded, Origin, ProbeIo, Start, Traffic,
     BOOTLOADER_ID, EXIT_PAIRS, QUERY, QUERY_GETS, QUERY_PAIRS,
 };
-use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
+use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode, RawInfo};
 use crate::protocol::{Report, Status, REPORT_LEN};
 use std::fs;
 use std::io;
@@ -400,6 +400,21 @@ fn never_opened() -> Exchange {
     }
 }
 
+/// The node sysfs linked to the bootloader must itself say it is `1532:110E` (`HIDIOCGRAWINFO`) before anything is sent to it.
+pub fn check_node_is_bootloader(node: &Path, info: &RawInfo) -> Result<(), OpenFailure> {
+    if (info.vendor, info.product) == BOOTLOADER_ID {
+        return Ok(());
+    }
+    Err(OpenFailure {
+        node: node.display().to_string(),
+        errno: None,
+        message: format!(
+            "HIDIOCGRAWINFO says {:04x}:{:04x}, not 1532:110E",
+            info.vendor, info.product
+        ),
+    })
+}
+
 fn open_failure(node: &Path, e: &io::Error) -> OpenFailure {
     OpenFailure {
         node: node.display().to_string(),
@@ -531,16 +546,7 @@ impl ProbeIo for RealProbe {
             }
         };
         let info = hid.raw_info().map_err(|e| open_failure(&path, &e))?;
-        if (info.vendor, info.product) != BOOTLOADER_ID {
-            return Err(OpenFailure {
-                node: path.display().to_string(),
-                errno: None,
-                message: format!(
-                    "HIDIOCGRAWINFO says {:04x}:{:04x}, not 1532:110E",
-                    info.vendor, info.product
-                ),
-            });
-        }
+        check_node_is_bootloader(&path, &info)?;
         self.boot = Some(BootOpen::Hid(hid));
         Ok(HidrawOpened {
             node: path.display().to_string(),
