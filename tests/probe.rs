@@ -4034,7 +4034,7 @@ fn shape_of_hid(g: &BootGuarded<SimHid>) -> Vec<Shape> {
 }
 
 /// What an exchange came to: per SET its errno, per GET its 90 bytes or that it failed.
-fn outcome_of(x: &Exchange) -> Vec<(Option<i32>, Vec<Result<Vec<u8>, ()>>)> {
+fn outcome_of(x: &Exchange) -> Vec<PairOutcome> {
     x.pairs
         .iter()
         .map(|p| {
@@ -4050,9 +4050,13 @@ fn outcome_of(x: &Exchange) -> Vec<(Option<i32>, Vec<Result<Vec<u8>, ()>>)> {
 }
 
 type Script = Vec<Result<Vec<u8>, i32>>;
+/// A named script of replies, built fresh for each channel.
+type Scripted = (&'static str, fn() -> Script);
+/// One SET with its errno and the GETs after it.
+type PairOutcome = (Option<i32>, Vec<Result<Vec<u8>, ()>>);
 
 /// Scripts of replies for the retry rules, each built twice (once per channel).
-fn retry_scripts() -> Vec<(&'static str, fn() -> Script)> {
+fn retry_scripts() -> Vec<Scripted> {
     vec![
         ("polled on 0 and 1", || {
             vec![ok(Q, 0, 0), ok(Q, 1, 0), ok(Q, 2, 0x009E)]
@@ -4096,7 +4100,7 @@ fn the_query_polls_and_resends_exactly_the_same_on_hidraw_as_on_usbfs() {
 
 #[test]
 fn the_exit_resends_exactly_the_same_on_hidraw_as_on_usbfs() {
-    let scripts: Vec<(&str, fn() -> Script)> = vec![
+    let scripts: Vec<Scripted> = vec![
         ("accepted", || vec![ok((0x10, 0x05), 2, 0)]),
         ("a failed get re-sends, three sends in all", || {
             vec![Err(ETIMEDOUT), Err(ETIMEDOUT), Err(ETIMEDOUT)]
