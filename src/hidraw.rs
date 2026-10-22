@@ -128,6 +128,32 @@ const fn hidioc(nr: u64, len: usize) -> u64 {
 }
 const HIDIOCSFEATURE_NR: u64 = 0x06;
 const HIDIOCGFEATURE_NR: u64 = 0x07;
+// _IOC(_IOC_READ, 'H', nr, size): the three read-only queries the bootloader probe makes of a `1532:110E` node
+// (DAN-1948). `struct hidraw_devinfo` is {u32 bustype; s16 vendor; s16 product}; `struct hidraw_report_descriptor` is
+// {u32 size; u8 value[4096]}.
+const fn hidioc_read(nr: u64, len: usize) -> u64 {
+    (2u64 << 30) | ((len as u64) << 16) | ((b'H' as u64) << 8) | nr
+}
+const HIDRAW_DESC_MAX: usize = 4096;
+const HIDIOCGRDESCSIZE: u64 = hidioc_read(0x01, 4);
+const HIDIOCGRDESC: u64 = hidioc_read(0x02, 4 + HIDRAW_DESC_MAX);
+const HIDIOCGRAWINFO: u64 = hidioc_read(0x03, 8);
+
+/// The 91 bytes `HIDIOCSFEATURE` is given for a payload: report id `0x00`, then the 90 bytes. Every feature report razerctl
+/// sends, probe frames included, goes out through this.
+pub fn feature_buffer(payload: &[u8; REPORT_LEN]) -> [u8; REPORT_LEN + 1] {
+    let mut buf = [0u8; REPORT_LEN + 1];
+    buf[1..].copy_from_slice(payload);
+    buf
+}
+
+/// What `HIDIOCGRAWINFO` reports about a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawInfo {
+    pub bustype: u32,
+    pub vendor: u16,
+    pub product: u16,
+}
 
 pub struct Hidraw {
     file: File,
@@ -139,10 +165,10 @@ impl Hidraw {
         Ok(Hidraw { file })
     }
 
-    fn ioctl(&self, nr: u64, buf: &mut [u8]) -> io::Result<usize> {
-        let req = hidioc(nr, buf.len());
-        // SAFETY: buf is a valid, writable buffer of the length encoded in `req`.
-        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req as _, buf.as_mut_ptr()) };
+    /// The one place an ioctl is issued.
+    fn ioctl_raw(&self, req: u64, arg: *mut libc::c_void) -> io::Result<usize> {
+        // SAFETY: `arg` points at a live value of the type `req` expects, for the whole call.
+        let r = unsafe { libc::ioctl(self.file.as_raw_fd(), req as _, arg) };
         if r < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -150,17 +176,47 @@ impl Hidraw {
         }
     }
 
+    fn ioctl(&self, nr: u64, buf: &mut [u8]) -> io::Result<usize> {
+        self.ioctl_raw(hidioc(nr, buf.len()), buf.as_mut_ptr().cast())
+    }
+
     /// 91-byte feature report: report ID 0 + 90-byte payload (UsbRzDeviceAction.js).
     pub fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {
-        let mut buf = [0u8; REPORT_LEN + 1];
-        buf[1..].copy_from_slice(payload);
+        let mut buf = feature_buffer(payload);
         self.ioctl(HIDIOCSFEATURE_NR, &mut buf).map(|_| ())
     }
 
     pub fn get_feature(&self) -> io::Result<[u8; REPORT_LEN + 1]> {
+        self.get_feature_len().map(|(_, buf)| buf)
+    }
+
+    /// Like [`Hidraw::get_feature`], and also how many bytes the kernel returned (the report id counts).
+    pub fn get_feature_len(&self) -> io::Result<(usize, [u8; REPORT_LEN + 1])> {
         let mut buf = [0u8; REPORT_LEN + 1];
-        self.ioctl(HIDIOCGFEATURE_NR, &mut buf)?;
-        Ok(buf)
+        let n = self.ioctl(HIDIOCGFEATURE_NR, &mut buf)?;
+        Ok((n, buf))
+    }
+
+    /// `HIDIOCGRAWINFO`: bus, vendor id and product id of the node. Read-only.
+    pub fn raw_info(&self) -> io::Result<RawInfo> {
+        let mut info = [0u8; 8];
+        self.ioctl_raw(HIDIOCGRAWINFO, info.as_mut_ptr().cast())?;
+        Ok(RawInfo {
+            bustype: u32::from_ne_bytes([info[0], info[1], info[2], info[3]]),
+            vendor: u16::from_ne_bytes([info[4], info[5]]),
+            product: u16::from_ne_bytes([info[6], info[7]]),
+        })
+    }
+
+    /// `HIDIOCGRDESCSIZE` then `HIDIOCGRDESC`: the HID report descriptor as the kernel parsed it. Read-only.
+    pub fn report_descriptor(&self) -> io::Result<Vec<u8>> {
+        let mut size = [0u8; 4];
+        self.ioctl_raw(HIDIOCGRDESCSIZE, size.as_mut_ptr().cast())?;
+        let size = (u32::from_ne_bytes(size) as usize).min(HIDRAW_DESC_MAX);
+        let mut desc = vec![0u8; 4 + HIDRAW_DESC_MAX];
+        desc[..4].copy_from_slice(&(size as u32).to_ne_bytes());
+        self.ioctl_raw(HIDIOCGRDESC, desc.as_mut_ptr().cast())?;
+        Ok(desc[4..4 + size].to_vec())
     }
 
     /// Send a request and wait for its response; see [`transact_on`].
@@ -286,6 +342,10 @@ mod tests {
         // HIDIOCSFEATURE(91) / HIDIOCGFEATURE(91) from <linux/hidraw.h>
         assert_eq!(hidioc(HIDIOCSFEATURE_NR, 91), 0xC05B4806);
         assert_eq!(hidioc(HIDIOCGFEATURE_NR, 91), 0xC05B4807);
+        // HIDIOCGRDESCSIZE / HIDIOCGRDESC / HIDIOCGRAWINFO
+        assert_eq!(HIDIOCGRDESCSIZE, 0x80044801);
+        assert_eq!(HIDIOCGRDESC, 0x90044802);
+        assert_eq!(HIDIOCGRAWINFO, 0x80084803);
     }
 
     #[test]

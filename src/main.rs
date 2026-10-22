@@ -55,11 +55,13 @@ COMMANDS:
                              Print every frame a flash would send, against a simulated device.
                              Flashing a real device is not supported yet
     firmware probe-bootloader [--yes-enter-bootloader] [--out FILE]
-                             Put the Viper Mini SE (dongle 1532:009F or USB cable 1532:009E) into its bootloader (1532:110E), record how it
-                             enumerates on Linux (sysfs + usbfs, needs the updated udev rule), ask it the query Razer's
-                             updater asks first (10:80) and, only if the reply is the expected one, try the exit frame.
+                             Put the Viper Mini SE (dongle 1532:009F or USB cable 1532:009E) into its bootloader (1532:110E), or start from
+                             a mouse already in it, record how it enumerates on Linux (sysfs + usbfs or the bootloader's hidraw node,
+                             needs the updated udev rule), ask it the query Razer's updater asks first (10:80) and, only if the reply
+                             is the expected one, try the exit frame.
                              Never erases or writes firmware; without the flag it only prints what it would do.
-                             The mouse is dead while it runs. Worst case: replug the dongle or the cable
+                             The mouse is dead while it runs. Worst case: it stays in its bootloader. Replug the dongle; a replug of
+                             the USB cable does NOT reset the mouse (see the README)
     update [--check]         Ask GitHub whether a newer release exists (only when you run this).
                              Without --check: show what is new, then ask y/N before replacing an
                              AppImage; other installs get the release link or the package command

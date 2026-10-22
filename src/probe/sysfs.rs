@@ -35,6 +35,9 @@ pub struct UsbDevice {
     pub bcd_device: Option<u16>,
     pub product: Option<String>,
     pub interface0: Interface0,
+    /// The hidraw nodes the kernel made for interface 0 (`hidraw0`, ...), found under `<name>:1.0/*/hidraw/` in sysfs: the
+    /// link between a USB device and its `/dev/hidrawN`, whatever the HID name says. Empty if there is none.
+    pub hidraw: Vec<String>,
     /// The kernel's cached descriptors, or why they could not be read.
     pub descriptors: Result<Vec<u8>, String>,
     pub seen_at: SystemTime,
@@ -81,6 +84,22 @@ fn interface0(root: &Path, name: &str) -> Interface0 {
     }
 }
 
+/// The names under `<name>:1.0/<hid device>/hidraw/` (`hidraw0`, ...), sorted: the nodes of interface 0.
+fn hidraw_nodes(root: &Path, name: &str) -> Vec<String> {
+    let Ok(dir) = fs::read_dir(root.join(format!("{name}:1.0"))) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = dir
+        .flatten()
+        .filter_map(|hid| fs::read_dir(hid.path().join("hidraw")).ok())
+        .flat_map(|nodes| nodes.flatten())
+        .map(|n| n.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("hidraw"))
+        .collect();
+    out.sort();
+    out
+}
+
 /// Every USB device under `root` (interfaces and root hubs left out), sorted by name. A missing root is an empty list.
 pub fn scan(root: &Path, seen_at: SystemTime) -> Vec<UsbDevice> {
     let Ok(dir) = fs::read_dir(root) else {
@@ -102,6 +121,7 @@ pub fn scan(root: &Path, seen_at: SystemTime) -> Vec<UsbDevice> {
                 bcd_device: hex16(&d, "bcdDevice"),
                 product: text(&d, "product"),
                 interface0: interface0(root, &name),
+                hidraw: hidraw_nodes(root, &name),
                 descriptors: fs::read(d.join("descriptors")).map_err(|e| e.to_string()),
                 seen_at,
                 name,

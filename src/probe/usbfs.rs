@@ -1,6 +1,7 @@
 //! The probe's second transport (DAN-1929, phase 2b of DAN-1878): USB control transfers on endpoint 0 through Linux usbfs
-//! (`/dev/bus/usb/BBB/DDD`). The bootloader (`1532:110E`) has no interrupt endpoint, so the kernel makes no hidraw node
-//! for it and the hidraw transport cannot reach it. HID feature reports are plain control requests, which usbfs can send.
+//! (`/dev/bus/usb/BBB/DDD`). The dongle's bootloader (`1532:110E`) has no interrupt endpoint, so no driver binds it and the
+//! kernel makes no hidraw node for it. HID feature reports are plain control requests, which usbfs can send. (The mouse's
+//! own bootloader has an interrupt endpoint, `usbhid` binds it and it has a hidraw node: that is `hidboot.rs`.)
 //!
 //! **It can send three requests and nothing else**: the report descriptor read, the feature SET_REPORT (which may carry
 //! the `10:80` query or the `10:05` exit, byte for byte) and its GET_REPORT. The fence, in the same three layers as `hw.rs`:

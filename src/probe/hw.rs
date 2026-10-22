@@ -8,21 +8,25 @@
 //!    control request, so a caller cannot ask it to send one; the methods that write ([`ProbeIo::read_version`],
 //!    [`ProbeIo::enter_bootloader`], [`ProbeIo::query_bootloader`], [`ProbeIo::exit_bootloader`]) build their frame from
 //!    the constructors in `probe/mod.rs`.
-//! 2. Every hidraw write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not one of the
-//!    two normal-mode probe frames ([`super::permitted`]); every usbfs request goes through
-//!    [`super::usbfs::UsbGuarded`], which refuses all but its three. Both are runtime checks at the last point before the
-//!    kernel, so a frame built by hand in this file would still not get out.
+//! 2. Every normal-mode hidraw write goes through [`Guarded`], whose `send_feature` refuses any 90-byte payload that is not
+//!    one of the two normal-mode probe frames ([`super::permitted`]); every usbfs request goes through
+//!    [`super::usbfs::UsbGuarded`], which refuses all but its three; every write to a bound bootloader's hidraw node goes
+//!    through [`super::hidboot::BootGuarded`], which refuses all but the `10:80` and `10:05` frames. These are runtime
+//!    checks at the last point before the kernel, so a frame built by hand in this file would still not get out.
 //! 3. This file does not name the phase-1 DFU module, its trait or its erase/program constructors; the fence test reads
 //!    the source for that.
 
-use super::report::{BootloaderWait, Exchange, Get, OpenFailure, Pair, ReturnWait, SendError};
+use super::hidboot::{self, BootGuarded, BootHid};
+use super::report::{
+    BootloaderWait, Exchange, Get, HidrawOpened, OpenFailure, Pair, ReturnWait, SendError,
+};
 use super::sysfs::{self, UsbDevice};
 use super::usbfs::{self, ControlIo, UsbGuarded, Usbfs};
 use super::{
-    enter_frame, permitted, read_version_frame, Answer, Decoded, ProbeIo, Start, Traffic,
+    enter_frame, permitted, read_version_frame, Answer, Decoded, Origin, ProbeIo, Start, Traffic,
     BOOTLOADER_ID, EXIT_PAIRS, QUERY, QUERY_GETS, QUERY_PAIRS,
 };
-use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode};
+use crate::hidraw::{self, transact_on, FeatureIo, Hidraw, HidrawNode, RawInfo};
 use crate::protocol::{Report, Status, REPORT_LEN};
 use std::fs;
 use std::io;
@@ -104,18 +108,42 @@ pub fn enter_via<T: FeatureIo>(io: &Guarded<T>) -> Result<Answer, SendError> {
     send_and_listen(io, &enter_frame())
 }
 
+/// A guarded channel to the bootloader that carries the two frames of steps 3c and 3d and reads the answers: usbfs control
+/// transfers (the dongle's bootloader, no driver) or the hidraw node `usbhid` made (the mouse's). The polling and re-send
+/// rules below are written once against this and are the same on both.
+pub trait BootChannel {
+    /// `10:80` as a feature SET_REPORT.
+    fn send_query(&self) -> io::Result<()>;
+    /// `10:05` as a feature SET_REPORT.
+    fn send_exit(&self) -> io::Result<()>;
+    /// The 90 bytes of the feature report that answers the last SET.
+    fn read_reply(&self) -> io::Result<Vec<u8>>;
+}
+
+impl<T: ControlIo> BootChannel for UsbGuarded<T> {
+    fn send_query(&self) -> io::Result<()> {
+        usbfs::send_query(self)
+    }
+    fn send_exit(&self) -> io::Result<()> {
+        usbfs::send_exit(self)
+    }
+    fn read_reply(&self) -> io::Result<Vec<u8>> {
+        usbfs::read_reply(self)
+    }
+}
+
 /// One reply read for the report: the 90 bytes, or the error (the errno is kept).
-fn read_get<T: ControlIo>(io: &UsbGuarded<T>) -> Get {
+fn read_get<C: BootChannel>(io: &C) -> Get {
     std::thread::sleep(PRE_DELAY);
     let at = SystemTime::now();
     Get {
         at,
-        reply: usbfs::read_reply(io).map_err(SendError::from),
+        reply: io.read_reply().map_err(SendError::from),
     }
 }
 
 /// One SET_REPORT, after the vendor sender's pre-delay. `gets` is empty; the caller fills it.
-fn send_set<T: ControlIo>(io: &UsbGuarded<T>, send: fn(&UsbGuarded<T>) -> io::Result<()>) -> Pair {
+fn send_set<C: BootChannel>(io: &C, send: fn(&C) -> io::Result<()>) -> Pair {
     std::thread::sleep(PRE_DELAY);
     let set_at = SystemTime::now();
     Pair {
@@ -143,14 +171,14 @@ fn poll_query(raw: &[u8]) -> Poll {
     }
 }
 
-/// Step 3c on any guarded usbfs channel: `10:80` as a feature SET_REPORT, then up to [`QUERY_GETS`] GET_REPORTs, each after
+/// Step 3c on any guarded bootloader channel: `10:80` as a feature SET_REPORT, then up to [`QUERY_GETS`] GET_REPORTs, each after
 /// [`PRE_DELAY`]. Status 0 or 1, a failed GET and a reply to another frame are polled again; any other status re-sends the
 /// SET at once, and so do five GETs without an answer. At most [`QUERY_PAIRS`] SET/GET pairs. A SET that fails ends it
 /// (the device may have left the bus). The caller decides what the last reply means ([`super::gate`]).
-pub fn query_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
+pub fn query_via<C: BootChannel>(io: &C) -> Exchange {
     let mut x = Exchange::default();
     for _ in 0..QUERY_PAIRS {
-        let mut pair = send_set(io, usbfs::send_query);
+        let mut pair = send_set(io, C::send_query);
         if pair.set.is_err() {
             x.pairs.push(pair);
             return x;
@@ -180,14 +208,14 @@ pub fn query_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
     x
 }
 
-/// Step 3d on any guarded usbfs channel: `10:05` as a feature SET_REPORT, then one GET_REPORT, each after [`PRE_DELAY`].
+/// Step 3d on any guarded bootloader channel: `10:05` as a feature SET_REPORT, then one GET_REPORT, each after [`PRE_DELAY`].
 /// A failed GET or a status other than 2 re-sends the same SET, up to [`EXIT_PAIRS`] SET/GET pairs; the result is logged and
 /// never an error of its own, as in the vendor's updater. A SET that fails ends it: the device leaving the bus in the
 /// middle of the transfer is the shape of the exit working, which the caller checks for.
-pub fn exit_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
+pub fn exit_via<C: BootChannel>(io: &C) -> Exchange {
     let mut x = Exchange::default();
     for _ in 0..EXIT_PAIRS {
-        let mut pair = send_set(io, usbfs::send_exit);
+        let mut pair = send_set(io, C::send_exit);
         if pair.set.is_err() {
             x.pairs.push(pair);
             return x;
@@ -203,11 +231,14 @@ pub fn exit_via<T: ControlIo>(io: &UsbGuarded<T>) -> Exchange {
     x
 }
 
-/// Where the probe looks: the kernel's USB device list and the usbfs nodes. The tests point both at a fixture tree.
+/// Where the probe looks: the kernel's USB device list, the usbfs nodes and the hidraw nodes. The tests point all three at a
+/// fixture tree.
 #[derive(Debug, Clone)]
 pub struct Roots {
     pub sysfs: PathBuf,
     pub dev: PathBuf,
+    /// Where `/dev/hidrawN` lives: a bootloader's sysfs entry names its node (`hidraw0`), this says where that node is.
+    pub hidraw: PathBuf,
 }
 
 impl Roots {
@@ -215,36 +246,76 @@ impl Roots {
         Roots {
             sysfs: PathBuf::from(sysfs::DEFAULT_ROOT),
             dev: PathBuf::from("/dev/bus/usb"),
+            hidraw: PathBuf::from("/dev"),
         }
     }
 }
 
-/// The real device: the dongle's control node, and later the usbfs node its bootloader appears on.
-pub struct RealProbe {
-    normal: Guarded<Hidraw>,
-    node: HidrawNode,
-    roots: Roots,
-    usb: Option<UsbGuarded<Usbfs>>,
-    start: Start,
+/// What is open on the bootloader once step 3b has run: usbfs (no driver bound) or the hidraw node (`usbhid` bound).
+enum BootOpen {
+    Usb(UsbGuarded<Usbfs>),
+    Hid(BootGuarded<Hidraw>),
 }
 
-/// The nodes of `1532:009F` and `1532:009E` that exist now.
+/// The real device: the dongle's (or the cable's) control node, or, for a run that starts from the bootloader, none; and
+/// later the usbfs or hidraw node its bootloader appears on.
+pub struct RealProbe {
+    /// `None` when the run starts from the bootloader: there is no normal-mode node to open.
+    normal: Option<Guarded<Hidraw>>,
+    node: HidrawNode,
+    roots: Roots,
+    boot: Option<BootOpen>,
+    origin: Origin,
+}
+
+/// The nodes of `1532:009F`, `1532:009E` and `1532:110E` that exist now.
 pub fn probe_nodes() -> io::Result<Vec<HidrawNode>> {
     Ok(hidraw::enumerate()?
         .into_iter()
-        .filter(|n| Start::of((n.vid, n.pid)).is_some())
+        .filter(|n| Start::of((n.vid, n.pid)).is_some() || (n.vid, n.pid) == BOOTLOADER_ID)
         .collect())
 }
 
-/// Which identity the run starts from: exactly one of the dongle (`009F`) and the cable (`009E`) must be present. Both, or
-/// neither, is a refusal that says which were found; nothing is sent then.
-pub fn select_start(nodes: &[HidrawNode]) -> Result<Start, String> {
-    let has = |s: Start| nodes.iter().any(|n| (n.vid, n.pid) == s.id());
-    match (has(Start::Dongle), has(Start::Cable)) {
-        (true, false) => Ok(Start::Dongle),
-        (false, true) => Ok(Start::Cable),
-        (true, true) => Err("refusing: both the dongle 1532:009F and the mouse on its USB cable 1532:009E are connected (found 1532:009F and 1532:009E); unplug one of them so the probe knows which to use. Nothing was sent".into()),
-        (false, false) => Err("refusing: neither the Razer dongle 1532:009F nor the mouse on its USB cable 1532:009E is connected (found neither); nothing was sent".into()),
+/// Where the run starts: exactly one of the dongle (`009F`), the cable (`009E`) and one mouse already in its bootloader
+/// (`110E`, on hidraw) must be present. Any other mix, none, or two `110E` nodes is a refusal that says what was found; nothing
+/// is sent then.
+pub fn select_origin(nodes: &[HidrawNode]) -> Result<Origin, String> {
+    let count = |id: (u16, u16)| nodes.iter().filter(|n| (n.vid, n.pid) == id).count();
+    match (
+        count(Start::Dongle.id()),
+        count(Start::Cable.id()),
+        count(BOOTLOADER_ID),
+    ) {
+        (d, 0, 0) if d > 0 => Ok(Origin::Normal(Start::Dongle)),
+        (0, c, 0) if c > 0 => Ok(Origin::Normal(Start::Cable)),
+        (0, 0, 1) => Ok(Origin::Bootloader(None)),
+        (0, 0, 0) => Err("refusing: neither the Razer dongle 1532:009F, nor the mouse on its USB cable 1532:009E, nor a mouse in its bootloader 1532:110E is connected (found neither); nothing was sent".into()),
+        (d, c, 0) if d > 0 && c > 0 => Err("refusing: both the dongle 1532:009F and the mouse on its USB cable 1532:009E are connected (found 1532:009F and 1532:009E); unplug one of them so the probe knows which to use. Nothing was sent".into()),
+        _ => {
+            let mut found: Vec<String> = nodes
+                .iter()
+                .map(|n| format!("{:04X}:{:04X} {}", n.vid, n.pid, n.dev.display()))
+                .collect();
+            found.sort();
+            Err(format!(
+                "refusing: found {}; the probe starts from exactly one of the dongle 1532:009F, the mouse on its USB cable 1532:009E, or one mouse already in its bootloader 1532:110E on hidraw, never a mix or two bootloaders. Unplug the others. Nothing was sent",
+                found.join(", ")
+            ))
+        }
+    }
+}
+
+/// A bootloader start needs exactly one `1532:110E` USB device on the bus: the dongle's bootloader, which has no hidraw node,
+/// would otherwise be indistinguishable from the mouse's when step 3 looks the device up by id. Anything else is a refusal.
+pub fn single_bootloader(sysfs_root: &Path) -> Result<(), String> {
+    let n = sysfs::scan(sysfs_root, SystemTime::UNIX_EPOCH)
+        .iter()
+        .filter(|d| (d.vid, d.pid) == BOOTLOADER_ID)
+        .count();
+    if n == 1 {
+        Ok(())
+    } else {
+        Err(format!("refusing: {n} devices 1532:110E are listed in {}; the probe starts from exactly one bootloader (unplug the others). Nothing was sent", sysfs_root.display()))
     }
 }
 
@@ -271,23 +342,31 @@ fn poll_until(timeout: Duration, mut done: impl FnMut() -> bool) -> Option<Durat
 }
 
 impl RealProbe {
-    /// Open the control node of the dongle for read/write. Sends nothing.
+    /// Open the control node of the dongle or the cable for read/write. Sends nothing. For the node of a bootloader
+    /// (`1532:110E`) nothing is opened here: the run is told where it started, and step 3b opens the node it finds in sysfs.
     pub fn open(node: &HidrawNode, roots: Roots) -> io::Result<RealProbe> {
-        let start = Start::of((node.vid, node.pid)).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!(
-                    "{:04x}:{:04x} is neither 1532:009F nor 1532:009E",
-                    node.vid, node.pid
-                ),
-            )
-        })?;
+        let (normal, origin) = match Start::of((node.vid, node.pid)) {
+            Some(start) => (
+                Some(Guarded(Hidraw::open(&node.dev)?)),
+                Origin::Normal(start),
+            ),
+            None if (node.vid, node.pid) == BOOTLOADER_ID => (None, Origin::Bootloader(None)),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "{:04x}:{:04x} is none of 1532:009F, 1532:009E and 1532:110E",
+                        node.vid, node.pid
+                    ),
+                ))
+            }
+        };
         Ok(RealProbe {
-            normal: Guarded(Hidraw::open(&node.dev)?),
+            normal,
             node: node.clone(),
             roots,
-            usb: None,
-            start,
+            boot: None,
+            origin,
         })
     }
 
@@ -305,18 +384,35 @@ impl RealProbe {
     }
 }
 
-/// What a frame that was asked for without an open usbfs node produced: a failed SET, nothing on the wire.
+const NO_NORMAL_NODE: &str = "the run started from the bootloader: there is no normal-mode node";
+
+/// What a frame that was asked for without an open bootloader node produced: a failed SET, nothing on the wire.
 fn never_opened() -> Exchange {
     Exchange {
         pairs: vec![Pair {
             set_at: SystemTime::now(),
             set: Err(SendError {
                 errno: None,
-                message: "the usbfs node was never opened".into(),
+                message: "the bootloader's node was never opened".into(),
             }),
             gets: Vec::new(),
         }],
     }
+}
+
+/// The node sysfs linked to the bootloader must itself say it is `1532:110E` (`HIDIOCGRAWINFO`) before anything is sent to it.
+pub fn check_node_is_bootloader(node: &Path, info: &RawInfo) -> Result<(), OpenFailure> {
+    if (info.vendor, info.product) == BOOTLOADER_ID {
+        return Ok(());
+    }
+    Err(OpenFailure {
+        node: node.display().to_string(),
+        errno: None,
+        message: format!(
+            "HIDIOCGRAWINFO says {:04x}:{:04x}, not 1532:110E",
+            info.vendor, info.product
+        ),
+    })
 }
 
 fn open_failure(node: &Path, e: &io::Error) -> OpenFailure {
@@ -332,8 +428,8 @@ impl ProbeIo for RealProbe {
         SystemTime::now()
     }
 
-    fn start(&self) -> Start {
-        self.start
+    fn origin(&self) -> Origin {
+        self.origin
     }
 
     fn describe_device(&self) -> String {
@@ -348,15 +444,25 @@ impl ProbeIo for RealProbe {
     }
 
     fn read_version(&mut self) -> Result<Report, String> {
-        read_version_via(&self.normal)
+        match &self.normal {
+            Some(normal) => read_version_via(normal),
+            None => Err(NO_NORMAL_NODE.into()),
+        }
     }
 
     fn enter_bootloader(&mut self) -> Result<Answer, SendError> {
-        enter_via(&self.normal)
+        match &self.normal {
+            Some(normal) => enter_via(normal),
+            None => Err(SendError {
+                errno: None,
+                message: NO_NORMAL_NODE.into(),
+            }),
+        }
     }
 
     fn wait_for_dongle_gone(&mut self, timeout: Duration) -> Option<Duration> {
-        poll_until(timeout, || !self.present(self.start.id()))
+        let start = self.origin.target()?;
+        poll_until(timeout, || !self.present(start.id()))
     }
 
     fn wait_for_bootloader(&mut self, timeout: Duration) -> BootloaderWait {
@@ -405,28 +511,72 @@ impl ProbeIo for RealProbe {
         };
         usb.claim_interface(usbfs::INTERFACE)
             .map_err(|e| open_failure(&path, &e))?;
-        self.usb = Some(usb);
+        self.boot = Some(BootOpen::Usb(usb));
         Ok(path.display().to_string())
     }
 
+    fn open_hidraw(&mut self, device: &UsbDevice) -> Result<HidrawOpened, OpenFailure> {
+        // the node is the hidraw child sysfs lists under the device's interface 0, never one picked by its HID name
+        let [name] = device.hidraw.as_slice() else {
+            return Err(OpenFailure {
+                node: "(unknown)".into(),
+                errno: None,
+                message: format!(
+                    "{} has {} hidraw node(s) in sysfs, not exactly one",
+                    device.name,
+                    device.hidraw.len()
+                ),
+            });
+        };
+        let path = self.roots.hidraw.join(name);
+        let start = Instant::now();
+        let hid = loop {
+            match hidboot::open(&path) {
+                Ok(h) => break h,
+                // udev applies the ACL just after the node appears
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
+                    ) && start.elapsed() < OPEN_RETRY =>
+                {
+                    std::thread::sleep(POLL)
+                }
+                Err(e) => return Err(open_failure(&path, &e)),
+            }
+        };
+        let info = hid.raw_info().map_err(|e| open_failure(&path, &e))?;
+        check_node_is_bootloader(&path, &info)?;
+        self.boot = Some(BootOpen::Hid(hid));
+        Ok(HidrawOpened {
+            node: path.display().to_string(),
+            info,
+        })
+    }
+
     fn read_report_descriptor(&mut self) -> Result<Vec<u8>, SendError> {
-        let usb = self.usb.as_ref().ok_or(SendError {
-            errno: None,
-            message: "the usbfs node was never opened".into(),
-        })?;
-        usbfs::read_report_descriptor(usb).map_err(SendError::from)
+        match &self.boot {
+            Some(BootOpen::Usb(usb)) => usbfs::read_report_descriptor(usb).map_err(SendError::from),
+            Some(BootOpen::Hid(hid)) => hid.report_descriptor().map_err(SendError::from),
+            None => Err(SendError {
+                errno: None,
+                message: "the bootloader's node was never opened".into(),
+            }),
+        }
     }
 
     fn query_bootloader(&mut self) -> Exchange {
-        match &self.usb {
-            Some(usb) => query_via(usb),
+        match &self.boot {
+            Some(BootOpen::Usb(usb)) => query_via(usb),
+            Some(BootOpen::Hid(hid)) => query_via(hid),
             None => never_opened(),
         }
     }
 
     fn exit_bootloader(&mut self) -> Exchange {
-        match &self.usb {
-            Some(usb) => exit_via(usb),
+        match &self.boot {
+            Some(BootOpen::Usb(usb)) => exit_via(usb),
+            Some(BootOpen::Hid(hid)) => exit_via(hid),
             None => never_opened(),
         }
     }
@@ -435,11 +585,11 @@ impl ProbeIo for RealProbe {
         poll_until(timeout, || !self.present(BOOTLOADER_ID))
     }
 
-    fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait {
+    fn wait_for_return(&mut self, target: Start, timeout: Duration) -> ReturnWait {
         let mut back_at = None;
         poll_until(timeout, || {
             let now = sysfs::scan(&self.roots.sysfs, SystemTime::now());
-            let back = now.iter().any(|d| (d.vid, d.pid) == self.start.id())
+            let back = now.iter().any(|d| (d.vid, d.pid) == target.id())
                 && !now.iter().any(|d| (d.vid, d.pid) == BOOTLOADER_ID);
             if back {
                 back_at = Some(SystemTime::now());

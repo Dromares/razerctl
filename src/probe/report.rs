@@ -4,7 +4,7 @@
 use super::sysfs::{Interface0, UsbDevice};
 use super::usbfs::Setup;
 use super::{
-    exit_frame, query_frame, Build, Decoded, Start, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
+    exit_frame, query_frame, Build, Decoded, Origin, BOOTLOADER_TIMEOUT, EXIT, EXIT_PAIRS, QUERY,
     QUERY_PAIRS, RETURN_TIMEOUT, UDEV_HINT,
 };
 use crate::protocol::REPORT_LEN;
@@ -130,6 +130,13 @@ impl std::fmt::Display for OpenFailure {
     }
 }
 
+/// The bootloader's hidraw node, once it was opened (DAN-1948): the path and what `HIDIOCGRAWINFO` said it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HidrawOpened {
+    pub node: String,
+    pub info: crate::hidraw::RawInfo,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Every step ran and the starting identity came back.
@@ -144,7 +151,13 @@ pub enum Outcome {
         why: String,
         permission: bool,
     },
-    /// Step 3b: a kernel driver owns interface 0. Not detached; nothing was sent.
+    /// Step 3b: the bootloader's hidraw node could not be opened, or it is not `1532:110E`. Nothing was sent. `permission` as
+    /// for [`Outcome::UsbfsUnavailable`].
+    HidrawUnavailable {
+        why: String,
+        permission: bool,
+    },
+    /// Step 3b: a kernel driver owns interface 0 and it is not `usbhid` with one hidraw node. Not detached; nothing was sent.
     DriverBound(String),
     /// Step 3c: the `10:80` query got no answer the gate accepts (no reply, a status other than 2, a different frame
     /// echoed, or a PID other than the starting one), so `10:05` was **not** sent and nothing further was.
@@ -156,7 +169,7 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// After these the dongle may still be in its bootloader, so the user is told to replug.
+    /// After these the device may still be in its bootloader, so the user is told how to get it back ([`Origin::recovery`]).
     pub fn needs_replug(&self) -> bool {
         !matches!(
             self,
@@ -169,11 +182,14 @@ impl Outcome {
     }
 
     /// What the user should do next, one line each.
-    pub fn next_steps(&self, start: Start) -> Vec<String> {
+    pub fn next_steps(&self, origin: Origin) -> Vec<String> {
         let mut out = Vec::new();
         if matches!(
             self,
             Outcome::UsbfsUnavailable {
+                permission: true,
+                ..
+            } | Outcome::HidrawUnavailable {
                 permission: true,
                 ..
             }
@@ -181,17 +197,17 @@ impl Outcome {
             out.push(UDEV_HINT.to_string());
         }
         if self.needs_replug() {
-            out.push(start.replug());
+            out.extend(origin.recovery());
         }
         out
     }
 
-    fn headline(&self, start: Start) -> String {
+    fn headline(&self, origin: Origin) -> String {
         match self {
             Outcome::Completed => {
                 format!(
                 "COMPLETED: every step ran and {} is listed again (timing below)",
-                start.id_text()
+                origin.target_text()
             )
             }
             Outcome::ReadVersionFailed(w) => {
@@ -207,6 +223,9 @@ impl Outcome {
             Outcome::UsbfsUnavailable { why: w, .. } => {
                 format!("STOPPED at step 3b (usbfs): {w}. Nothing was sent to the bootloader")
             }
+            Outcome::HidrawUnavailable { why: w, .. } => {
+                format!("STOPPED at step 3b (hidraw): {w}. Nothing was sent to the bootloader")
+            }
             Outcome::DriverBound(w) => format!(
                 "STOPPED at step 3b (usbfs): {w}. Not detached; nothing was sent to the bootloader"
             ),
@@ -218,7 +237,7 @@ impl Outcome {
             ),
             Outcome::DidNotReturn => format!(
                 "STEP 4 TIMED OUT: {} did not come back within {} s of 10:05",
-                start.id_text(),
+                origin.target_text(),
                 RETURN_TIMEOUT.as_secs()
             ),
         }
@@ -256,8 +275,9 @@ impl Step {
 #[derive(Debug)]
 pub struct ProbeLog {
     pub build: Build,
-    /// The identity the run started from: the dongle `1532:009F` or the cable `1532:009E`.
-    pub start: Start,
+    /// Where the run began: the dongle `1532:009F`, the cable `1532:009E`, or the bootloader (with the identity its `10:80`
+    /// reply named, once there is one).
+    pub origin: Origin,
     pub started: SystemTime,
     pub device: String,
     pub steps: Vec<Step>,
@@ -270,6 +290,8 @@ pub struct ProbeLog {
     pub appeared_at: Option<SystemTime>,
     /// Step 3b: the usbfs node that was opened, or why it could not be.
     pub usbfs: Option<Result<String, OpenFailure>>,
+    /// Step 3b, when the bootloader is bound to `usbhid`: the hidraw node that was opened instead of usbfs, or why it could not be.
+    pub hidraw: Option<Result<HidrawOpened, OpenFailure>>,
     /// Step 3b: the HID report descriptor of interface 0, or the errno of the read.
     pub report_descriptor: Option<Result<Vec<u8>, SendError>>,
     /// Step 3: when the settle wait after `1532:110E` appeared ended.
@@ -295,10 +317,10 @@ fn secs_between(from: SystemTime, to: SystemTime) -> f64 {
 }
 
 impl ProbeLog {
-    pub fn new(build: Build, started: SystemTime, device: String, start: Start) -> ProbeLog {
+    pub fn new(build: Build, started: SystemTime, device: String, origin: Origin) -> ProbeLog {
         ProbeLog {
             build,
-            start,
+            origin,
             started,
             device,
             steps: Vec::new(),
@@ -307,6 +329,7 @@ impl ProbeLog {
             bootloader: None,
             appeared_at: None,
             usbfs: None,
+            hidraw: None,
             report_descriptor: None,
             settled_at: None,
             timeout_nodes: Vec::new(),
@@ -331,26 +354,26 @@ impl ProbeLog {
 
     pub fn render(&self) -> String {
         let mut o = String::new();
-        let _ = writeln!(o, "razerctl bootloader probe v4 (DAN-1944, for DAN-1878)");
+        let _ = writeln!(o, "razerctl bootloader probe v5 (DAN-1948, for DAN-1878)");
         let _ = writeln!(
             o,
             "razerctl {} git {}",
             self.build.version, self.build.git_sha
         );
         let _ = writeln!(o, "started {}", utc(self.started));
-        let _ = writeln!(o, "started from {}", self.start.label());
+        let _ = writeln!(o, "started from {}", self.origin.label());
         let _ = writeln!(o, "device  {}", self.device);
         let _ = writeln!(
             o,
             "RESULT  {}",
             match &self.outcome {
-                Some(r) => r.headline(self.start),
+                Some(r) => r.headline(self.origin),
                 None => "INCOMPLETE: the program stopped before it finished (this is a checkpoint)"
                     .into(),
             }
         );
         if let Some(r) = &self.outcome {
-            for n in r.next_steps(self.start) {
+            for n in r.next_steps(self.origin) {
                 let _ = writeln!(o, "NEXT    {n}");
             }
         }
@@ -374,6 +397,7 @@ impl ProbeLog {
         }
         self.render_bootloader(&mut o);
         self.render_usbfs(&mut o);
+        self.render_hidraw(&mut o);
         self.render_query(&mut o);
         self.render_exit(&mut o);
         if self.has_step("4") {
@@ -431,6 +455,15 @@ impl ProbeLog {
                 Interface0::Bound(n) => format!("`{n}`"),
             }
         );
+        let _ = writeln!(
+            o,
+            "  hidraw node(s) of interface 0: {}",
+            if d.hidraw.is_empty() {
+                "none".to_string()
+            } else {
+                d.hidraw.join(", ")
+            }
+        );
         match &d.descriptors {
             Ok(b) => {
                 let _ = writeln!(o, "  kernel descriptors ({} bytes): {}", b.len(), hex(b));
@@ -438,6 +471,50 @@ impl ProbeLog {
             Err(e) => {
                 let _ = writeln!(o, "  kernel descriptors: could not be read ({e})");
             }
+        }
+    }
+
+    /// Step 3b through the bootloader's hidraw node (`usbhid` is bound): the node, what `HIDIOCGRAWINFO` said, and the report
+    /// descriptor the kernel parsed.
+    fn render_hidraw(&self, o: &mut String) {
+        match &self.hidraw {
+            Some(Ok(h)) => {
+                let _ = writeln!(
+                    o,
+                    "\nhidraw (step 3b): opened {} as the current user, nothing was detached; HIDIOCGRAWINFO: bustype {} vendor {:04x} product {:04x}",
+                    h.node, h.info.bustype, h.info.vendor, h.info.product
+                );
+            }
+            Some(Err(f)) => {
+                let need_root = f.is_permission_error();
+                let _ = writeln!(
+                    o,
+                    "\nhidraw (step 3b): FAILED, {f}; {}. Not escalated, nothing was sent.",
+                    if need_root {
+                        "the udev rule does not let this user open it (is udev/70-razerctl.rules installed?)"
+                    } else {
+                        "this is not a permission error"
+                    }
+                );
+            }
+            None => return,
+        }
+        match &self.report_descriptor {
+            Some(Ok(b)) => {
+                let _ = writeln!(
+                    o,
+                    "HID report descriptor of the node, HIDIOCGRDESCSIZE/HIDIOCGRDESC ({} bytes): {}",
+                    b.len(),
+                    hex(b)
+                );
+            }
+            Some(Err(e)) => {
+                let _ = writeln!(
+                    o,
+                    "HID report descriptor of the node, HIDIOCGRDESCSIZE/HIDIOCGRDESC: FAILED, {e}"
+                );
+            }
+            None => {}
         }
     }
 
@@ -527,8 +604,17 @@ impl ProbeLog {
         max_pairs: usize,
         x: &Exchange,
     ) {
-        let set = setup_hex(&Setup::set_report_feature());
-        let get = setup_hex(&Setup::get_report_feature());
+        let (set, get) = if self.hidraw.is_some() {
+            (
+                "HIDIOCSFEATURE (report id 00, then the 90 bytes)".to_string(),
+                "HIDIOCGFEATURE (report id 00)".to_string(),
+            )
+        } else {
+            (
+                setup_hex(&Setup::set_report_feature()),
+                setup_hex(&Setup::get_report_feature()),
+            )
+        };
         for (i, p) in x.pairs.iter().enumerate() {
             let n = i + 1;
             match &p.set {
@@ -602,7 +688,7 @@ impl ProbeLog {
         let _ = writeln!(
             o,
             "\n{} after 10:05: {}",
-            self.start.id_text(),
+            self.origin.target_text(),
             match self.returned_at {
                 Some(back) => {
                     let mut s = String::new();
