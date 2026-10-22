@@ -154,14 +154,14 @@ impl Origin {
     }
 }
 
-/// How long step 3 waits for `1532:110E` before it gives up and tells the user to replug. The board's kernel log has it
+/// How long step 3 waits for `1532:110E` before it gives up and tells the user how to get the mouse back ([`Origin::recovery`]). The board's kernel log has it
 /// enumerated about a second after the enter frame.
 pub const BOOTLOADER_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long steps 2 and 3d wait for a device to leave the bus after a send that returned an error.
 pub const LEAVE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long step 4 waits for the starting identity to come back, counted from the exit send. If `10:05` works it is back within
-/// seconds. Nothing shows that the bootloader ever leaves by itself (the return on the board's first run was a replug),
-/// so a timeout here means the device has to be replugged.
+/// seconds. Nothing shows that the bootloader ever leaves by itself (the return on the board's first run was a dongle replug),
+/// so a timeout here means the device may still be in its bootloader (a dongle recovers with a replug, the mouse does not).
 pub const RETURN_TIMEOUT: Duration = Duration::from_secs(30);
 /// SET/GET pairs of the `10:80` query: a status other than 0, 1 or 2 (or five GETs without an answer) re-sends the SET.
 pub const QUERY_PAIRS: usize = 3;
