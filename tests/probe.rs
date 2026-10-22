@@ -123,7 +123,7 @@ fn only_the_two_normal_mode_frames_are_permitted_over_hidraw() {
         assert!(permitted(&f.to_bytes()), "{f:?}");
     }
     let refused: Vec<(&str, Report)> = vec![
-        // 10:80 and 10:05 are the usbfs transport's frames: the bootloader has no hidraw node, so hidraw never carries them
+        // 10:80 and 10:05 are a bootloader's frames (usbfs, or hidboot's own allow-list): a normal-mode hidraw node never carries them
         ("query 10:80", query_frame()),
         ("exit 10:05", exit_frame()),
         ("erase 10:01", dfu::erase_frame(0x1000, 0x2000)),

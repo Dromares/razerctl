@@ -190,8 +190,8 @@ pub fn exit_frame() -> Report {
     Report::new(EXIT, 0, TID)
 }
 
-/// The hidraw allow-list: the two normal-mode frames, byte for byte. (`10:80` and `10:05` are not on it: the bootloader
-/// has no hidraw node, so they only go out through [`usbfs`].)
+/// The hidraw allow-list of a normal-mode node: the two normal-mode frames, byte for byte. (`10:80` and `10:05` are not on
+/// it: they go to a bootloader, through [`usbfs`] or through [`hidboot`]'s own allow-list on the bootloader's node.)
 pub fn permitted(bytes: &[u8; REPORT_LEN]) -> bool {
     [read_version_frame(), enter_frame()]
         .iter()
