@@ -2,14 +2,15 @@
 //! before the device is touched, and the output file. The order is fixed and every step before the last can only refuse:
 //!
 //! 1. without `--yes-enter-bootloader`: print the plan, exit non-zero, open nothing;
-//! 2. find the starting identity: exactly one of the dongle (`1532:009F`) and the cable (`1532:009E`) must be on hidraw (both, or
-//!    neither, is refused), and it must be exactly one device with a usable control node;
+//! 2. find where the run starts: exactly one of the dongle (`1532:009F`), the cable (`1532:009E`) and one mouse already in its
+//!    bootloader (`1532:110E`, on hidraw) must be present (any mix, none, or two bootloaders is refused), and it must be exactly
+//!    one device with a usable control node;
 //! 3. refuse if other razerctl or openrazer traffic is on it ([`super::refusals`]);
 //! 4. create the output file (it must not exist yet), so an unwritable path is found before the device is touched;
 //! 5. open the control node and run the steps ([`super::run`]).
 
 use super::hw::{self, RealProbe, Roots};
-use super::{plan_text, refusals, report::ProbeLog, run, Build};
+use super::{plan_text, refusals, report::ProbeLog, run, Build, Origin, BOOTLOADER_ID};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -67,11 +68,15 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     }
 
     let all = hw::probe_nodes().map_err(|e| format!("listing HID devices: {e}"))?;
-    let start = hw::select_start(&all)?;
-    let nodes: Vec<_> = all
-        .into_iter()
-        .filter(|n| (n.vid, n.pid) == start.id())
-        .collect();
+    let origin = hw::select_origin(&all)?;
+    let (want, want_text) = match origin {
+        Origin::Normal(start) => (start.id(), start.id_text()),
+        Origin::Bootloader(_) => (BOOTLOADER_ID, "1532:110E".to_string()),
+    };
+    let nodes: Vec<_> = all.into_iter().filter(|n| (n.vid, n.pid) == want).collect();
+    if let Origin::Bootloader(_) = origin {
+        hw::single_bootloader(Path::new(super::sysfs::DEFAULT_ROOT))?;
+    }
     let devices: std::collections::HashSet<_> = nodes
         .iter()
         .filter_map(|n| {
@@ -84,14 +89,17 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
         .collect();
     if devices.len() > 1 {
         return Err(format!(
-            "refusing: more than one {} device is connected; unplug the others. Nothing was sent",
-            start.id_text()
+            "refusing: more than one {want_text} device is connected; unplug the others. Nothing was sent"
         ));
     }
-    let Some(control) = hw::control_node(&nodes) else {
+    // a bootloader start has no normal-mode node to pick: select_origin saw exactly one bootloader node
+    let control = match origin {
+        Origin::Normal(_) => hw::control_node(&nodes),
+        Origin::Bootloader(_) => nodes.first(),
+    };
+    let Some(control) = control else {
         return Err(format!(
-            "refusing: no {} interface with a feature report was found; nothing was sent",
-            start.id_text()
+            "refusing: no {want_text} interface with a feature report was found; nothing was sent"
         ));
     };
 
@@ -121,12 +129,19 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
         )
     })?;
 
-    eprintln!(
-        "starting from the {}; entering the bootloader of {} now; the mouse stops working until this ends (writing {})",
-        start.label(),
-        control.dev.display(),
-        out.display()
-    );
+    match origin {
+        Origin::Normal(start) => eprintln!(
+            "starting from the {}; entering the bootloader of {} now; the mouse stops working until this ends (writing {})",
+            start.label(),
+            control.dev.display(),
+            out.display()
+        ),
+        Origin::Bootloader(_) => eprintln!(
+            "starting from the bootloader ({}); asking it 10:80 now, and sending exit only if it names the mouse; the mouse stays out of use until this ends (writing {})",
+            control.dev.display(),
+            out.display()
+        ),
+    }
     let mut write_failed = false;
     let log = run(&mut probe, &build(), &mut |l: &ProbeLog| {
         if let Err(e) = fs::write(&out, l.render()) {
@@ -149,7 +164,10 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     }
     let _ = std::io::stdout().flush();
     let outcome = log.outcome.as_ref();
-    for n in outcome.map(|o| o.next_steps(start)).unwrap_or_default() {
+    for n in outcome
+        .map(|o| o.next_steps(log.origin))
+        .unwrap_or_default()
+    {
         eprintln!("{n}");
     }
     match outcome {
