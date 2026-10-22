@@ -139,6 +139,14 @@ const HIDIOCGRDESCSIZE: u64 = hidioc_read(0x01, 4);
 const HIDIOCGRDESC: u64 = hidioc_read(0x02, 4 + HIDRAW_DESC_MAX);
 const HIDIOCGRAWINFO: u64 = hidioc_read(0x03, 8);
 
+/// The 91 bytes `HIDIOCSFEATURE` is given for a payload: report id `0x00`, then the 90 bytes. Every feature report razerctl
+/// sends, probe frames included, goes out through this.
+pub fn feature_buffer(payload: &[u8; REPORT_LEN]) -> [u8; REPORT_LEN + 1] {
+    let mut buf = [0u8; REPORT_LEN + 1];
+    buf[1..].copy_from_slice(payload);
+    buf
+}
+
 /// What `HIDIOCGRAWINFO` reports about a node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RawInfo {
@@ -174,8 +182,7 @@ impl Hidraw {
 
     /// 91-byte feature report: report ID 0 + 90-byte payload (UsbRzDeviceAction.js).
     pub fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {
-        let mut buf = [0u8; REPORT_LEN + 1];
-        buf[1..].copy_from_slice(payload);
+        let mut buf = feature_buffer(payload);
         self.ioctl(HIDIOCSFEATURE_NR, &mut buf).map(|_| ())
     }
 

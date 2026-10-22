@@ -4,22 +4,24 @@
 //! reads the real `/sys`, and the one test that runs the binary does so without `--yes-enter-bootloader`.
 
 use razerctl::firmware::{dfu, flash};
-use razerctl::hidraw::FeatureIo;
+use razerctl::hidraw::{FeatureIo, RawInfo};
 use razerctl::probe::cli;
-use razerctl::probe::hw::{self, Guarded, RealProbe, Roots};
+use razerctl::probe::hidboot::{self, BootGuarded, BootHid};
+use razerctl::probe::hw::{self, BootChannel, Guarded, RealProbe, Roots};
 use razerctl::probe::report::{
-    utc, BootloaderWait, Exchange, Get, OpenFailure, Outcome, Pair, ProbeLog, ReturnWait, SendError,
+    utc, BootloaderWait, Exchange, Get, HidrawOpened, OpenFailure, Outcome, Pair, ProbeLog,
+    ReturnWait, SendError,
 };
 use razerctl::probe::sysfs::{self, Interface0, UsbDevice};
 use razerctl::probe::usbfs::{self, ControlIo, Setup, UsbGuarded};
 use razerctl::probe::{
     self, enter_frame, exit_frame, permitted, query_frame, read_version_frame, Answer, Build,
-    Decoded, ProbeIo, Start, Traffic, BOOTLOADER_ID, CABLE_ID, NORMAL_ID,
+    Decoded, Origin, ProbeIo, Start, Traffic, BOOTLOADER_ID, CABLE_ID, NORMAL_ID,
 };
 
 /// The gate of a run that started from the dongle, which is what every test written before probe v4 is about.
 fn gate(query: &Exchange) -> Result<u16, String> {
-    probe::gate(query, Start::Dongle)
+    probe::gate(query, Origin::Normal(Start::Dongle))
 }
 use razerctl::protocol::{Report, REPORT_LEN};
 use std::cell::RefCell;
@@ -484,8 +486,8 @@ fn a_failed_get_and_a_reply_to_another_frame_are_polled_again() {
     let q = hw::query_via(&g);
     assert_eq!((g.0.sets().len(), g.0.gets_seen()), (1, 3));
     // the reply that finally answers names 009E: it opens the gate for a cable start and not for a dongle start
-    assert_eq!(probe::gate(&q, Start::Cable), Ok(0x009E));
-    assert!(probe::gate(&q, Start::Dongle).is_err());
+    assert_eq!(probe::gate(&q, Origin::Normal(Start::Cable)), Ok(0x009E));
+    assert!(probe::gate(&q, Origin::Normal(Start::Dongle)).is_err());
 }
 
 #[test]
@@ -953,6 +955,7 @@ fn bootloader_device(interface0: Interface0) -> UsbDevice {
         bcd_device: Some(0x009f),
         product: Some("RAZER BOOTLOADER".into()),
         interface0,
+        hidraw: Vec::new(),
         descriptors: Ok(KERNEL_DESC.to_vec()),
         seen_at: at(3),
     }
@@ -977,10 +980,14 @@ struct Sim {
     bootloader_left: Option<Duration>,
     /// Seconds after the end of the step-4 call at which the starting identity is listed again.
     back: Option<u64>,
-    /// Which identity the run starts from.
-    start: Start,
+    /// Where the run starts: the dongle, the cable or the bootloader.
+    origin: Origin,
     /// The `1532` devices the step-3 wait lists when `1532:110E` never appears.
     timeout_nodes: Vec<String>,
+    /// What `open_hidraw` gives (only called when the bootloader is bound to usbhid with one hidraw node).
+    hidraw_open: Result<HidrawOpened, OpenFailure>,
+    /// The identity step 4 was told to wait for.
+    waited_for: Option<Start>,
 }
 
 /// One SET_REPORT and one GET_REPORT that returned a 90-byte reply.
@@ -1047,9 +1054,22 @@ impl Sim {
             exit: exchange_ok((0x10, 0x05), 2, 0),
             bootloader_left: Some(Duration::from_millis(200)),
             back: Some(2),
-            start: Start::Dongle,
+            origin: Origin::Normal(Start::Dongle),
             timeout_nodes: Vec::new(),
+            hidraw_open: Ok(HidrawOpened {
+                node: "/dev/hidraw1".into(),
+                info: RawInfo {
+                    bustype: 3,
+                    vendor: 0x1532,
+                    product: 0x110E,
+                },
+            }),
+            waited_for: None,
         }
+    }
+    /// The identity the run started from (not for a run that started from the bootloader).
+    fn start(&self) -> Start {
+        self.origin.target().expect("a normal-mode start")
     }
     fn tick(&mut self, what: &'static str) {
         self.calls.push(what);
@@ -1061,14 +1081,17 @@ impl ProbeIo for Sim {
     fn now(&self) -> SystemTime {
         at(self.clock)
     }
-    fn start(&self) -> Start {
-        self.start
+    fn origin(&self) -> Origin {
+        self.origin
     }
     fn describe_device(&self) -> String {
-        format!(
-            "{} /dev/hidraw3 interface 0 (Razer Viper Mini SE)",
-            self.start.id_text().to_lowercase()
-        )
+        match self.origin {
+            Origin::Normal(s) => format!(
+                "{} /dev/hidraw3 interface 0 (Razer Viper Mini SE)",
+                s.id_text().to_lowercase()
+            ),
+            Origin::Bootloader(_) => "1532:110e /dev/hidraw1 interface 0 (Razer bootloader)".into(),
+        }
     }
     fn read_version(&mut self) -> Result<Report, String> {
         self.tick("read_version");
@@ -1104,6 +1127,11 @@ impl ProbeIo for Sim {
         self.tick("open_usbfs");
         self.open.clone()
     }
+    fn open_hidraw(&mut self, device: &UsbDevice) -> Result<HidrawOpened, OpenFailure> {
+        assert_eq!((device.vid, device.pid), BOOTLOADER_ID);
+        self.tick("open_hidraw");
+        self.hidraw_open.clone()
+    }
     fn read_report_descriptor(&mut self) -> Result<Vec<u8>, SendError> {
         self.tick("read_report_descriptor");
         self.descriptor.clone()
@@ -1121,14 +1149,15 @@ impl ProbeIo for Sim {
         self.tick("wait_for_bootloader_gone");
         self.bootloader_left
     }
-    fn wait_for_return(&mut self, timeout: Duration) -> ReturnWait {
+    fn wait_for_return(&mut self, target: Start, timeout: Duration) -> ReturnWait {
         assert_eq!(timeout, probe::RETURN_TIMEOUT);
         self.tick("wait_for_return");
+        self.waited_for = Some(target);
         ReturnWait {
             back_at: self.back.map(|s| at(self.clock + s)),
             nodes: vec![format!(
                 "{} 8-3 bus 8 device 6 bcdDevice 0101 product \"Razer Viper Mini SE\"",
-                self.start.id_text().to_lowercase()
+                target.id_text().to_lowercase()
             )],
         }
     }
@@ -1610,7 +1639,7 @@ fn outcome_d_a_pid_other_than_009f_or_009e_sends_no_exit() {
 /// A Sim that starts from the cable. Its bootloader reports bcdDevice 0101, so that no `009f` is in its data.
 fn cable_sim() -> Sim {
     let mut sim = Sim::happy();
-    sim.start = Start::Cable;
+    sim.origin = Origin::Normal(Start::Cable);
     sim.query = exchange_ok(Q, 2, 0x009E);
     sim.bootloader = Some(UsbDevice {
         bcd_device: Some(0x0101),
@@ -1634,13 +1663,16 @@ fn node_of(pid: u16, interface: u8) -> razerctl::hidraw::HidrawNode {
 #[test]
 fn a_009e_only_start_is_accepted() {
     let cable = [node_of(0x009E, 0), node_of(0x009E, 2)];
-    assert_eq!(hw::select_start(&cable), Ok(Start::Cable));
+    assert_eq!(hw::select_origin(&cable), Ok(Origin::Normal(Start::Cable)));
     let dongle = [node_of(0x009F, 0), node_of(0x009F, 2)];
-    assert_eq!(hw::select_start(&dongle), Ok(Start::Dongle));
+    assert_eq!(
+        hw::select_origin(&dongle),
+        Ok(Origin::Normal(Start::Dongle))
+    );
     // a cable start opens a probe that is a cable probe
     let (base, roots) = fixture_roots("cableopen");
     let p = fixture_probe_of(roots, 0x009E);
-    assert_eq!(p.start(), Start::Cable);
+    assert_eq!(p.origin(), Origin::Normal(Start::Cable));
     assert!(
         p.describe_device().starts_with("1532:009e "),
         "{}",
@@ -1652,34 +1684,34 @@ fn a_009e_only_start_is_accepted() {
 #[test]
 fn both_009f_and_009e_present_is_refused_naming_both() {
     let both = [node_of(0x009F, 0), node_of(0x009E, 0)];
-    let e = hw::select_start(&both).unwrap_err();
+    let e = hw::select_origin(&both).unwrap_err();
     assert!(e.contains("1532:009F") && e.contains("1532:009E"), "{e}");
     assert!(e.contains("both") && e.contains("Nothing was sent"), "{e}");
     // the order does not matter
     let both = [node_of(0x009E, 2), node_of(0x009F, 0), node_of(0x009E, 0)];
-    assert!(hw::select_start(&both).is_err());
+    assert!(hw::select_origin(&both).is_err());
 }
 
 #[test]
 fn neither_009f_nor_009e_present_is_refused_and_says_so() {
-    let e = hw::select_start(&[]).unwrap_err();
+    let e = hw::select_origin(&[]).unwrap_err();
     assert!(
         e.contains("neither") && e.contains("nothing was sent"),
         "{e}"
     );
     // another Razer device is not a start
-    let e = hw::select_start(&[node_of(0x00A5, 0)]).unwrap_err();
+    let e = hw::select_origin(&[node_of(0x00A5, 0)]).unwrap_err();
     assert!(e.contains("neither"), "{e}");
     // and a probe cannot be opened on one
     let (base, roots) = fixture_roots("otherpid");
-    let node = node_of(0x110E, 0);
+    let node = node_of(0x00A5, 0);
     assert!(RealProbe::open(&node, roots).is_err());
     let _ = std::fs::remove_dir_all(base);
 }
 
 #[test]
 fn the_selection_filters_to_the_probe_pids() {
-    // `probe_nodes` keeps exactly the nodes `select_start` can use; it is the one thing cli.rs enumerates
+    // `probe_nodes` keeps exactly the nodes `select_origin` can use; it is the one thing cli.rs enumerates
     let all = [node_of(0x00A5, 0), node_of(0x009E, 0), node_of(0x110E, 0)];
     let kept: Vec<_> = all
         .iter()
@@ -1695,7 +1727,7 @@ fn a_cable_run_goes_through_the_same_steps_in_the_same_order() {
     let (log, _) = run(&mut sim);
     assert_eq!(sim.calls, HAPPY_CALLS);
     assert_eq!(log.outcome, Some(Outcome::Completed));
-    assert_eq!(log.start, Start::Cable);
+    assert_eq!(log.origin, Origin::Normal(Start::Cable));
     assert_eq!(log.gate, Some(Ok(0x009E)));
     let text = log.render();
     assert!(text.contains("started from cable 1532:009E"), "{text}");
@@ -1744,7 +1776,7 @@ fn a_009e_start_with_a_10_80_pid_of_009f_sends_no_10_05() {
         .as_ref()
         .unwrap_err()
         .contains("009f, not 009e"));
-    // the reply is recorded in full, and the board is told to replug the cable
+    // the reply is recorded in full, and the board is NOT told that a cable replug brings the mouse back
     let text = log.render();
     assert!(
         text.contains("the 10:80 reply names PID 009f, not 009e"),
@@ -1753,7 +1785,11 @@ fn a_009e_start_with_a_10_80_pid_of_009f_sends_no_10_05() {
     assert!(text.contains(&hex_of(&reply_bytes(Q, 2, 0x009F))), "{text}");
     assert!(text.contains("10:05 was NOT sent"), "{text}");
     assert!(
-        text.contains("NEXT    Unplug the USB cable and plug it back in"),
+        text.contains("NEXT    The mouse may still be in its bootloader (lsusb shows 1532:110e). A replug of the USB cable does not reset it"),
+        "{text}"
+    );
+    assert!(
+        !text.contains("plug it back in") && !text.contains("should come back"),
         "{text}"
     );
 }
@@ -1793,13 +1829,19 @@ fn the_gate_takes_only_the_starting_pid() {
             }],
         }],
     };
-    assert_eq!(probe::gate(&one(0x009F), Start::Dongle), Ok(0x009F));
-    assert_eq!(probe::gate(&one(0x009E), Start::Cable), Ok(0x009E));
-    assert!(probe::gate(&one(0x009E), Start::Dongle).is_err());
-    assert!(probe::gate(&one(0x009F), Start::Cable).is_err());
+    assert_eq!(
+        probe::gate(&one(0x009F), Origin::Normal(Start::Dongle)),
+        Ok(0x009F)
+    );
+    assert_eq!(
+        probe::gate(&one(0x009E), Origin::Normal(Start::Cable)),
+        Ok(0x009E)
+    );
+    assert!(probe::gate(&one(0x009E), Origin::Normal(Start::Dongle)).is_err());
+    assert!(probe::gate(&one(0x009F), Origin::Normal(Start::Cable)).is_err());
     for pid in [0x110Eu16, 0, 0x009D, 0x00A0] {
-        assert!(probe::gate(&one(pid), Start::Dongle).is_err());
-        assert!(probe::gate(&one(pid), Start::Cable).is_err());
+        assert!(probe::gate(&one(pid), Origin::Normal(Start::Dongle)).is_err());
+        assert!(probe::gate(&one(pid), Origin::Normal(Start::Cable)).is_err());
     }
 }
 
@@ -1888,7 +1930,12 @@ fn no_message_of_a_cable_run_names_009f_or_the_dongle() {
     for (what, mut sim) in cases {
         let (log, _) = run(&mut sim);
         let mut text = log.render();
-        for n in log.outcome.as_ref().unwrap().next_steps(Start::Cable) {
+        for n in log
+            .outcome
+            .as_ref()
+            .unwrap()
+            .next_steps(Origin::Normal(Start::Cable))
+        {
             assert!(!n.to_lowercase().contains("009f"), "{what}: {n}");
             text.push_str(&n);
         }
@@ -1902,23 +1949,52 @@ fn no_message_of_a_cable_run_names_009f_or_the_dongle() {
 }
 
 #[test]
-fn the_replug_text_follows_the_starting_pid() {
+fn the_recovery_text_follows_where_the_run_started() {
+    let dongle = Origin::Normal(Start::Dongle);
     assert_eq!(
-        Start::Dongle.replug(),
-        "Unplug the dongle and plug it back in. The firmware was not erased or written, so the mouse should come back as 1532:009F."
+        dongle.recovery(),
+        ["Unplug the dongle and plug it back in. The firmware was not erased or written, so the mouse should come back as 1532:009F."]
     );
-    assert_eq!(
-        Start::Cable.replug(),
-        "Unplug the USB cable and plug it back in. The firmware was not erased or written, so the mouse should come back as 1532:009E."
-    );
+    // the mouse runs on its battery: a cable replug does not reset it, so a cable or bootloader start never promises that
+    for o in [Origin::Normal(Start::Cable), Origin::Bootloader(None)] {
+        let text = o.recovery().join("\n");
+        assert!(text.contains("does not reset it"), "{text}");
+        assert!(text.contains("battery"), "{text}");
+        assert!(text.contains("switch on its underside"), "{text}");
+        assert!(
+            text.contains("wait 10 s and switch it on (not verified)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Razer's updater on Windows, or in a VM"),
+            "{text}"
+        );
+        assert!(
+            text.contains("The firmware was not erased or written"),
+            "{text}"
+        );
+        assert!(!text.contains("should come back"), "{text}");
+        assert!(
+            !text.to_lowercase().contains("unplug the usb cable"),
+            "{text}"
+        );
+        assert!(!text.to_lowercase().contains("dongle"), "{text}");
+    }
     for o in [
         Outcome::BootloaderNeverAppeared,
         Outcome::NoExit("x".into()),
         Outcome::ExitFailed("x".into()),
         Outcome::DidNotReturn,
     ] {
-        assert_eq!(o.next_steps(Start::Cable), [Start::Cable.replug()]);
-        assert_eq!(o.next_steps(Start::Dongle), [Start::Dongle.replug()]);
+        assert_eq!(o.next_steps(dongle), dongle.recovery());
+        assert_eq!(
+            o.next_steps(Origin::Normal(Start::Cable)),
+            Origin::Normal(Start::Cable).recovery()
+        );
+        assert_eq!(
+            o.next_steps(Origin::Bootloader(Some(Start::Cable))),
+            Origin::Bootloader(None).recovery()
+        );
     }
 }
 
@@ -2313,7 +2389,7 @@ fn a_version_answer_that_is_not_success_stops_before_entering_the_bootloader() {
 
 #[test]
 fn an_unfinished_log_says_so() {
-    let log = ProbeLog::new(build(), at(0), "dev".into(), Start::Dongle);
+    let log = ProbeLog::new(build(), at(0), "dev".into(), Origin::Normal(Start::Dongle));
     let text = log.render();
     assert!(text.contains("RESULT  INCOMPLETE"), "{text}");
 }
@@ -2399,6 +2475,7 @@ fn fixture_roots(name: &str) -> (PathBuf, Roots) {
     let roots = Roots {
         sysfs: base.join("sys/bus/usb/devices"),
         dev: base.join("dev/bus/usb"),
+        hidraw: base.join("dev"),
     };
     std::fs::create_dir_all(&roots.sysfs).unwrap();
     std::fs::create_dir_all(&roots.dev).unwrap();
@@ -2544,7 +2621,7 @@ fn unreadable_descriptors_are_reported_not_hidden() {
     std::fs::remove_file(roots.sysfs.join("8-3/descriptors")).unwrap();
     let d = sysfs::find(&roots.sysfs, BOOTLOADER_ID, at(0)).unwrap();
     assert!(d.descriptors.is_err());
-    let mut log = ProbeLog::new(build(), at(0), "dev".into(), Start::Dongle);
+    let mut log = ProbeLog::new(build(), at(0), "dev".into(), Origin::Normal(Start::Dongle));
     log.push(probe::report::Step::new("3", "x", at(0), at(1), "y".into()));
     log.bootloader = Some(d);
     assert!(log
@@ -2660,18 +2737,18 @@ fn the_dongle_is_back_only_when_009f_is_listed_and_110e_is_not() {
         Some(None),
     );
     let mut p = fixture_probe(roots.clone());
-    let r = p.wait_for_return(Duration::from_millis(300));
+    let r = p.wait_for_return(Start::Dongle, Duration::from_millis(300));
     assert!(r.back_at.is_none());
     // the bootloader goes: back
     std::fs::remove_dir_all(roots.sysfs.join("8-4")).unwrap();
-    let r = p.wait_for_return(Duration::from_secs(2));
+    let r = p.wait_for_return(Start::Dongle, Duration::from_secs(2));
     assert!(r.back_at.is_some());
     assert_eq!(r.nodes.len(), 1, "{:?}", r.nodes);
     assert!(r.nodes[0].starts_with("1532:009f 8-3 bus 8 device 4 bcdDevice 0101"));
     // nothing listed at all: not back
     std::fs::remove_dir_all(roots.sysfs.join("8-3")).unwrap();
     assert!(p
-        .wait_for_return(Duration::from_millis(300))
+        .wait_for_return(Start::Dongle, Duration::from_millis(300))
         .back_at
         .is_none());
     let _ = std::fs::remove_dir_all(base);
@@ -2707,13 +2784,13 @@ fn the_return_wait_matches_the_starting_pid() {
     dongle_in(&roots.sysfs);
     let mut cable = fixture_probe_of(roots.clone(), 0x009E);
     assert!(cable
-        .wait_for_return(Duration::from_millis(300))
+        .wait_for_return(Start::Cable, Duration::from_millis(300))
         .back_at
         .is_none());
     // a dongle probe counts it
     let mut dongle = fixture_probe(roots.clone());
     assert!(dongle
-        .wait_for_return(Duration::from_secs(2))
+        .wait_for_return(Start::Dongle, Duration::from_secs(2))
         .back_at
         .is_some());
     // the cable comes back, the dongle is not there: the cable probe sees it, the dongle probe does not
@@ -2728,7 +2805,7 @@ fn the_return_wait_matches_the_starting_pid() {
         (8, 6),
         Some(Some("usbhid")),
     );
-    let back = cable.wait_for_return(Duration::from_secs(2));
+    let back = cable.wait_for_return(Start::Cable, Duration::from_secs(2));
     assert!(back.back_at.is_some());
     assert_eq!(back.nodes.len(), 1, "{:?}", back.nodes);
     assert!(
@@ -2737,7 +2814,7 @@ fn the_return_wait_matches_the_starting_pid() {
         back.nodes
     );
     assert!(dongle
-        .wait_for_return(Duration::from_millis(300))
+        .wait_for_return(Start::Dongle, Duration::from_millis(300))
         .back_at
         .is_none());
     // and a 110E that has not left yet keeps a cable probe from calling it back
@@ -2751,7 +2828,7 @@ fn the_return_wait_matches_the_starting_pid() {
         Some(None),
     );
     assert!(cable
-        .wait_for_return(Duration::from_millis(300))
+        .wait_for_return(Start::Cable, Duration::from_millis(300))
         .back_at
         .is_none());
     let _ = std::fs::remove_dir_all(base);
@@ -3091,13 +3168,19 @@ fn without_the_flag_it_prints_the_plan_and_exits_non_zero() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     for needle in [
-        "would, on the Razer dongle 1532:009F or on the mouse on its USB cable 1532:009E",
+        "would, on the Razer dongle 1532:009F, on the mouse on its USB cable 1532:009E, or on a mouse that is already in its bootloader 1532:110E (exactly one of them must be connected)",
+        "[skipped when the mouse is already in its bootloader]",
+        "through its usbfs node (needs the udev rule); if usbhid owns it and",
+        "through that node (read-only ioctls; no write to it)",
         "1. read its version (00:87)",
         "2. send enter-bootloader (00:04, mode 1)",
         "3. wait up to 10 s",
         "3b. after letting it settle for at least 1000 ms",
         "3c. send the query Razer's updater sends first (10:80)",
-        "3d. only if the reply has status 2 and the starting PID (009F for the dongle, 009E for the cable): send exit (10:05)",
+        "3d. only if the reply has status 2 and the starting PID (009F for the dongle, 009E for the cable; 009E or 009F when the mouse",
+        "was already in its bootloader): send exit (10:05) straight away on the same handle",
+        "a replug of the mouse's USB cable does NOT reset the",
+        "mouse, which runs on its battery",
         "00:87, 00:04, 10:80 and 10:05",
         "4. wait up to 30 s",
         "never erases or writes firmware",
@@ -3253,7 +3336,7 @@ fn fence_probe_cannot_name_the_dfu_code_or_a_destructive_command() {
         }
     }
     assert_eq!(
-        checked, 6,
+        checked, 7,
         "src/probe/ gained or lost a file: review the fence"
     );
 }
@@ -3296,6 +3379,7 @@ fn fence_the_real_transport_implements_only_the_probe_trait() {
         impls("src/probe/hw.rs"),
         [
             "impl<T: FeatureIo> FeatureIo for Guarded<T> {",
+            "impl<T: ControlIo> BootChannel for UsbGuarded<T> {",
             "impl Roots {",
             "impl RealProbe {",
             "impl ProbeIo for RealProbe {",
