@@ -231,19 +231,34 @@ razerctl opens no device for either, and it does not ship or download Razer's fi
 of the updater. **Flashing a real device is not supported yet**; without `--dry-run` the command refuses.
 
 `probe-bootloader` is the one firmware command that talks to a device, and it only runs when you ask for it with `--yes-enter-bootloader`.
-It is a measurement for a later update feature. It reads the Viper Mini SE dongle's version (`00:87`) and puts it into its
-bootloader (`00:04`, mode 1). The bootloader enumerates as `1532:110E` and the kernel makes **no hidraw node** for it, so the
+It is a measurement for a later update feature. It reads the Viper Mini SE's version (`00:87`) and puts it into its
+bootloader (`00:04`, mode 1). It starts either from the dongle (`1532:009F`) or from the mouse on its USB cable
+(`1532:009E`); exactly one of them must be connected, and the report says which one it used. The bootloader enumerates as `1532:110E` when it enumerates at all (on the board's two probe v3 runs through the dongle it did
+not, and whether the cable's bootloader shows up as `1532:110E` is not known yet) and the kernel makes **no hidraw node** for it, so the
 probe finds it in `/sys/bus/usb/devices` (reading sysfs sends nothing) and writes down the bus and device number,
 `bcdDevice`, product string, any driver bound to interface 0 and the kernel's cached descriptors. It then opens the
 bootloader's `/dev/bus/usb/BBB/DDD` node (at least 1000 ms after it appears, the wait Razer's updater makes), reads its
 HID report descriptor and sends the query frame `10:80` that Razer's updater sends first on every bootloader open. `10:80` asks
-the bootloader for its PID and changes nothing. Only if the reply has status 2 and a PID of `009F` or `009E` does the probe
+the bootloader for its PID and changes nothing. Only if the reply has status 2 and a PID equal to the one it started from (`009F` for the dongle, `009E` for the cable) does the probe
 send exit (`10:05`), straight away on the same handle, as a HID feature SET_REPORT; any other reply (or none) ends the run
-there, nothing more is sent and it tells you to replug. It then waits up to 30 s for `1532:009F` to come back, recording how
+there, nothing more is sent and it tells you to replug. It then waits up to 30 s for the same `1532:009F` / `1532:009E` to come back, recording how
 long that took from the `10:05` send and from entry (which tells whether `10:05` is what brought it back). Whether
 `10:05` makes the bootloader exit is not known: on the first run it was accepted and the dongle stayed in the bootloader until it was replugged. An error on the enter send counts as
-"entered" only if the dongle then leaves the USB bus. Everything goes into a text file (`--out FILE`, default
+"entered" only if the device then leaves the USB bus. If `1532:110E` does not appear within 10 s, the report lists every `1532`
+device the kernel shows at that moment (ID, port, `bcdDevice`, product), in case the bootloader enumerates under another ID. Everything goes into a text file (`--out FILE`, default
 `razerctl-bootloader-probe-<time>.txt` in the current directory) that is meant to be pasted into the issue as it is.
+
+### Running it on the cable
+
+To try the mouse on its USB cable instead of through the dongle, unplug the dongle (or the cable) so that only one of
+`1532:009F` and `1532:009E` is connected, then run the same command:
+
+```
+razerctl firmware probe-bootloader --yes-enter-bootloader --out cable-probe.txt
+```
+
+With both connected, or neither, it refuses and sends nothing. On the cable, a `10:80` reply that names any PID other than `009E`
+sends no `10:05`, and the instruction to recover is to unplug the USB cable and plug it back in. The udev rule is the same for both.
 
 Before running it, reinstall the udev rule, which now has a line for `1532:110E` (without it the bootloader's node is
 root-only and the probe stops before sending anything to it):
@@ -259,11 +274,11 @@ sudo cp udev/70-razerctl.rules /etc/udev/rules.d/ && sudo udevadm control --relo
 * Without `--yes-enter-bootloader` it only prints what it would do and exits with an error; nothing is sent.
 * If the bootloader's usbfs node cannot be opened (no udev rule), or a kernel driver owns interface 0, it sends nothing to the
   bootloader, never uses root or detaches the driver, writes down the error number or the driver, and tells you to
-  install the rule and replug the dongle.
+  install the rule and replug the dongle (or the USB cable).
 * It refuses to start while another razerctl (the remap or battery service, the GUI, another command) or openrazer
   (`openrazer-daemon`, or the `razermouse` kernel driver bound to the dongle) is using the device, or anything else has its
   hidraw node open. Stop them first.
-* **The mouse does not work while it runs.** The worst case is that the dongle sits in bootloader mode until you unplug it
+* **The mouse does not work while it runs.** The worst case is that it sits in bootloader mode until you unplug the dongle (or the USB cable)
   and plug it back in. If a step times out the file says which one and the command prints that instruction. Whether a replug always recovers it has not
   been confirmed on Linux, which is part of what the probe is for. If it does not, Razer's own updater on Windows is the
   fallback; that it can talk to a dongle in bootloader mode is inferred from its code, not tested.

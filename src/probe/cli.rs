@@ -2,7 +2,8 @@
 //! before the device is touched, and the output file. The order is fixed and every step before the last can only refuse:
 //!
 //! 1. without `--yes-enter-bootloader`: print the plan, exit non-zero, open nothing;
-//! 2. find the dongle (`1532:009F`) and refuse if it is not exactly one device with a usable control node;
+//! 2. find the starting identity: exactly one of the dongle (`1532:009F`) and the cable (`1532:009E`) must be on hidraw (both, or
+//!    neither, is refused), and it must be exactly one device with a usable control node;
 //! 3. refuse if other razerctl or openrazer traffic is on it ([`super::refusals`]);
 //! 4. create the output file (it must not exist yet), so an unwritable path is found before the device is touched;
 //! 5. open the control node and run the steps ([`super::run`]).
@@ -65,10 +66,12 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
         return Err("refusing to run without --yes-enter-bootloader; nothing was sent".into());
     }
 
-    let nodes = hw::dongle_nodes().map_err(|e| format!("listing HID devices: {e}"))?;
-    if nodes.is_empty() {
-        return Err("refusing: no Razer dongle 1532:009F is connected; nothing was sent".into());
-    }
+    let all = hw::probe_nodes().map_err(|e| format!("listing HID devices: {e}"))?;
+    let start = hw::select_start(&all)?;
+    let nodes: Vec<_> = all
+        .into_iter()
+        .filter(|n| (n.vid, n.pid) == start.id())
+        .collect();
     let devices: std::collections::HashSet<_> = nodes
         .iter()
         .filter_map(|n| {
@@ -80,13 +83,16 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
         })
         .collect();
     if devices.len() > 1 {
-        return Err("refusing: more than one 1532:009F device is connected; unplug the others. Nothing was sent".into());
+        return Err(format!(
+            "refusing: more than one {} device is connected; unplug the others. Nothing was sent",
+            start.id_text()
+        ));
     }
     let Some(control) = hw::control_node(&nodes) else {
-        return Err(
-            "refusing: no 1532:009F interface with a feature report was found; nothing was sent"
-                .into(),
-        );
+        return Err(format!(
+            "refusing: no {} interface with a feature report was found; nothing was sent",
+            start.id_text()
+        ));
     };
 
     let (traffic, unchecked) = hw::collect_traffic(Path::new("/proc"), &nodes, std::process::id());
@@ -116,7 +122,8 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     })?;
 
     eprintln!(
-        "entering the bootloader of {} now; the mouse stops working until this ends (writing {})",
+        "starting from the {}; entering the bootloader of {} now; the mouse stops working until this ends (writing {})",
+        start.label(),
         control.dev.display(),
         out.display()
     );
@@ -142,7 +149,7 @@ pub fn probe_bootloader(args: &[String]) -> Result<(), String> {
     }
     let _ = std::io::stdout().flush();
     let outcome = log.outcome.as_ref();
-    for n in outcome.map(|o| o.next_steps()).unwrap_or_default() {
+    for n in outcome.map(|o| o.next_steps(start)).unwrap_or_default() {
         eprintln!("{n}");
     }
     match outcome {
