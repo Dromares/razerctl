@@ -7,7 +7,7 @@ use razerctl::firmware::{dfu, flash};
 use razerctl::hidraw::{FeatureIo, RawInfo};
 use razerctl::probe::cli;
 use razerctl::probe::hidboot::{self, BootGuarded, BootHid};
-use razerctl::probe::hw::{self, BootChannel, Guarded, RealProbe, Roots};
+use razerctl::probe::hw::{self, Guarded, RealProbe, Roots};
 use razerctl::probe::report::{
     utc, BootloaderWait, Exchange, Get, HidrawOpened, OpenFailure, Outcome, Pair, ProbeLog,
     ReturnWait, SendError,
@@ -1066,10 +1066,6 @@ impl Sim {
             }),
             waited_for: None,
         }
-    }
-    /// The identity the run started from (not for a run that started from the bootloader).
-    fn start(&self) -> Start {
-        self.origin.target().expect("a normal-mode start")
     }
     fn tick(&mut self, what: &'static str) {
         self.calls.push(what);
@@ -3733,6 +3729,1323 @@ fn fence_sysfs_only_reads() {
     ] {
         for l in code(&src) {
             assert!(!l.contains(banned), "sysfs.rs uses `{banned}`: {l}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Probe v5 (DAN-1948): the mouse's bootloader over hidraw, and a run that starts from the bootloader.
+//
+// The mouse's `1532:110E` has an interrupt endpoint, `usbhid` binds it and the kernel makes it a hidraw node. Everything below
+// is a simulated device or a fixture tree: nothing opens a real hidraw node.
+
+/// What reached a simulated bootloader hidraw node, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HidOp {
+    RawInfo,
+    Descriptor,
+    /// `HIDIOCSFEATURE` with these 90 bytes (the report id is added below the guard, by `hidraw::feature_buffer`).
+    Set(Vec<u8>),
+    Get,
+}
+
+/// A bootloader hidraw node that records every call that reaches it. GETs are answered from `gets` in order; with none
+/// scripted the node answers the last SET with status 2 (and PID 009F to a `10:80`), as `SimUsb` does.
+struct SimHid {
+    ops: RefCell<Vec<HidOp>>,
+    arrived: RefCell<Vec<std::time::Instant>>,
+    info: RawInfo,
+    descriptor: Vec<u8>,
+    set_errno: Option<i32>,
+    gets: RefCell<VecDeque<Result<Vec<u8>, i32>>>,
+    last_set: RefCell<Option<Vec<u8>>>,
+}
+
+impl SimHid {
+    fn new() -> SimHid {
+        SimHid {
+            ops: RefCell::new(Vec::new()),
+            arrived: RefCell::new(Vec::new()),
+            info: RawInfo {
+                bustype: 3,
+                vendor: 0x1532,
+                product: 0x110E,
+            },
+            descriptor: DESC.to_vec(),
+            set_errno: None,
+            gets: RefCell::new(VecDeque::new()),
+            last_set: RefCell::new(None),
+        }
+    }
+    fn scripted(gets: Vec<Result<Vec<u8>, i32>>) -> SimHid {
+        let s = SimHid::new();
+        *s.gets.borrow_mut() = gets.into();
+        s
+    }
+    fn log(&self, op: HidOp) {
+        self.ops.borrow_mut().push(op);
+        self.arrived.borrow_mut().push(std::time::Instant::now());
+    }
+    fn sets(&self) -> Vec<Vec<u8>> {
+        self.ops
+            .borrow()
+            .iter()
+            .filter_map(|o| match o {
+                HidOp::Set(p) => Some(p.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+impl BootHid for SimHid {
+    fn raw_info(&self) -> io::Result<RawInfo> {
+        self.log(HidOp::RawInfo);
+        Ok(self.info)
+    }
+    fn report_descriptor(&self) -> io::Result<Vec<u8>> {
+        self.log(HidOp::Descriptor);
+        Ok(self.descriptor.clone())
+    }
+    fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()> {
+        self.log(HidOp::Set(payload.to_vec()));
+        *self.last_set.borrow_mut() = Some(payload.to_vec());
+        match self.set_errno {
+            Some(e) => Err(io::Error::from_raw_os_error(e)),
+            None => Ok(()),
+        }
+    }
+    fn get_feature(&self) -> io::Result<(usize, [u8; REPORT_LEN + 1])> {
+        self.log(HidOp::Get);
+        let bytes = match self.gets.borrow_mut().pop_front() {
+            Some(Err(e)) => return Err(io::Error::from_raw_os_error(e)),
+            Some(Ok(b)) => b,
+            None => {
+                let sent = self.last_set.borrow().clone().expect("GET before any SET");
+                let cmd = (sent[6], sent[7]);
+                reply_bytes(cmd, 2, if cmd == (0x10, 0x80) { 0x009F } else { 0 })
+            }
+        };
+        let mut buf = [0u8; REPORT_LEN + 1];
+        buf[1..=bytes.len()].copy_from_slice(&bytes);
+        Ok((bytes.len() + 1, buf))
+    }
+}
+
+/// A bootloader device as the kernel lists the mouse's: `usbhid` bound to interface 0, one hidraw node.
+fn hid_bound_device() -> UsbDevice {
+    UsbDevice {
+        name: "10-4".into(),
+        bcd_device: Some(0x0200),
+        product: Some("Razer bootloader".into()),
+        hidraw: vec!["hidraw1".into()],
+        ..bootloader_device(Interface0::Bound("usbhid".into()))
+    }
+}
+
+/// A `Sim` that starts from the cable, with the mouse's bootloader bound to `usbhid`.
+fn hid_cable_sim() -> Sim {
+    let mut sim = cable_sim();
+    sim.bootloader = Some(hid_bound_device());
+    sim
+}
+
+/// A `Sim` that starts from the bootloader (steps 1 and 2 skipped), and whose `10:80` reply names `pid`.
+fn bootloader_start_sim(pid: u16) -> Sim {
+    let mut sim = Sim::happy();
+    sim.origin = Origin::Bootloader(None);
+    sim.bootloader = Some(hid_bound_device());
+    sim.query = exchange_ok(Q, 2, pid);
+    sim
+}
+
+const HID_CALLS: [&str; 6] = [
+    "wait_for_bootloader",
+    "open_hidraw",
+    "read_report_descriptor",
+    "query_bootloader",
+    "exit_bootloader",
+    "wait_for_return",
+];
+
+// --- the hidraw channel: frames, bytes, retries, timing ---------------------------------------------------------------
+
+#[test]
+fn the_hidraw_path_sends_the_query_then_the_exit_as_feature_reports_and_nothing_else() {
+    let g = BootGuarded(SimHid::new());
+    assert_eq!(g.raw_info().unwrap().product, 0x110E);
+    assert_eq!(g.report_descriptor().unwrap(), DESC.to_vec());
+    let q = hw::query_via(&g);
+    assert_eq!(gate(&q), Ok(0x009F));
+    let x = hw::exit_via(&g);
+    assert_eq!(x.set_error(), None);
+    let status = Decoded::of(x.last_get().unwrap().reply.as_ref().unwrap()).unwrap();
+    assert_eq!((status.class, status.id, status.status), (0x10, 0x05, 2));
+    assert_eq!(
+        *g.0.ops.borrow(),
+        vec![
+            HidOp::RawInfo,
+            HidOp::Descriptor,
+            HidOp::Set(golden(9, 0x10, 0x80, &[]).to_vec()),
+            HidOp::Get,
+            HidOp::Set(golden(0, 0x10, 0x05, &[]).to_vec()),
+            HidOp::Get,
+        ]
+    );
+}
+
+#[test]
+fn the_feature_report_has_the_leading_report_id_zero_then_the_same_90_bytes() {
+    // the bytes HIDIOCSFEATURE is given: report id 0x00, then exactly the frame the usbfs path puts in its SET_REPORT
+    for frame in [query_frame(), exit_frame()] {
+        let buf = razerctl::hidraw::feature_buffer(&frame.to_bytes());
+        assert_eq!(buf.len(), 91);
+        assert_eq!(buf[0], 0x00);
+        assert_eq!(buf[1..], frame.to_bytes());
+    }
+    let q = razerctl::hidraw::feature_buffer(&query_frame().to_bytes());
+    assert_eq!(
+        q[..9],
+        [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x10, 0x80]
+    );
+    assert_eq!(q[89], 0x99, "the crc byte of 10:80");
+    // and a reply is the 90 bytes after the id, only when the kernel returned all 91
+    let g = BootGuarded(SimHid::scripted(vec![ok(Q, 2, 0x009E)]));
+    assert_eq!(hidboot::read_reply(&g).unwrap(), reply_bytes(Q, 2, 0x009E));
+    let g = BootGuarded(SimHid::scripted(vec![Ok(vec![2; 40])]));
+    let e = hidboot::read_reply(&g).unwrap_err().to_string();
+    assert!(e.contains("returned 41 bytes, not 91"), "{e}");
+}
+
+#[test]
+fn the_hidraw_guard_refuses_every_frame_but_the_query_and_the_exit() {
+    let frames: Vec<(&str, [u8; REPORT_LEN])> = vec![
+        ("00:87 read version", read_version_frame().to_bytes()),
+        ("00:04 enter bootloader", enter_frame().to_bytes()),
+        ("10:01 erase", Report::new((0x10, 0x01), 0, 0).to_bytes()),
+        ("10:02 program", Report::new((0x10, 0x02), 0, 0).to_bytes()),
+        (
+            "0a:01 flash class",
+            Report::new((0x0A, 0x01), 0, 0).to_bytes(),
+        ),
+        (
+            "0a:80 flash class",
+            Report::new((0x0A, 0x80), 9, 0).to_bytes(),
+        ),
+        ("10:00", Report::new((0x10, 0x00), 0, 0).to_bytes()),
+        ("10:81", Report::new((0x10, 0x81), 9, 0).to_bytes()),
+        ("10:06", Report::new((0x10, 0x06), 0, 0).to_bytes()),
+        ("10:85", Report::new((0x10, 0x85), 0, 0).to_bytes()),
+        (
+            "10:80 with data",
+            Report::new((0x10, 0x80), 9, 0).with_args(&[1]).to_bytes(),
+        ),
+        (
+            "10:05 with data",
+            Report::new((0x10, 0x05), 0, 0).with_args(&[1]).to_bytes(),
+        ),
+        (
+            "10:80 with another size",
+            Report::new((0x10, 0x80), 8, 0).to_bytes(),
+        ),
+        (
+            "10:05 with a txn id",
+            Report::new((0x10, 0x05), 0, 0x1f).to_bytes(),
+        ),
+        ("all zero", [0u8; REPORT_LEN]),
+    ];
+    for (what, bytes) in &frames {
+        let g = BootGuarded(SimHid::new());
+        let e = g.send_feature(bytes).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied, "{what}");
+        assert!(g.0.ops.borrow().is_empty(), "{what} reached the node");
+        assert!(!hidboot::permitted(bytes), "{what}");
+    }
+    // the two it carries go through, byte for byte
+    for frame in [query_frame(), exit_frame()] {
+        let g = BootGuarded(SimHid::new());
+        g.send_feature(&frame.to_bytes()).unwrap();
+        assert_eq!(g.0.sets(), [frame.to_bytes().to_vec()]);
+    }
+}
+
+#[test]
+fn the_hidraw_guard_compares_every_byte_not_just_the_command() {
+    for frame in [query_frame(), exit_frame()] {
+        for i in 0..REPORT_LEN {
+            let mut b = frame.to_bytes();
+            b[i] ^= 0x01;
+            assert!(
+                !hidboot::permitted(&b),
+                "byte {i} of {:?} is not checked",
+                frame.command_id
+            );
+        }
+    }
+}
+
+#[test]
+fn the_normal_mode_allow_list_is_unchanged_and_the_two_allow_lists_do_not_overlap() {
+    // hidraw of a normal-mode node: 00:87 and 00:04 only
+    assert!(permitted(&read_version_frame().to_bytes()));
+    assert!(permitted(&enter_frame().to_bytes()));
+    assert!(!permitted(&query_frame().to_bytes()));
+    assert!(!permitted(&exit_frame().to_bytes()));
+    // hidraw of a bootloader node: 10:80 and 10:05 only
+    assert!(hidboot::permitted(&query_frame().to_bytes()));
+    assert!(hidboot::permitted(&exit_frame().to_bytes()));
+    assert!(!hidboot::permitted(&read_version_frame().to_bytes()));
+    assert!(!hidboot::permitted(&enter_frame().to_bytes()));
+    // and the normal-mode guard still stops a bootloader frame
+    let g = Guarded(SimFeature::new());
+    assert!(g.send_feature(&query_frame().to_bytes()).is_err());
+    assert!(g.send_feature(&exit_frame().to_bytes()).is_err());
+}
+
+/// What one SET or GET looked like to the device, without the timestamps and without the text of an error.
+type Shape = (char, Vec<u8>);
+
+fn shape_of_usb(g: &UsbGuarded<SimUsb>) -> Vec<Shape> {
+    g.0.requests
+        .borrow()
+        .iter()
+        .filter_map(|(s, p)| {
+            if *s == Setup::set_report_feature() {
+                Some(('S', p.clone()))
+            } else if *s == Setup::get_report_feature() {
+                Some(('G', Vec::new()))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn shape_of_hid(g: &BootGuarded<SimHid>) -> Vec<Shape> {
+    g.0.ops
+        .borrow()
+        .iter()
+        .filter_map(|o| match o {
+            HidOp::Set(p) => Some(('S', p.clone())),
+            HidOp::Get => Some(('G', Vec::new())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// What an exchange came to: per SET its errno, per GET its 90 bytes or that it failed.
+fn outcome_of(x: &Exchange) -> Vec<(Option<i32>, Vec<Result<Vec<u8>, ()>>)> {
+    x.pairs
+        .iter()
+        .map(|p| {
+            (
+                p.set.as_ref().err().and_then(|e| e.errno),
+                p.gets
+                    .iter()
+                    .map(|g| g.reply.clone().map_err(|_| ()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+type Script = Vec<Result<Vec<u8>, i32>>;
+
+/// Scripts of replies for the retry rules, each built twice (once per channel).
+fn retry_scripts() -> Vec<(&'static str, fn() -> Script)> {
+    vec![
+        ("polled on 0 and 1", || {
+            vec![ok(Q, 0, 0), ok(Q, 1, 0), ok(Q, 2, 0x009E)]
+        }),
+        ("a failed get and another frame's reply are polled", || {
+            vec![Err(ETIMEDOUT), ok((0x00, 0x87), 2, 0), ok(Q, 2, 0x009F)]
+        }),
+        ("any other status re-sends the set", || {
+            vec![ok(Q, 3, 0), ok(Q, 4, 0), ok(Q, 2, 0x009E)]
+        }),
+        (
+            "five reads without an answer re-send, three sends in all",
+            || {
+                let mut v: Script = (0..15).map(|_| ok(Q, 0, 0)).collect();
+                v.push(ok(Q, 2, 0x009E));
+                v
+            },
+        ),
+        ("a short read is a failed read", || {
+            vec![Ok(vec![2u8; 40]), ok(Q, 2, 0x009E)]
+        }),
+        ("a txn mismatch is not an answer", || {
+            let mut r = reply_bytes(Q, 2, 0x009E);
+            r[1] = 0x1f;
+            vec![Ok(r.clone()), Ok(r), ok(Q, 2, 0x009E)]
+        }),
+    ]
+}
+
+#[test]
+fn the_query_polls_and_resends_exactly_the_same_on_hidraw_as_on_usbfs() {
+    for (what, script) in retry_scripts() {
+        let usb = UsbGuarded(SimUsb::scripted(script()));
+        let hid = BootGuarded(SimHid::scripted(script()));
+        let (xu, xh) = (hw::query_via(&usb), hw::query_via(&hid));
+        assert_eq!(shape_of_usb(&usb), shape_of_hid(&hid), "{what}");
+        assert_eq!(outcome_of(&xu), outcome_of(&xh), "{what}");
+        assert_eq!(gate(&xu), gate(&xh), "{what}");
+    }
+}
+
+#[test]
+fn the_exit_resends_exactly_the_same_on_hidraw_as_on_usbfs() {
+    let scripts: Vec<(&str, fn() -> Script)> = vec![
+        ("accepted", || vec![ok((0x10, 0x05), 2, 0)]),
+        ("a failed get re-sends, three sends in all", || {
+            vec![Err(ETIMEDOUT), Err(ETIMEDOUT), Err(ETIMEDOUT)]
+        }),
+        ("any status but 2 re-sends", || {
+            vec![ok((0x10, 0x05), 3, 0), ok((0x10, 0x05), 2, 0)]
+        }),
+        ("a short read re-sends", || {
+            vec![Ok(vec![2u8; 10]), ok((0x10, 0x05), 2, 0)]
+        }),
+    ];
+    for (what, script) in scripts {
+        let usb = UsbGuarded(SimUsb::scripted(script()));
+        let hid = BootGuarded(SimHid::scripted(script()));
+        let (xu, xh) = (hw::exit_via(&usb), hw::exit_via(&hid));
+        assert_eq!(shape_of_usb(&usb), shape_of_hid(&hid), "{what}");
+        assert_eq!(outcome_of(&xu), outcome_of(&xh), "{what}");
+    }
+    // a SET that fails ends it on both
+    let mut u = SimUsb::new();
+    u.set_errno = Some(71);
+    let mut h = SimHid::new();
+    h.set_errno = Some(71);
+    let (usb, hid) = (UsbGuarded(u), BootGuarded(h));
+    let (xu, xh) = (hw::exit_via(&usb), hw::exit_via(&hid));
+    assert_eq!(shape_of_usb(&usb), shape_of_hid(&hid));
+    assert_eq!(outcome_of(&xu), outcome_of(&xh));
+    assert_eq!(xh.set_error().unwrap().errno, Some(71));
+    let (mut u, mut h) = (SimUsb::new(), SimHid::new());
+    u.set_errno = Some(71);
+    h.set_errno = Some(71);
+    let (usb, hid) = (UsbGuarded(u), BootGuarded(h));
+    let (xu, xh) = (hw::query_via(&usb), hw::query_via(&hid));
+    assert_eq!(shape_of_usb(&usb), shape_of_hid(&hid));
+    assert_eq!(outcome_of(&xu), outcome_of(&xh));
+}
+
+#[test]
+fn the_hidraw_path_waits_two_milliseconds_before_every_set_and_every_get() {
+    let g = BootGuarded(SimHid::scripted(vec![
+        ok(Q, 0, 0),
+        ok(Q, 2, 0x009E),
+        Err(ETIMEDOUT),
+        ok((0x10, 0x05), 2, 0),
+    ]));
+    let _ = hw::query_via(&g);
+    let _ = hw::exit_via(&g);
+    let t = g.0.arrived.borrow().clone();
+    assert_eq!(t.len(), 3 + 4);
+    for w in t.windows(2) {
+        assert!(w[1] - w[0] >= Duration::from_millis(2), "{:?}", w[1] - w[0]);
+    }
+}
+
+// --- the run: a bound bootloader uses hidraw -------------------------------------------------------------------------------
+
+#[test]
+fn a_bound_110e_with_one_hidraw_node_uses_hidraw_and_sends_10_80_then_10_05() {
+    let mut sim = hid_cable_sim();
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        [
+            "read_version",
+            "enter_bootloader",
+            "wait_for_bootloader",
+            "open_hidraw",
+            "read_report_descriptor",
+            "query_bootloader",
+            "exit_bootloader",
+            "wait_for_return"
+        ]
+    );
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    assert_eq!(log.gate, Some(Ok(0x009E)));
+    assert!(log.usbfs.is_none());
+    let h = log.hidraw.clone().unwrap().unwrap();
+    assert_eq!(h.node, "/dev/hidraw1");
+    assert_eq!((h.info.vendor, h.info.product), (0x1532, 0x110E));
+    assert_eq!(sim.waited_for, Some(Start::Cable));
+    // the same thing from the dongle: the bound device decides the channel, not the starting identity
+    let mut dongle = Sim::happy();
+    dongle.bootloader = Some(hid_bound_device());
+    let (log, _) = run(&mut dongle);
+    assert!(dongle.calls.contains(&"open_hidraw"), "{:?}", dongle.calls);
+    assert!(!dongle.calls.contains(&"open_usbfs"), "{:?}", dongle.calls);
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+}
+
+#[test]
+fn an_unbound_110e_still_takes_the_usbfs_path() {
+    let mut sim = cable_sim();
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+    assert!(!sim.calls.contains(&"open_hidraw"));
+    assert!(log.hidraw.is_none());
+    assert_eq!(log.usbfs, Some(Ok("/dev/bus/usb/008/005".into())));
+    let text = log.render();
+    assert!(
+        text.contains("usbfs: open the node, read the report descriptor"),
+        "{text}"
+    );
+    assert!(!text.contains("hidraw (step 3b)"), "{text}");
+    // even a device that happens to list a hidraw child, but has no driver bound, is the usbfs path
+    let mut sim = cable_sim();
+    sim.bootloader = Some(UsbDevice {
+        hidraw: vec!["hidraw1".into()],
+        ..bootloader_device(Interface0::Unbound)
+    });
+    run(&mut sim);
+    assert_eq!(sim.calls, HAPPY_CALLS);
+}
+
+#[test]
+fn a_driver_other_than_usbhid_or_not_exactly_one_hidraw_node_sends_nothing_and_opens_nothing() {
+    let mut cases: Vec<(&str, UsbDevice)> = Vec::new();
+    cases.push((
+        "another driver",
+        UsbDevice {
+            interface0: Interface0::Bound("razermouse".into()),
+            ..hid_bound_device()
+        },
+    ));
+    cases.push((
+        "usbhid with no hidraw node",
+        UsbDevice {
+            hidraw: Vec::new(),
+            ..hid_bound_device()
+        },
+    ));
+    cases.push((
+        "usbhid with two hidraw nodes",
+        UsbDevice {
+            hidraw: vec!["hidraw1".into(), "hidraw2".into()],
+            ..hid_bound_device()
+        },
+    ));
+    for (what, device) in cases {
+        let mut sim = cable_sim();
+        sim.bootloader = Some(device);
+        let (log, _) = run(&mut sim);
+        assert_eq!(
+            sim.calls,
+            ["read_version", "enter_bootloader", "wait_for_bootloader"],
+            "{what}"
+        );
+        assert!(
+            matches!(log.outcome, Some(Outcome::DriverBound(_))),
+            "{what}"
+        );
+        let text = log.render();
+        assert!(
+            text.contains("it is not detached and nothing is sent"),
+            "{what}: {text}"
+        );
+        assert!(log.query.is_none() && log.exit.is_none(), "{what}");
+    }
+}
+
+#[test]
+fn a_hidraw_node_that_cannot_be_opened_is_recorded_and_nothing_is_sent() {
+    let mut sim = hid_cable_sim();
+    sim.hidraw_open = Err(OpenFailure {
+        node: "/dev/hidraw1".into(),
+        errno: Some(13),
+        message: "Permission denied".into(),
+    });
+    let (log, _) = run(&mut sim);
+    assert_eq!(
+        sim.calls,
+        [
+            "read_version",
+            "enter_bootloader",
+            "wait_for_bootloader",
+            "open_hidraw"
+        ]
+    );
+    assert_eq!(
+        log.outcome,
+        Some(Outcome::HidrawUnavailable {
+            why: "open /dev/hidraw1 failed with errno 13 (Permission denied)".into(),
+            permission: true
+        })
+    );
+    let text = log.render();
+    assert!(
+        text.contains("STOPPED at step 3b (hidraw): open /dev/hidraw1 failed with errno 13"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Nothing was sent to the bootloader"),
+        "{text}"
+    );
+    assert!(text.contains("NEXT    Reinstall the udev rule"), "{text}");
+    // a failure that is not a permission error does not point at udev
+    let mut sim = hid_cable_sim();
+    sim.hidraw_open = Err(OpenFailure {
+        node: "/dev/hidraw1".into(),
+        errno: None,
+        message: "HIDIOCGRAWINFO says 1532:009e, not 1532:110E".into(),
+    });
+    let (log, _) = run(&mut sim);
+    assert!(matches!(
+        log.outcome,
+        Some(Outcome::HidrawUnavailable {
+            permission: false,
+            ..
+        })
+    ));
+    assert!(!log.render().contains("Reinstall the udev rule"));
+}
+
+#[test]
+fn the_report_of_a_hidraw_run_has_the_node_the_descriptor_and_all_90_bytes_of_every_reply() {
+    let mut sim = hid_cable_sim();
+    sim.descriptor = Ok(vec![0x06, 0x00, 0xFF, 0x09, 0x21, 0xA1, 0x01, 0xC0]);
+    let (log, _) = run(&mut sim);
+    let text = log.render();
+    assert!(
+        text.starts_with("razerctl bootloader probe v5 (DAN-1948, for DAN-1878)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hidraw (step 3b): opened /dev/hidraw1 as the current user, nothing was detached; HIDIOCGRAWINFO: bustype 3 vendor 1532 product 110e"),
+        "{text}"
+    );
+    assert!(
+        text.contains("HID report descriptor of the node, HIDIOCGRDESCSIZE/HIDIOCGRDESC (8 bytes): 06 00 ff 09 21 a1 01 c0"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hidraw node(s) of interface 0: hidraw1"),
+        "{text}"
+    );
+    assert!(
+        text.contains("driver bound to interface 0: `usbhid`"),
+        "{text}"
+    );
+    assert!(
+        text.contains("hidraw: open the node, read the report descriptor"),
+        "{text}"
+    );
+    assert!(
+        text.contains("HIDIOCSFEATURE (report id 00, then the 90 bytes)"),
+        "{text}"
+    );
+    assert!(text.contains("HIDIOCGFEATURE (report id 00)"), "{text}");
+    // every byte of the 10:80 reply and of the 10:05 reply
+    assert!(
+        text.contains(&format!(
+            "reply (90 bytes): {}",
+            hex_of(&reply_bytes(Q, 2, 0x009E))
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "reply (90 bytes): {}",
+            hex_of(&reply_bytes((0x10, 0x05), 2, 0))
+        )),
+        "{text}"
+    );
+    // and the usbfs wording is not on a hidraw report
+    assert!(!text.contains("usbfs (step 3b)"), "{text}");
+    assert!(!text.contains("GET_DESCRIPTOR"), "{text}");
+}
+
+// --- the run: start from the bootloader ---------------------------------------------------------------------------------------
+
+#[test]
+fn a_bootloader_start_skips_00_87_and_00_04_and_goes_straight_to_the_wait_and_10_80() {
+    let mut sim = bootloader_start_sim(0x009E);
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HID_CALLS);
+    for never in [
+        "read_version",
+        "enter_bootloader",
+        "wait_for_dongle_gone",
+        "open_usbfs",
+    ] {
+        assert!(
+            !sim.calls.contains(&never),
+            "{never} was called: {:?}",
+            sim.calls
+        );
+    }
+    assert_eq!(log.outcome, Some(Outcome::Completed));
+    // the exit waits for the PID the reply named, not for some default
+    assert_eq!(sim.waited_for, Some(Start::Cable));
+    assert_eq!(log.origin, Origin::Bootloader(Some(Start::Cable)));
+    assert_eq!(log.version_read, None);
+    let text = log.render();
+    assert!(
+        text.contains("started from the bootloader 1532:110E (the mouse was already in it)"),
+        "{text}"
+    );
+    assert!(text.contains("1. read version (00:87)"), "{text}");
+    assert!(
+        text.contains(
+            "SKIPPED: the run started from the bootloader; nothing is sent to a normal-mode node"
+        ),
+        "{text}"
+    );
+    assert!(text.contains("4. wait for 1532:009E"), "{text}");
+    assert!(
+        text.contains("COMPLETED: every step ran and 1532:009E is listed again"),
+        "{text}"
+    );
+    assert!(
+        text.contains("PID 009e (a mouse PID: step 4 waits for it)"),
+        "{text}"
+    );
+    // the other mouse PID
+    let mut sim = bootloader_start_sim(0x009F);
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, HID_CALLS);
+    assert_eq!(sim.waited_for, Some(Start::Dongle));
+    assert_eq!(log.origin, Origin::Bootloader(Some(Start::Dongle)));
+    assert!(log.render().contains("4. wait for 1532:009F"));
+}
+
+#[test]
+fn a_bootloader_start_whose_10_80_pid_is_not_009e_or_009f_sends_no_10_05() {
+    let bad: Vec<(&str, Exchange)> = vec![
+        ("the bootloader's own PID", exchange_ok(Q, 2, 0x110E)),
+        ("another PID", exchange_ok(Q, 2, 0x00A5)),
+        ("PID 0000", exchange_ok(Q, 2, 0x0000)),
+        ("status 3", exchange_ok(Q, 3, 0x009E)),
+        ("status 0", exchange_ok(Q, 0, 0x009E)),
+        (
+            "another frame's reply",
+            exchange_ok((0x10, 0x05), 2, 0x009E),
+        ),
+        ("no reply at all", exchange_get_failed(5, ETIMEDOUT)),
+        ("a failed SET", exchange_set_failed(71)),
+    ];
+    for (what, query) in bad {
+        let mut sim = bootloader_start_sim(0x009E);
+        sim.query = query;
+        let (log, _) = run(&mut sim);
+        assert_eq!(
+            sim.calls,
+            [
+                "wait_for_bootloader",
+                "open_hidraw",
+                "read_report_descriptor",
+                "query_bootloader"
+            ],
+            "{what}"
+        );
+        assert!(!sim.calls.contains(&"exit_bootloader"), "{what}");
+        assert!(matches!(log.outcome, Some(Outcome::NoExit(_))), "{what}");
+        assert_eq!(sim.waited_for, None, "{what}");
+        assert_eq!(log.origin, Origin::Bootloader(None), "{what}");
+        let text = log.render();
+        assert!(text.contains("10:05 was NOT sent"), "{what}: {text}");
+        assert!(text.contains("gate: CLOSED"), "{what}: {text}");
+    }
+    // the reason names both PIDs it would have taken
+    let mut sim = bootloader_start_sim(0x110E);
+    let (log, _) = run(&mut sim);
+    assert!(
+        log.render().contains(
+            "the 10:80 reply names PID 110e, not 009e or 009f (the run started from the bootloader"
+        ),
+        "{}",
+        log.render()
+    );
+}
+
+#[test]
+fn a_bootloader_start_that_never_finds_the_bootloader_sends_nothing() {
+    let mut sim = bootloader_start_sim(0x009E);
+    sim.bootloader = None;
+    let (log, _) = run(&mut sim);
+    assert_eq!(sim.calls, ["wait_for_bootloader"]);
+    assert_eq!(log.outcome, Some(Outcome::BootloaderNeverAppeared));
+}
+
+#[test]
+fn a_bootloader_start_never_promises_that_a_cable_replug_brings_the_mouse_back() {
+    let mut cases: Vec<(&str, Sim)> = Vec::new();
+    let mut s = bootloader_start_sim(0x009E);
+    s.query = exchange_ok(Q, 2, 0x00A5);
+    cases.push(("wrong pid", s));
+    let mut s = bootloader_start_sim(0x009E);
+    s.exit = exchange_set_failed(71);
+    s.bootloader_left = None;
+    cases.push(("exit failed", s));
+    let mut s = bootloader_start_sim(0x009E);
+    s.back = None;
+    cases.push(("did not return", s));
+    let mut s = bootloader_start_sim(0x009F);
+    s.back = None;
+    cases.push(("did not return, 009f", s));
+    for (what, mut sim) in cases {
+        let (log, _) = run(&mut sim);
+        let text = log.render();
+        let lower = text.to_lowercase();
+        assert!(
+            text.contains("NEXT    The mouse may still be in its bootloader"),
+            "{what}: {text}"
+        );
+        assert!(
+            text.contains("A replug of the USB cable does not reset it: it runs on its battery"),
+            "{what}: {text}"
+        );
+        assert!(text.contains("Switch the mouse off with the switch on its underside, wait 10 s and switch it on (not verified)"), "{what}: {text}");
+        assert!(
+            text.contains("Razer's updater on Windows, or in a VM"),
+            "{what}: {text}"
+        );
+        for banned in [
+            "should come back",
+            "plug it back in",
+            "must be replugged",
+            "unplug the usb cable",
+            "dongle",
+        ] {
+            assert!(!lower.contains(banned), "{what}: `{banned}` in {text}");
+        }
+    }
+    // the step-4 timeout line of a cable start says the same
+    let mut sim = hid_cable_sim();
+    sim.back = None;
+    let (log, _) = run(&mut sim);
+    let text = log.render();
+    assert!(text.contains("so the mouse may still be in its bootloader (a replug of the USB cable does not reset it)"), "{text}");
+    // a dongle run keeps its words
+    let mut sim = Sim::happy();
+    sim.back = None;
+    let (log, _) = run(&mut sim);
+    let text = log.render();
+    assert!(text.contains("so it must be replugged"), "{text}");
+    assert!(
+        text.contains("NEXT    Unplug the dongle and plug it back in."),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_gate_of_a_bootloader_start_takes_009e_and_009f_and_nothing_else() {
+    let one = |pid| exchange_ok(Q, 2, pid);
+    assert_eq!(
+        probe::gate(&one(0x009E), Origin::Bootloader(None)),
+        Ok(0x009E)
+    );
+    assert_eq!(
+        probe::gate(&one(0x009F), Origin::Bootloader(None)),
+        Ok(0x009F)
+    );
+    for pid in [0x110E, 0x0000, 0x00A5, 0x9E00, 0xFFFF] {
+        assert!(
+            probe::gate(&one(pid), Origin::Bootloader(None)).is_err(),
+            "{pid:04x}"
+        );
+    }
+    // status 2, txn 0 and class/id are still checked
+    assert!(probe::gate(&exchange_ok(Q, 3, 0x009E), Origin::Bootloader(None)).is_err());
+    assert!(probe::gate(
+        &exchange_ok((0x10, 0x05), 2, 0x009E),
+        Origin::Bootloader(None)
+    )
+    .is_err());
+    // a run that started from a normal identity keeps v4's rule
+    assert!(probe::gate(&one(0x009E), Origin::Normal(Start::Dongle)).is_err());
+    assert!(probe::gate(&one(0x009F), Origin::Normal(Start::Cable)).is_err());
+}
+
+// --- where the run starts ---------------------------------------------------------------------------------------------------
+
+#[test]
+fn one_110e_hidraw_node_alone_is_a_bootloader_start() {
+    assert_eq!(
+        hw::select_origin(&[node_of(0x110E, 0)]),
+        Ok(Origin::Bootloader(None))
+    );
+}
+
+#[test]
+fn a_110e_together_with_009f_or_009e_is_refused_naming_what_was_found() {
+    for other in [0x009F, 0x009E] {
+        for order in [
+            [node_of(0x110E, 0), node_of(other, 1)],
+            [node_of(other, 1), node_of(0x110E, 0)],
+        ] {
+            let e = hw::select_origin(&order).unwrap_err();
+            assert!(e.starts_with("refusing: found "), "{e}");
+            assert!(e.contains("1532:110E /dev/hidraw0"), "{e}");
+            assert!(e.contains(&format!("1532:{other:04X} /dev/hidraw1")), "{e}");
+            assert!(e.contains("never a mix"), "{e}");
+            assert!(e.ends_with("Nothing was sent"), "{e}");
+        }
+    }
+    // with both normal identities as well
+    assert!(
+        hw::select_origin(&[node_of(0x110E, 0), node_of(0x009E, 1), node_of(0x009F, 2)]).is_err()
+    );
+}
+
+#[test]
+fn two_110e_nodes_are_refused_naming_both() {
+    let e = hw::select_origin(&[node_of(0x110E, 0), node_of(0x110E, 3)]).unwrap_err();
+    assert!(
+        e.contains("/dev/hidraw0") && e.contains("/dev/hidraw3"),
+        "{e}"
+    );
+    assert!(e.contains("1532:110E"), "{e}");
+    assert!(e.ends_with("Nothing was sent"), "{e}");
+    // and a normal start with an extra bootloader is the same refusal
+    assert!(
+        hw::select_origin(&[node_of(0x009E, 0), node_of(0x110E, 1), node_of(0x110E, 2)]).is_err()
+    );
+}
+
+#[test]
+fn a_bootloader_start_needs_exactly_one_110e_device_on_the_bus() {
+    let (base, roots) = fixture_roots("singlebl");
+    let e = hw::single_bootloader(&roots.sysfs).unwrap_err();
+    assert!(e.contains("0 devices 1532:110E"), "{e}");
+    fake_usb(
+        &roots.sysfs,
+        "10-4",
+        BOOTLOADER_ID,
+        0x0200,
+        "Razer bootloader",
+        (10, 6),
+        Some(Some("usbhid")),
+    );
+    assert_eq!(hw::single_bootloader(&roots.sysfs), Ok(()));
+    // the dongle's bootloader is also 110E: with both listed, the lookup by id could pick the wrong one
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        BOOTLOADER_ID,
+        0x009f,
+        "RAZER BOOTLOADER",
+        (8, 5),
+        Some(None),
+    );
+    let e = hw::single_bootloader(&roots.sysfs).unwrap_err();
+    assert!(
+        e.contains("2 devices 1532:110E") && e.contains("Nothing was sent"),
+        "{e}"
+    );
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// --- sysfs: the hidraw child of a USB device ---------------------------------------------------------------------------
+
+/// `<name>:1.0/<hid>/hidraw/<node>`: how the kernel links a USB interface to its hidraw node.
+fn fake_hidraw(root: &Path, name: &str, hid_dir: &str, node: &str) {
+    std::fs::create_dir_all(
+        root.join(format!("{name}:1.0"))
+            .join(hid_dir)
+            .join("hidraw")
+            .join(node),
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_hidraw_node_is_found_through_sysfs_not_through_the_hid_name() {
+    let (base, roots) = fixture_roots("hidchild");
+    fake_usb(
+        &roots.sysfs,
+        "10-4",
+        BOOTLOADER_ID,
+        0x0200,
+        "Razer bootloader",
+        (10, 6),
+        Some(Some("usbhid")),
+    );
+    // whatever the HID directory is called and whatever the product string says
+    fake_hidraw(&roots.sysfs, "10-4", "0003:1532:110E.0007", "hidraw3");
+    let d = sysfs::find(&roots.sysfs, BOOTLOADER_ID, UNIX_EPOCH).unwrap();
+    assert_eq!(d.hidraw, ["hidraw3"]);
+    assert_eq!(d.interface0, Interface0::Bound("usbhid".into()));
+    // another device's node is not this device's
+    fake_usb(
+        &roots.sysfs,
+        "8-3",
+        NORMAL_ID,
+        0x0101,
+        "Razer Razer Viper Mini SE",
+        (8, 4),
+        Some(Some("usbhid")),
+    );
+    fake_hidraw(&roots.sysfs, "8-3", "0003:1532:009F.0001", "hidraw7");
+    fake_hidraw(&roots.sysfs, "8-3", "0003:1532:009F.0002", "hidraw5");
+    let a = sysfs::find(&roots.sysfs, NORMAL_ID, UNIX_EPOCH).unwrap();
+    assert_eq!(a.hidraw, ["hidraw5", "hidraw7"]);
+    let d = sysfs::find(&roots.sysfs, BOOTLOADER_ID, UNIX_EPOCH).unwrap();
+    assert_eq!(d.hidraw, ["hidraw3"]);
+    // no hidraw child, no interface directory: empty, not an error
+    fake_usb(
+        &roots.sysfs,
+        "9-1",
+        (0x1532, 0x0111),
+        0x0101,
+        "x",
+        (9, 2),
+        Some(Some("usbhid")),
+    );
+    fake_usb(
+        &roots.sysfs,
+        "9-2",
+        (0x1532, 0x0112),
+        0x0101,
+        "x",
+        (9, 3),
+        None,
+    );
+    assert!(sysfs::find(&roots.sysfs, (0x1532, 0x0111), UNIX_EPOCH)
+        .unwrap()
+        .hidraw
+        .is_empty());
+    assert!(sysfs::find(&roots.sysfs, (0x1532, 0x0112), UNIX_EPOCH)
+        .unwrap()
+        .hidraw
+        .is_empty());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// --- the real transport over fixture directories ---------------------------------------------------------------------------
+
+#[test]
+fn a_probe_opened_on_a_bootloader_node_starts_from_the_bootloader_and_has_no_normal_mode_node() {
+    let (base, roots) = fixture_roots("blopen");
+    let node = razerctl::hidraw::HidrawNode {
+        dev: PathBuf::from("/dev/hidraw9"),
+        ..node_of(0x110E, 0)
+    };
+    let mut p = RealProbe::open(&node, roots).unwrap();
+    assert_eq!(p.origin(), Origin::Bootloader(None));
+    assert!(
+        p.describe_device()
+            .starts_with("1532:110e /dev/hidraw9 interface 0"),
+        "{}",
+        p.describe_device()
+    );
+    // nothing can be sent to a normal-mode node it does not have
+    assert!(p
+        .read_version()
+        .unwrap_err()
+        .contains("no normal-mode node"));
+    assert!(p
+        .enter_bootloader()
+        .unwrap_err()
+        .message
+        .contains("no normal-mode node"));
+    assert_eq!(p.wait_for_dongle_gone(Duration::from_millis(100)), None);
+    // and with no bootloader opened, a query or an exit is a failed SET with nothing on the wire
+    let q = p.query_bootloader();
+    assert!(q.set_error().unwrap().message.contains("never opened"));
+    assert!(p.exit_bootloader().set_error().is_some());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_bootloader_start_still_settles_for_1000_ms_from_when_it_is_found() {
+    // the device is already listed when the wait starts: the settle runs from that moment, as for a device that just appeared
+    let (base, roots) = fixture_roots("blsettle");
+    fake_usb(
+        &roots.sysfs,
+        "10-4",
+        BOOTLOADER_ID,
+        0x0200,
+        "Razer bootloader",
+        (10, 6),
+        Some(Some("usbhid")),
+    );
+    fake_hidraw(&roots.sysfs, "10-4", "0003:1532:110E.0007", "hidraw3");
+    let node = razerctl::hidraw::HidrawNode {
+        dev: PathBuf::from("/dev/hidraw3"),
+        ..node_of(0x110E, 0)
+    };
+    let mut p = RealProbe::open(&node, roots).unwrap();
+    let before = SystemTime::now();
+    let w = p.wait_for_bootloader(Duration::from_secs(5));
+    let (seen, settled) = (w.appeared_at.unwrap(), w.settled_at.unwrap());
+    assert!(seen.duration_since(before).unwrap() < Duration::from_millis(500));
+    assert!(settled.duration_since(seen).unwrap() >= Duration::from_millis(1000));
+    let d = w.device.unwrap();
+    assert!(d.seen_at >= settled);
+    assert_eq!(d.hidraw, ["hidraw3"]);
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn opening_a_hidraw_node_that_is_not_a_hidraw_node_fails_with_its_errno_and_writes_nothing() {
+    // a regular file stands in for the node: opening it works, the first ioctl (HIDIOCGRAWINFO) does not
+    let (base, roots) = fixture_roots("hidopen");
+    std::fs::create_dir_all(&roots.hidraw).unwrap();
+    let file = roots.hidraw.join("hidraw1");
+    std::fs::write(&file, b"").unwrap();
+    let mut p = fixture_probe_of(roots.clone(), 0x009E);
+    let f = p.open_hidraw(&hid_bound_device()).unwrap_err();
+    assert_eq!(f.errno, Some(libc_enotty()), "{f}");
+    assert_eq!(f.node, file.display().to_string());
+    assert!(!f.is_permission_error());
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        Vec::<u8>::new(),
+        "something was written to the node"
+    );
+    // no channel was kept: a query afterwards sends nothing
+    assert!(p
+        .query_bootloader()
+        .set_error()
+        .unwrap()
+        .message
+        .contains("never opened"));
+    assert!(p.read_report_descriptor().is_err());
+    let _ = std::fs::remove_dir_all(base);
+}
+
+fn libc_enotty() -> i32 {
+    25
+}
+
+#[test]
+fn a_missing_hidraw_node_is_an_open_failure_with_enoent() {
+    let (base, roots) = fixture_roots("hidmissing");
+    let mut p = fixture_probe_of(roots, 0x009E);
+    let f = p.open_hidraw(&hid_bound_device()).unwrap_err();
+    assert_eq!(f.errno, Some(2), "{f}");
+    let _ = std::fs::remove_dir_all(base);
+}
+
+#[test]
+fn a_device_without_exactly_one_hidraw_child_is_not_opened() {
+    let (base, roots) = fixture_roots("hidcount");
+    let mut p = fixture_probe_of(roots, 0x009E);
+    for nodes in [
+        Vec::new(),
+        vec!["hidraw1".to_string(), "hidraw2".to_string()],
+    ] {
+        let device = UsbDevice {
+            hidraw: nodes,
+            ..hid_bound_device()
+        };
+        let f = p.open_hidraw(&device).unwrap_err();
+        assert!(f.message.contains("not exactly one"), "{f}");
+        assert_eq!(f.node, "(unknown)");
+    }
+    let _ = std::fs::remove_dir_all(base);
+}
+
+// --- the fence on the hidraw-bootloader path ---------------------------------------------------------------------------
+
+#[test]
+fn fence_the_bootloader_hidraw_node_is_reachable_only_through_the_guard() {
+    let lines: Vec<String> = code(&src_file("src/probe/hidboot.rs"))
+        .into_iter()
+        .map(|l| l.trim().to_string())
+        .collect();
+    let at = |needle: &str| {
+        lines
+            .iter()
+            .position(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("hidboot.rs lost `{needle}`"))
+    };
+    let impls: Vec<&String> = lines.iter().filter(|l| l.starts_with("impl")).collect();
+    assert_eq!(
+        impls,
+        [
+            "impl BootHid for Hidraw {",
+            "impl<T: BootHid> BootHid for BootGuarded<T> {",
+            "impl<T: BootHid> BootChannel for BootGuarded<T> {",
+        ]
+    );
+    // the trait has the five operations of a bootloader node and nothing that writes a report another way
+    let trait_fns: Vec<&String> = lines
+        .iter()
+        .skip(at("pub trait BootHid {"))
+        .take_while(|l| l.as_str() != "}")
+        .filter(|l| l.starts_with("fn "))
+        .collect();
+    assert_eq!(
+        trait_fns,
+        [
+            "fn raw_info(&self) -> io::Result<RawInfo>;",
+            "fn report_descriptor(&self) -> io::Result<Vec<u8>>;",
+            "fn send_feature(&self, payload: &[u8; REPORT_LEN]) -> io::Result<()>;",
+            "fn get_feature(&self) -> io::Result<(usize, [u8; REPORT_LEN + 1])>;",
+        ]
+    );
+    // the allow-list is the two frames, built by their constructors, and nothing else
+    let perm = at("pub fn permitted(");
+    assert_eq!(
+        lines[perm + 1],
+        "*bytes == query_frame().to_bytes() || *bytes == exit_frame().to_bytes()"
+    );
+    // the guard checks the allow-list before it delegates, and delegates the write in exactly one place
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.contains("self.0.send_feature("))
+            .count(),
+        1
+    );
+    assert!(at("if !permitted(payload)") < at("self.0.send_feature(payload)"));
+    // a bare node is built in one place, and handed out only inside the guard
+    let built: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("BootGuarded(Hidraw"))
+        .collect();
+    assert_eq!(built, ["Ok(BootGuarded(Hidraw::open(path)?))"]);
+    assert!(lines
+        .iter()
+        .any(|l| l == "pub fn open(path: &Path) -> io::Result<BootGuarded<Hidraw>> {"));
+    // no other module builds a guard or reaches around it
+    for (name, src) in src_files() {
+        if name == "src/probe/hidboot.rs" {
+            continue;
+        }
+        for l in code(&src) {
+            assert!(
+                !l.contains("BootGuarded("),
+                "{name} builds a BootGuarded: {l}"
+            );
+            // hw.rs's own `Guarded` (the normal-mode node) delegates in exactly these two lines, in its `impl FeatureIo`
+            let normal_guard = name == "src/probe/hw.rs"
+                && matches!(
+                    l.trim(),
+                    "self.0.send_feature(payload)" | "self.0.get_feature()"
+                );
+            if name.starts_with("src/probe/") && !normal_guard {
+                assert!(
+                    !l.contains(".0.send_feature(") && !l.contains(".0.get_feature("),
+                    "{name} reaches around a guard: {l}"
+                );
+            }
+        }
+    }
+    // the only place the probe holds a Hidraw for the bootloader is inside the guard
+    for (name, src) in src_files() {
+        if !name.starts_with("src/probe/") || name == "src/probe/hidboot.rs" {
+            continue;
+        }
+        for l in code(&src) {
+            if tokens(&l).contains(&"Hidraw") {
+                assert!(
+                    l.contains("Guarded<Hidraw>")
+                        || l.contains("Hidraw::open(")
+                        || l.trim_start().starts_with("use "),
+                    "{name} holds an unguarded Hidraw: {l}"
+                );
+            }
+        }
+    }
+}
+
+/// The text of a source file up to its `#[cfg(test)]` module.
+fn non_test_code(name: &str) -> Vec<String> {
+    let src = src_file(name);
+    let end = src.find("#[cfg(test)]").unwrap_or(src.len());
+    code(&src[..end])
+}
+
+#[test]
+fn fence_a_bootloader_node_gets_five_ioctls_and_no_write() {
+    let lines = non_test_code("src/hidraw.rs");
+    // the one raw ioctl, called from the five operations only
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("libc::ioctl(")).count(),
+        1
+    );
+    let mut used: Vec<String> = lines
+        .iter()
+        .filter(|l| l.contains("self.ioctl(") || l.contains("self.ioctl_raw("))
+        .flat_map(|l| tokens(l).into_iter().filter(|t| t.starts_with("HIDIOC")))
+        .map(String::from)
+        .collect();
+    used.sort();
+    assert_eq!(
+        used,
+        [
+            "HIDIOCGFEATURE_NR",
+            "HIDIOCGRAWINFO",
+            "HIDIOCGRDESC",
+            "HIDIOCGRDESCSIZE",
+            "HIDIOCSFEATURE_NR",
+        ]
+    );
+    // every ioctl request constant defined is one of the five
+    for l in &lines {
+        for t in tokens(l) {
+            if t.starts_with("HIDIOC") {
+                assert!(
+                    [
+                        "HIDIOCSFEATURE_NR",
+                        "HIDIOCGFEATURE_NR",
+                        "HIDIOCGRDESCSIZE",
+                        "HIDIOCGRDESC",
+                        "HIDIOCGRAWINFO"
+                    ]
+                    .contains(&t),
+                    "hidraw.rs names `{t}`: {l}"
+                );
+            }
+        }
+    }
+    // no write(2) of an output report: nothing that writes to the file, in the hidraw transport or the bootloader's wrapper
+    for name in ["src/hidraw.rs", "src/probe/hidboot.rs"] {
+        for l in non_test_code(name) {
+            let sq = l.replace(".write(true)", "");
+            for banned in [
+                ".write(",
+                "write_all",
+                "libc::write",
+                "pwrite",
+                "writev",
+                "io::Write",
+                "Write as _",
+                "fs::write",
+                "File::create",
+                ".send(",
+                "libc::send",
+            ] {
+                assert!(
+                    !sq.contains(banned),
+                    "{name} can write to a node (`{banned}`): {l}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn fence_hidboot_is_a_device_file_and_the_other_fences_cover_it() {
+    // the DFU fence test above counts the files of src/probe; this one pins that the new one is read as a device file
+    let src = src_file("src/probe/hidboot.rs");
+    assert!(touches_a_device(&src));
+    for (name, text) in src_files() {
+        if name == "src/probe/hidboot.rs" {
+            for l in code(&text) {
+                for t in tokens(&l) {
+                    assert!(!DFU_NAMES.contains(&t), "{t}: {l}");
+                }
+                for c in FORBIDDEN_COMMANDS {
+                    assert!(!squeeze(&l).contains(c), "{c}: {l}");
+                }
+                assert!(
+                    !l.contains("Report::new(") && !l.contains(".with_args("),
+                    "{l}"
+                );
+            }
         }
     }
 }
